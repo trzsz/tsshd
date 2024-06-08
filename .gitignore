@@ -20,3 +20,12 @@
 # Go workspace file
 go.work
 go.work.sum
+
+bin/
+debian/files
+
+*.swp
+*.swo
+
+dist/
+vendor/

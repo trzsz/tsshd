@@ -1,3 +1,4 @@
+/*
 MIT License
 
 Copyright (c) 2024 The Trzsz SSH Authors.
@@ -19,3 +20,32 @@ AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
 LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
+*/
+
+package tsshd
+
+import (
+	"fmt"
+
+	"github.com/trzsz/go-arg"
+)
+
+const kTsshdVersion = "0.1.0"
+
+type tsshdArgs struct {
+}
+
+func (tsshdArgs) Description() string {
+	return "tsshd works with `tssh --udp`, just like mosh-server.\n"
+}
+
+func (tsshdArgs) Version() string {
+	return fmt.Sprintf("trzsz sshd %s", kTsshdVersion)
+}
+
+// TsshdMain is the main function of `tsshd` binary.
+func TsshdMain() int {
+	var args tsshdArgs
+	arg.MustParse(&args)
+	return 0
+}

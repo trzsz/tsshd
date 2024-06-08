@@ -1,0 +1,74 @@
+project_name: tsshd
+before:
+  hooks:
+    - go mod tidy
+builds:
+  - id: tsshd
+    main: ./cmd/tsshd
+    binary: tsshd
+    env:
+      - CGO_ENABLED=0
+    goos:
+      - linux
+      - windows
+      - darwin
+    goarch:
+      - "386"
+      - amd64
+      - arm
+      - arm64
+      - loong64
+    goarm:
+      - "6"
+      - "7"
+    ignore:
+      - goos: windows
+        goarch: arm
+      - goos: darwin
+        goarch: arm
+archives:
+  - id: tsshd
+    name_template: >-
+      {{ .ProjectName }}_
+      {{- .Version }}_
+      {{- if eq .Os "darwin" }}macos_
+      {{- else }}{{ .Os }}_{{ end }}
+      {{- if eq .Arch "amd64" }}x86_64
+      {{- else if eq .Arch "386" }}i386
+      {{- else if eq .Arch "arm64" }}aarch64
+      {{- else if eq .Arch "arm" }}armv{{ .Arm }}
+      {{- else }}{{ .Arch }}{{ end }}
+    wrap_in_directory: true
+    format_overrides:
+      - goos: windows
+        format: zip
+    files:
+      - none*
+nfpms:
+  - id: tsshd
+    builds:
+      - tsshd
+    file_name_template: >-
+      {{ .ProjectName }}_
+      {{- .Version }}_
+      {{- if eq .Os "darwin" }}macos_
+      {{- else }}{{ .Os }}_{{ end }}
+      {{- if eq .Arch "amd64" }}x86_64
+      {{- else if eq .Arch "386" }}i386
+      {{- else if eq .Arch "arm64" }}aarch64
+      {{- else if eq .Arch "arm" }}armv{{ .Arm }}
+      {{- else }}{{ .Arch }}{{ end }}
+    homepage: https://trzsz.github.io/
+    maintainer: Lonny Wong <lonnywong@qq.com>
+    description: |-
+      The `tssh --udp` works like `mosh`, and the `tsshd` works like `mosh-server`.
+    license: MIT
+    formats:
+      - rpm
+    bindir: /usr/bin
+    rpm:
+      group: Unspecified
+snapshot:
+  name_template: "{{ .Version }}.next"
+checksum:
+  name_template: "{{ .ProjectName }}_{{ .Version }}_checksums.txt"
