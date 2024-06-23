@@ -27,7 +27,7 @@ ${BIN_DIR}/${TSSHD}: $(wildcard ./cmd/tsshd/*.go ./tsshd/*.go) go.mod go.sum
 	go build -o ${BIN_DIR}/ ./cmd/tsshd
 
 clean:
-	-rm -f ${BIN_DIR}/tsshd{,.exe}
+	-rm -f ${BIN_DIR}/tsshd ${BIN_DIR}/tsshd.exe
 
 test:
 	${GO_TEST} -v -count=1 ./tsshd

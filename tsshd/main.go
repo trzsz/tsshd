@@ -26,6 +26,9 @@ package tsshd
 
 import (
 	"fmt"
+	"io"
+	"os"
+	"os/exec"
 
 	"github.com/trzsz/go-arg"
 )
@@ -43,9 +46,54 @@ func (tsshdArgs) Version() string {
 	return fmt.Sprintf("trzsz sshd %s", kTsshdVersion)
 }
 
+func background() (bool, io.ReadCloser, error) {
+	if v := os.Getenv("TRZSZ-SSHD-BACKGROUND"); v == "TRUE" {
+		return false, nil, nil
+	}
+	cmd := exec.Command(os.Args[0], os.Args[1:]...)
+	cmd.Stderr = os.Stderr
+	cmd.Env = append(os.Environ(), "TRZSZ-SSHD-BACKGROUND=TRUE")
+	cmd.SysProcAttr = getSysProcAttr()
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		return true, nil, err
+	}
+	if err := cmd.Start(); err != nil {
+		return true, nil, err
+	}
+	return true, stdout, nil
+}
+
 // TsshdMain is the main function of `tsshd` binary.
 func TsshdMain() int {
 	var args tsshdArgs
 	arg.MustParse(&args)
+
+	parent, stdout, err := background()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "run in background failed: %v\n", err)
+		return 1
+	}
+
+	if parent {
+		defer stdout.Close()
+		if _, err := io.Copy(os.Stdout, stdout); err != nil {
+			fmt.Fprintf(os.Stderr, "copy stdout failed: %v\n", err)
+			return 2
+		}
+		return 0
+	}
+
+	listener, err := initServer(&args)
+	if err != nil {
+		fmt.Println(err)
+		os.Stdout.Close()
+		return 3
+	}
+
+	os.Stdout.Close()
+
+	serve(listener)
+
 	return 0
 }

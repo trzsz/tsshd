@@ -17,7 +17,6 @@ builds:
       - amd64
       - arm
       - arm64
-      - loong64
     goarm:
       - "6"
       - "7"
