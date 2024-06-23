@@ -182,3 +182,42 @@ func RecvError(session *kcp.UDPSession) error {
 	}
 	return nil
 }
+
+func NewKcpSession(addr string, key []byte, cmd string) (session *kcp.UDPSession, err error) {
+	block, err := kcp.NewAESBlockCrypt(key)
+	if err != nil {
+		return nil, fmt.Errorf("new aes block crypt failed: %v", err)
+	}
+
+	done := make(chan struct{}, 1)
+	go func() {
+		defer func() {
+			if err != nil && session != nil {
+				session.Close()
+			}
+			done <- struct{}{}
+			close(done)
+		}()
+		session, err = kcp.DialWithOptions(addr, block, 10, 3)
+		if err != nil {
+			err = fmt.Errorf("kcp dial [%s] [%s] failed: %v", addr, cmd, err)
+			return
+		}
+		session.SetNoDelay(1, 10, 2, 1)
+		if err = SendCommand(session, cmd); err != nil {
+			err = fmt.Errorf("kcp send command [%s] [%s] failed: %v", addr, cmd, err)
+			return
+		}
+		if err = RecvError(session); err != nil {
+			err = fmt.Errorf("kcp new session [%s] [%s] failed: %v", addr, cmd, err)
+			return
+		}
+	}()
+
+	select {
+	case <-time.After(10 * time.Second):
+		err = fmt.Errorf("kcp new session [%s] [%s] timeout", addr, cmd)
+	case <-done:
+	}
+	return
+}

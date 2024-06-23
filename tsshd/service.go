@@ -64,6 +64,8 @@ func serve(listener *kcp.Listener) {
 func handleSession(session *kcp.UDPSession) {
 	defer session.Close()
 
+	session.SetNoDelay(1, 10, 2, 1)
+
 	command, err := RecvCommand(session)
 	if err != nil {
 		SendError(session, fmt.Errorf("recv session command failed: %v", err))
