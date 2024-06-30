@@ -32,7 +32,7 @@ The `tsshd` process listens on a random udp port between 61000 and 62000, and se
 
 ## Installation
 
-- Install with Go ( Requires go 1.20 or later )
+- Install with Go ( Requires go 1.21 or later )
 
   <details><summary><code>go install github.com/trzsz/tsshd/cmd/tsshd@latest</code></summary>
 
@@ -44,7 +44,7 @@ The `tsshd` process listens on a random udp port between 61000 and 62000, and se
 
   </details>
 
-- Build from source ( Requires go 1.20 or later )
+- Build from source ( Requires go 1.21 or later )
 
   <details><summary><code>sudo make install</code></summary>
 
