@@ -29,13 +29,17 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"time"
 
 	"github.com/trzsz/go-arg"
 )
 
-const kTsshdVersion = "0.1.0"
+const kTsshdVersion = "0.1.1"
+
+var exitChan = make(chan int, 1)
 
 type tsshdArgs struct {
+	KCP bool `arg:"--kcp" help:"KCP protocol (default is QUIC protocol)"`
 }
 
 func (tsshdArgs) Description() string {
@@ -84,7 +88,7 @@ func TsshdMain() int {
 		return 0
 	}
 
-	listener, err := initServer(&args)
+	kcpListener, quicListener, err := initServer(&args)
 	if err != nil {
 		fmt.Println(err)
 		os.Stdout.Close()
@@ -93,7 +97,22 @@ func TsshdMain() int {
 
 	os.Stdout.Close()
 
-	serve(listener)
+	if kcpListener != nil {
+		defer kcpListener.Close()
+		go serveKCP(kcpListener)
+	}
+	if quicListener != nil {
+		defer quicListener.Close()
+		go serveQUIC(quicListener)
+	}
 
-	return 0
+	go func() {
+		// should be connected within 20 seconds
+		time.Sleep(20 * time.Second)
+		if !serving.Load() {
+			exitChan <- 1
+		}
+	}()
+
+	return <-exitChan
 }

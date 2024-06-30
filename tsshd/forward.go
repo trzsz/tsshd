@@ -30,18 +30,16 @@ import (
 	"net"
 	"sync"
 	"sync/atomic"
-
-	"github.com/xtaci/kcp-go/v5"
 )
 
 var acceptMutex sync.Mutex
 var acceptID atomic.Uint64
 var acceptMap = make(map[uint64]net.Conn)
 
-func handleDialEvent(session *kcp.UDPSession) {
+func handleDialEvent(stream net.Conn) {
 	var msg DialMessage
-	if err := RecvMessage(session, &msg); err != nil {
-		SendError(session, fmt.Errorf("recv dial message failed: %v", err))
+	if err := RecvMessage(stream, &msg); err != nil {
+		SendError(stream, fmt.Errorf("recv dial message failed: %v", err))
 		return
 	}
 
@@ -53,36 +51,36 @@ func handleDialEvent(session *kcp.UDPSession) {
 		conn, err = net.Dial(msg.Network, msg.Addr)
 	}
 	if err != nil {
-		SendError(session, fmt.Errorf("dial %s [%s] failed: %v", msg.Network, msg.Addr, err))
+		SendError(stream, fmt.Errorf("dial %s [%s] failed: %v", msg.Network, msg.Addr, err))
 		return
 	}
 
 	defer conn.Close()
 
-	if err := SendSuccess(session); err != nil { // ack ok
+	if err := SendSuccess(stream); err != nil { // ack ok
 		trySendErrorMessage("dial ack ok failed: %v", err)
 		return
 	}
 
-	forwardConnection(session, conn)
+	forwardConnection(stream, conn)
 }
 
-func handleListenEvent(session *kcp.UDPSession) {
+func handleListenEvent(stream net.Conn) {
 	var msg ListenMessage
-	if err := RecvMessage(session, &msg); err != nil {
-		SendError(session, fmt.Errorf("recv listen message failed: %v", err))
+	if err := RecvMessage(stream, &msg); err != nil {
+		SendError(stream, fmt.Errorf("recv listen message failed: %v", err))
 		return
 	}
 
 	listener, err := net.Listen(msg.Network, msg.Addr)
 	if err != nil {
-		SendError(session, fmt.Errorf("listen on %s [%s] failed: %v", msg.Network, msg.Addr, err))
+		SendError(stream, fmt.Errorf("listen on %s [%s] failed: %v", msg.Network, msg.Addr, err))
 		return
 	}
 
 	defer listener.Close()
 
-	if err := SendSuccess(session); err != nil { // ack ok
+	if err := SendSuccess(stream); err != nil { // ack ok
 		trySendErrorMessage("listen ack ok failed: %v", err)
 		return
 	}
@@ -99,7 +97,7 @@ func handleListenEvent(session *kcp.UDPSession) {
 		acceptMutex.Lock()
 		id := acceptID.Add(1) - 1
 		acceptMap[id] = conn
-		if err := SendMessage(session, AcceptMessage{id}); err != nil {
+		if err := SendMessage(stream, AcceptMessage{id}); err != nil {
 			acceptMutex.Unlock()
 			trySendErrorMessage("send accept message failed: %v", err)
 			return
@@ -108,10 +106,10 @@ func handleListenEvent(session *kcp.UDPSession) {
 	}
 }
 
-func handleAcceptEvent(session *kcp.UDPSession) {
+func handleAcceptEvent(stream net.Conn) {
 	var msg AcceptMessage
-	if err := RecvMessage(session, &msg); err != nil {
-		SendError(session, fmt.Errorf("recv accept message failed: %v", err))
+	if err := RecvMessage(stream, &msg); err != nil {
+		SendError(stream, fmt.Errorf("recv accept message failed: %v", err))
 		return
 	}
 
@@ -120,30 +118,30 @@ func handleAcceptEvent(session *kcp.UDPSession) {
 
 	conn, ok := acceptMap[msg.ID]
 	if !ok {
-		SendError(session, fmt.Errorf("invalid accept id: %d", msg.ID))
+		SendError(stream, fmt.Errorf("invalid accept id: %d", msg.ID))
 		return
 	}
 
 	delete(acceptMap, msg.ID)
 	defer conn.Close()
 
-	if err := SendSuccess(session); err != nil { // ack ok
+	if err := SendSuccess(stream); err != nil { // ack ok
 		trySendErrorMessage("accept ack ok failed: %v", err)
 		return
 	}
 
-	forwardConnection(session, conn)
+	forwardConnection(stream, conn)
 }
 
-func forwardConnection(session *kcp.UDPSession, conn net.Conn) {
+func forwardConnection(stream net.Conn, conn net.Conn) {
 	var wg sync.WaitGroup
 	wg.Add(2)
 	go func() {
-		_, _ = io.Copy(conn, session)
+		_, _ = io.Copy(conn, stream)
 		wg.Done()
 	}()
 	go func() {
-		_, _ = io.Copy(session, conn)
+		_, _ = io.Copy(stream, conn)
 		wg.Done()
 	}()
 	wg.Wait()

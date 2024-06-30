@@ -26,63 +26,64 @@ package tsshd
 
 import (
 	"fmt"
+	"net"
 	"sync"
 	"sync/atomic"
 	"time"
-
-	"github.com/xtaci/kcp-go/v5"
 )
+
+var serving atomic.Bool
 
 var busMutex sync.Mutex
 
-var busSession atomic.Pointer[kcp.UDPSession]
+var busStream atomic.Pointer[net.Conn]
 
 var lastAliveTime atomic.Pointer[time.Time]
 
 func sendBusCommand(command string) error {
 	busMutex.Lock()
 	defer busMutex.Unlock()
-	session := busSession.Load()
-	if session == nil {
-		return fmt.Errorf("bus session is nil")
+	stream := busStream.Load()
+	if stream == nil {
+		return fmt.Errorf("bus stream is nil")
 	}
-	return SendCommand(session, command)
+	return SendCommand(*stream, command)
 }
 
 func sendBusMessage(command string, msg any) error {
 	busMutex.Lock()
 	defer busMutex.Unlock()
-	session := busSession.Load()
-	if session == nil {
-		return fmt.Errorf("bus session is nil")
+	stream := busStream.Load()
+	if stream == nil {
+		return fmt.Errorf("bus stream is nil")
 	}
-	if err := SendCommand(session, command); err != nil {
+	if err := SendCommand(*stream, command); err != nil {
 		return err
 	}
-	return SendMessage(session, msg)
+	return SendMessage(*stream, msg)
 }
 
 func trySendErrorMessage(format string, a ...any) {
 	_ = sendBusMessage("error", ErrorMessage{fmt.Sprintf(format, a...)})
 }
 
-func handleBusEvent(session *kcp.UDPSession) {
+func handleBusEvent(stream net.Conn) {
 	var msg BusMessage
-	if err := RecvMessage(session, &msg); err != nil {
-		SendError(session, fmt.Errorf("recv bus message failed: %v", err))
+	if err := RecvMessage(stream, &msg); err != nil {
+		SendError(stream, fmt.Errorf("recv bus message failed: %v", err))
 		return
 	}
 
 	busMutex.Lock()
 
 	// only one bus
-	if !busSession.CompareAndSwap(nil, session) {
+	if !busStream.CompareAndSwap(nil, &stream) {
 		busMutex.Unlock()
-		SendError(session, fmt.Errorf("bus has been initialized"))
+		SendError(stream, fmt.Errorf("bus has been initialized"))
 		return
 	}
 
-	if err := SendSuccess(session); err != nil { // ack ok
+	if err := SendSuccess(stream); err != nil { // ack ok
 		busMutex.Unlock()
 		trySendErrorMessage("bus ack ok failed: %v", err)
 		return
@@ -99,7 +100,7 @@ func handleBusEvent(session *kcp.UDPSession) {
 	}
 
 	for {
-		command, err := RecvCommand(session)
+		command, err := RecvCommand(stream)
 		if err != nil {
 			trySendErrorMessage("recv bus command failed: %v", err)
 			return
@@ -107,15 +108,15 @@ func handleBusEvent(session *kcp.UDPSession) {
 
 		switch command {
 		case "resize":
-			err = handleResizeEvent(session)
+			err = handleResizeEvent(stream)
 		case "close":
-			exitChan <- true
+			exitChan <- 0
 			return
 		case "alive":
 			now := time.Now()
 			lastAliveTime.Store(&now)
 		default:
-			err = handleUnknownEvent(session)
+			err = handleUnknownEvent(stream)
 		}
 		if err != nil {
 			trySendErrorMessage("handle bus command [%s] failed: %v", command, err)
@@ -123,22 +124,31 @@ func handleBusEvent(session *kcp.UDPSession) {
 	}
 }
 
-func handleUnknownEvent(session *kcp.UDPSession) error {
+func handleUnknownEvent(stream net.Conn) error {
 	var msg struct{}
-	if err := RecvMessage(session, &msg); err != nil {
+	if err := RecvMessage(stream, &msg); err != nil {
 		return fmt.Errorf("recv unknown message failed: %v", err)
 	}
 	return fmt.Errorf("unknown command")
 }
 
 func keepAlive(timeout time.Duration) {
+	sleepTime := timeout / 10
+	if sleepTime > 10*time.Second {
+		sleepTime = 10 * time.Second
+	}
+	go func() {
+		for {
+			_ = sendBusCommand("alive")
+			time.Sleep(sleepTime)
+		}
+	}()
 	for {
-		_ = sendBusCommand("alive")
 		if t := lastAliveTime.Load(); t != nil && time.Since(*t) > timeout {
 			trySendErrorMessage("tsshd keep alive timeout")
-			exitChan <- true
+			exitChan <- 2
 			return
 		}
-		time.Sleep(timeout / 10)
+		time.Sleep(sleepTime)
 	}
 }

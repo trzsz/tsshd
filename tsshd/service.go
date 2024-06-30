@@ -25,54 +25,112 @@ SOFTWARE.
 package tsshd
 
 import (
+	"context"
 	"fmt"
-	"sync/atomic"
-	"time"
+	"net"
 
+	"github.com/quic-go/quic-go"
 	"github.com/xtaci/kcp-go/v5"
+	"github.com/xtaci/smux"
 )
 
-var serving atomic.Bool
-
-var exitChan = make(chan bool, 1)
-
-func serve(listener *kcp.Listener) {
-	defer listener.Close()
-
-	go func() {
-		// should be connected within 10 seconds
-		time.Sleep(10 * time.Second)
-		if !serving.Load() {
-			exitChan <- true
-		}
-	}()
-
-	go func() {
-		for {
-			session, err := listener.AcceptKCP()
-			if err != nil {
-				trySendErrorMessage("kcp accept failed: %v", err)
-				return
-			}
-			go handleSession(session)
-		}
-	}()
-
-	<-exitChan
+var smuxConfig = smux.Config{
+	Version:           2,
+	KeepAliveDisabled: true,
+	MaxFrameSize:      32 * 1024,
+	MaxStreamBuffer:   64 * 1024,
+	MaxReceiveBuffer:  4 * 1024 * 1024,
 }
 
-func handleSession(session *kcp.UDPSession) {
-	defer session.Close()
+type quicStream struct {
+	quic.Stream
+	conn quic.Connection
+}
 
-	session.SetNoDelay(1, 10, 2, 1)
+func (s *quicStream) LocalAddr() net.Addr {
+	return s.conn.LocalAddr()
+}
 
-	command, err := RecvCommand(session)
-	if err != nil {
-		SendError(session, fmt.Errorf("recv session command failed: %v", err))
+func (s *quicStream) RemoteAddr() net.Addr {
+	return s.conn.RemoteAddr()
+}
+
+func serveKCP(listener *kcp.Listener) {
+	for {
+		conn, err := listener.AcceptKCP()
+		if err != nil {
+			trySendErrorMessage("kcp accept failed: %v", err)
+			return
+		}
+		go handleKcpConn(conn)
+	}
+}
+
+func handleKcpConn(conn *kcp.UDPSession) {
+	defer conn.Close()
+
+	if serving.Load() {
 		return
 	}
 
-	var handler func(*kcp.UDPSession)
+	conn.SetNoDelay(1, 10, 2, 1)
+
+	session, err := smux.Server(conn, &smuxConfig)
+	if err != nil {
+		trySendErrorMessage("kcp smux server failed: %v", err)
+		return
+	}
+
+	for {
+		stream, err := session.AcceptStream()
+		if err != nil {
+			trySendErrorMessage("kcp smux accept stream failed: %v", err)
+			return
+		}
+		go handleStream(stream)
+	}
+}
+
+func serveQUIC(listener *quic.Listener) {
+	for {
+		conn, err := listener.Accept(context.Background())
+		if err != nil {
+			trySendErrorMessage("quic accept conn failed: %v", err)
+			return
+		}
+		go handleQuicConn(conn)
+	}
+}
+
+func handleQuicConn(conn quic.Connection) {
+	defer func() {
+		_ = conn.CloseWithError(0, "")
+	}()
+
+	if serving.Load() {
+		return
+	}
+
+	for {
+		stream, err := conn.AcceptStream(context.Background())
+		if err != nil {
+			trySendErrorMessage("quic accept stream failed: %v", err)
+			return
+		}
+		go handleStream(&quicStream{stream, conn})
+	}
+}
+
+func handleStream(stream net.Conn) {
+	defer stream.Close()
+
+	command, err := RecvCommand(stream)
+	if err != nil {
+		SendError(stream, fmt.Errorf("recv stream command failed: %v", err))
+		return
+	}
+
+	var handler func(net.Conn)
 
 	switch command {
 	case "bus":
@@ -88,14 +146,14 @@ func handleSession(session *kcp.UDPSession) {
 	case "accept":
 		handler = handleAcceptEvent
 	default:
-		SendError(session, fmt.Errorf("unknown session command: %s", command))
+		SendError(stream, fmt.Errorf("unknown stream command: %s", command))
 		return
 	}
 
-	if err := SendSuccess(session); err != nil { // say hello
+	if err := SendSuccess(stream); err != nil { // say hello
 		trySendErrorMessage("tsshd say hello failed: %v", err)
 		return
 	}
 
-	handler(session)
+	handler(stream)
 }

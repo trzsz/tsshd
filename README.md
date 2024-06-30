@@ -4,7 +4,7 @@ The [`tssh --udp`](https://github.com/trzsz/trzsz-ssh) works like [`mosh`](https
 
 ## Advanced Features
 
-- Low latency ( based on kcp )
+- Low latency ( based on QUIC / KCP )
 
 - Port forwarding ( same as ssh )
 

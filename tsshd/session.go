@@ -27,14 +27,13 @@ package tsshd
 import (
 	"fmt"
 	"io"
+	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strings"
 	"sync"
-
-	"github.com/xtaci/kcp-go/v5"
 )
 
 type sessionContext struct {
@@ -50,17 +49,17 @@ type sessionContext struct {
 	started bool
 }
 
-type stderrContext struct {
-	id      uint64
-	wg      sync.WaitGroup
-	session *kcp.UDPSession
+type stderrStream struct {
+	id     uint64
+	wg     sync.WaitGroup
+	stream net.Conn
 }
 
 var sessionMutex sync.Mutex
 var sessionMap = make(map[uint64]*sessionContext)
 
 var stderrMutex sync.Mutex
-var stderrMap = make(map[uint64]*stderrContext)
+var stderrMap = make(map[uint64]*stderrStream)
 
 func (c *sessionContext) StartPty() error {
 	var err error
@@ -92,17 +91,17 @@ func (c *sessionContext) StartCmd() error {
 	return nil
 }
 
-func (c *sessionContext) forwardIO(session *kcp.UDPSession) {
+func (c *sessionContext) forwardIO(stream net.Conn) {
 	if c.stdin != nil {
 		go func() {
-			_, _ = io.Copy(c.stdin, session)
+			_, _ = io.Copy(c.stdin, stream)
 		}()
 	}
 
 	if c.stdout != nil {
 		c.wg.Add(1)
 		go func() {
-			_, _ = io.Copy(session, c.stdout)
+			_, _ = io.Copy(stream, c.stdout)
 			c.wg.Done()
 		}()
 	}
@@ -111,9 +110,9 @@ func (c *sessionContext) forwardIO(session *kcp.UDPSession) {
 		c.wg.Add(1)
 		go func() {
 			if stderr, ok := stderrMap[c.id]; ok {
-				_, _ = io.Copy(stderr.session, c.stderr)
+				_, _ = io.Copy(stderr.stream, c.stderr)
 			} else {
-				_, _ = io.Copy(session, c.stderr)
+				_, _ = io.Copy(stream, c.stderr)
 			}
 			c.wg.Done()
 		}()
@@ -167,20 +166,20 @@ func (c *sessionContext) SetSize(cols, rows int) error {
 	return nil
 }
 
-func handleSessionEvent(session *kcp.UDPSession) {
+func handleSessionEvent(stream net.Conn) {
 	var msg StartMessage
-	if err := RecvMessage(session, &msg); err != nil {
-		SendError(session, fmt.Errorf("recv start message failed: %v", err))
+	if err := RecvMessage(stream, &msg); err != nil {
+		SendError(stream, fmt.Errorf("recv start message failed: %v", err))
 		return
 	}
 
-	if errCtx := getStderrSession(msg.ID); errCtx != nil {
-		defer errCtx.Close()
+	if errStream := getStderrStream(msg.ID); errStream != nil {
+		defer errStream.Close()
 	}
 
-	ctx, err := newSession(&msg)
+	ctx, err := newSessionContext(&msg)
 	if err != nil {
-		SendError(session, err)
+		SendError(stream, err)
 		return
 	}
 	defer ctx.Close()
@@ -191,21 +190,21 @@ func handleSessionEvent(session *kcp.UDPSession) {
 		err = ctx.StartCmd()
 	}
 	if err != nil {
-		SendError(session, err)
+		SendError(stream, err)
 		return
 	}
 
-	if err := SendSuccess(session); err != nil { // ack ok
+	if err := SendSuccess(stream); err != nil { // ack ok
 		trySendErrorMessage("session ack ok failed: %v", err)
 		return
 	}
 
-	ctx.forwardIO(session)
+	ctx.forwardIO(stream)
 
 	ctx.Wait()
 }
 
-func newSession(msg *StartMessage) (*sessionContext, error) {
+func newSessionContext(msg *StartMessage) (*sessionContext, error) {
 	cmd, err := getSessionStartCmd(msg)
 	if err != nil {
 		return nil, fmt.Errorf("build start command failed: %v", err)
@@ -228,34 +227,34 @@ func newSession(msg *StartMessage) (*sessionContext, error) {
 	return ctx, nil
 }
 
-func (c *stderrContext) Wait() {
+func (c *stderrStream) Wait() {
 	c.wg.Wait()
 }
 
-func (c *stderrContext) Close() {
+func (c *stderrStream) Close() {
 	c.wg.Done()
 	stderrMutex.Lock()
 	defer stderrMutex.Unlock()
 	delete(stderrMap, c.id)
 }
 
-func newStderrSession(id uint64, session *kcp.UDPSession) (*stderrContext, error) {
+func newStderrStream(id uint64, stream net.Conn) (*stderrStream, error) {
 	stderrMutex.Lock()
 	defer stderrMutex.Unlock()
 	if _, ok := stderrMap[id]; ok {
 		return nil, fmt.Errorf("session %d stderr already set", id)
 	}
-	ctx := &stderrContext{id: id, session: session}
-	ctx.wg.Add(1)
-	stderrMap[id] = ctx
-	return ctx, nil
+	errStream := &stderrStream{id: id, stream: stream}
+	errStream.wg.Add(1)
+	stderrMap[id] = errStream
+	return errStream, nil
 }
 
-func getStderrSession(id uint64) *stderrContext {
+func getStderrStream(id uint64) *stderrStream {
 	stderrMutex.Lock()
 	defer stderrMutex.Unlock()
-	if ctx, ok := stderrMap[id]; ok {
-		return ctx
+	if errStream, ok := stderrMap[id]; ok {
+		return errStream
 	}
 	return nil
 }
@@ -294,30 +293,30 @@ func getSessionStartCmd(msg *StartMessage) (*exec.Cmd, error) {
 	return cmd, nil
 }
 
-func handleStderrEvent(session *kcp.UDPSession) {
+func handleStderrEvent(stream net.Conn) {
 	var msg StderrMessage
-	if err := RecvMessage(session, &msg); err != nil {
-		SendError(session, fmt.Errorf("recv stderr message failed: %v", err))
+	if err := RecvMessage(stream, &msg); err != nil {
+		SendError(stream, fmt.Errorf("recv stderr message failed: %v", err))
 		return
 	}
 
-	ctx, err := newStderrSession(msg.ID, session)
+	errStream, err := newStderrStream(msg.ID, stream)
 	if err != nil {
-		SendError(session, err)
+		SendError(stream, err)
 		return
 	}
 
-	if err := SendSuccess(session); err != nil { // ack ok
+	if err := SendSuccess(stream); err != nil { // ack ok
 		trySendErrorMessage("stderr ack ok failed: %v", err)
 		return
 	}
 
-	ctx.Wait()
+	errStream.Wait()
 }
 
-func handleResizeEvent(session *kcp.UDPSession) error {
+func handleResizeEvent(stream net.Conn) error {
 	var msg ResizeMessage
-	if err := RecvMessage(session, &msg); err != nil {
+	if err := RecvMessage(stream, &msg); err != nil {
 		return fmt.Errorf("recv resize message failed: %v", err)
 	}
 	if msg.Cols <= 0 || msg.Rows <= 0 {
