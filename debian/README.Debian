@@ -1,0 +1,6 @@
+tsshd for Debian
+---------------
+
+The 'tssh --udp' works like 'mosh', and the 'tsshd' works like 'mosh-server'.
+
+ -- Lonny Wong <lonnywong@qq.com>  Sun, 30 Jun 2024 17:38:13 +0800

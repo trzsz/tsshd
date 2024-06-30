@@ -1,0 +1,9 @@
+tsshd for Debian
+---------------
+
+tsshd for Debian is developed in Go.
+* Install go and make
+* make && make install
+
+ -- Lonny Wong <lonnywong@qq.com>  Sun, 30 Jun 2024 17:38:13 +0800
+
