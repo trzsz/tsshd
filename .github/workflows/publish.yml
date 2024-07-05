@@ -10,22 +10,19 @@ jobs:
       - name: Checkout tsshd
         uses: actions/checkout@v4
       - name: Set up Go
-        uses: actions/setup-go@v4
+        uses: actions/setup-go@v5
         with:
           go-version: "1.21"
       - name: Run GoReleaser
-        uses: goreleaser/goreleaser-action@v5
+        uses: goreleaser/goreleaser-action@v6
         with:
           distribution: goreleaser
-          version: latest
+          version: "~> v1"
           args: release --clean --skip=publish
       - name: Upload Release Assets
-        uses: trzsz/upload-release-assets@v1
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        uses: softprops/action-gh-release@v2
         with:
-          release_id: ${{ github.event.release.id }}
-          assets_path: |
+          files: |
             dist/*.tar.gz
             dist/*.zip
             dist/*.rpm
