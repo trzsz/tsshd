@@ -1,6 +1,6 @@
 The Debian Package tsshd
 ----------------------------
 
-The 'tssh --udp' works like 'mosh', and the 'tsshd' works like 'mosh-server'.
+The tsshd works like mosh-server, while the 'tssh --udp' works like mosh.
 
  -- Lonny Wong <lonnywong@qq.com>  Sun, 30 Jun 2024 17:38:13 +0800
