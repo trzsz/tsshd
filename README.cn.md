@@ -3,13 +3,15 @@
 [![MIT License](https://img.shields.io/badge/license-MIT-green.svg?style=flat)](https://choosealicense.com/licenses/mit/)
 [![GitHub Release](https://img.shields.io/github/v/release/trzsz/tsshd)](https://github.com/trzsz/tsshd/releases)
 
-[`tssh --udp`](https://github.com/trzsz/trzsz-ssh) 类似于 [`mosh`](https://github.com/mobile-shell/mosh), 而 `tsshd` 类似于 `mosh-server`.
+`tsshd` 类似于 `mosh-server`，而 [`tssh --udp`](https://github.com/trzsz/trzsz-ssh) 类似于 [`mosh`](https://github.com/mobile-shell/mosh)。
 
 ## 优点简介
 
-- 低延迟（ 基于 QUIC / KCP ）
+- 降低延迟（ 基于 [QUIC](https://github.com/quic-go/quic-go) / [KCP](https://github.com/xtaci/kcp-go) ）
 
-- 端口转发（ 与 openssh 相同 ）
+- 端口转发（ 与 openssh 相同，包括 ssh agent 转发和 X11 转发 ）
+
+- _[TODO]_ 连接迁移（ 支持网络切换和掉线重连，依赖于 [quic-go#234](https://github.com/quic-go/quic-go/issues/234) ）
 
 ## 如何使用
 

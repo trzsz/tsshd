@@ -68,6 +68,14 @@ func background() (bool, io.ReadCloser, error) {
 	return true, stdout, nil
 }
 
+var onExitFuncs []func()
+
+func cleanupOnExit() {
+	for i := len(onExitFuncs) - 1; i >= 0; i-- {
+		onExitFuncs[i]()
+	}
+}
+
 // TsshdMain is the main function of `tsshd` binary.
 func TsshdMain() int {
 	var args tsshdArgs
@@ -87,6 +95,9 @@ func TsshdMain() int {
 		}
 		return 0
 	}
+
+	// cleanup on exit
+	defer cleanupOnExit()
 
 	kcpListener, quicListener, err := initServer(&args)
 	if err != nil {

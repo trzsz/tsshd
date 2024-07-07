@@ -31,7 +31,7 @@ import (
 	"strings"
 	"syscall"
 
-	"github.com/UserExistsError/conpty"
+	"github.com/trzsz/tsshd/internal/conpty"
 	"golang.org/x/sys/windows"
 )
 
@@ -63,7 +63,7 @@ func newTsshdPty(cmd *exec.Cmd, cols, rows int) (*tsshdPty, error) {
 		}
 		cmdLine.WriteString(windows.EscapeArg(arg))
 	}
-	cpty, err := conpty.Start(cmdLine.String(), conpty.ConPtyDimensions(cols, rows))
+	cpty, err := conpty.Start(cmdLine.String(), conpty.ConPtyDimensions(cols, rows), conpty.ConPtyEnv(cmd.Env))
 	if err != nil {
 		return nil, err
 	}

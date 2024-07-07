@@ -62,9 +62,9 @@ var quicConfig = quic.Config{
 func initServer(args *tsshdArgs) (*kcp.Listener, *quic.Listener, error) {
 	portRangeLow := kDefaultPortRangeLow
 	portRangeHigh := kDefaultPortRangeHigh
-	conn, port := listenOnFreePort(portRangeLow, portRangeHigh)
-	if conn == nil {
-		return nil, nil, fmt.Errorf("no free udp port in [%d, %d]", portRangeLow, portRangeHigh)
+	conn, port, err := listenUdpOnFreePort(portRangeLow, portRangeHigh)
+	if err != nil {
+		return nil, nil, err
 	}
 
 	info := &ServerInfo{
@@ -72,7 +72,6 @@ func initServer(args *tsshdArgs) (*kcp.Listener, *quic.Listener, error) {
 		Port: port,
 	}
 
-	var err error
 	var kcpListener *kcp.Listener
 	var quicListener *quic.Listener
 	if args.KCP {
@@ -99,34 +98,40 @@ func initServer(args *tsshdArgs) (*kcp.Listener, *quic.Listener, error) {
 	return kcpListener, quicListener, nil
 }
 
-func listenOnFreePort(low, high int) (*net.UDPConn, int) {
+func listenUdpOnFreePort(low, high int) (*net.UDPConn, int, error) {
 	if high < low {
-		return nil, -1
+		return nil, 0, fmt.Errorf("no port in [%d,%d]", low, high)
 	}
+	var err error
+	var conn *net.UDPConn
 	size := high - low + 1
 	port := low + math_rand.Intn(size)
 	for i := 0; i < size; i++ {
-		if conn := listenOnPort(port); conn != nil {
-			return conn, port
+		if conn, err = listenUdpOnPort(port); err == nil {
+			return conn, port, nil
 		}
 		port++
 		if port > high {
 			port = low
 		}
 	}
-	return nil, -1
+	if err != nil {
+		return nil, 0, fmt.Errorf("listen udp on [%d,%d] failed: %v", low, high, err)
+	}
+	return nil, 0, fmt.Errorf("listen udp on [%d,%d] failed", low, high)
 }
 
-func listenOnPort(port int) *net.UDPConn {
-	addr, err := net.ResolveUDPAddr("udp", fmt.Sprintf(":%d", port))
+func listenUdpOnPort(port int) (*net.UDPConn, error) {
+	addr := fmt.Sprintf(":%d", port)
+	udpAddr, err := net.ResolveUDPAddr("udp", addr)
 	if err != nil {
-		return nil
+		return nil, fmt.Errorf("resolve udp addr [%s] failed: %v", addr, err)
 	}
-	conn, err := net.ListenUDP("udp", addr)
+	conn, err := net.ListenUDP("udp", udpAddr)
 	if err != nil {
-		return nil
+		return nil, fmt.Errorf("listen udp on [%s] failed: %v", addr, err)
 	}
-	return conn
+	return conn, nil
 }
 
 func listenKCP(conn *net.UDPConn, info *ServerInfo) (*kcp.Listener, error) {

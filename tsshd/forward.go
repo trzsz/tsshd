@@ -30,7 +30,12 @@ import (
 	"net"
 	"sync"
 	"sync/atomic"
+	"time"
 )
+
+type closeWriter interface {
+	CloseWrite() error
+}
 
 var acceptMutex sync.Mutex
 var acceptID atomic.Uint64
@@ -94,15 +99,14 @@ func handleListenEvent(stream net.Conn) {
 			trySendErrorMessage("listener %s [%s] accept failed: %v", msg.Network, msg.Addr, err)
 			continue
 		}
-		acceptMutex.Lock()
-		id := acceptID.Add(1) - 1
-		acceptMap[id] = conn
+		id := addAcceptConn(conn)
 		if err := SendMessage(stream, AcceptMessage{id}); err != nil {
-			acceptMutex.Unlock()
+			if conn := getAcceptConn(id); conn != nil {
+				conn.Close()
+			}
 			trySendErrorMessage("send accept message failed: %v", err)
 			return
 		}
-		acceptMutex.Unlock()
 	}
 }
 
@@ -113,16 +117,12 @@ func handleAcceptEvent(stream net.Conn) {
 		return
 	}
 
-	acceptMutex.Lock()
-	defer acceptMutex.Unlock()
-
-	conn, ok := acceptMap[msg.ID]
-	if !ok {
+	conn := getAcceptConn(msg.ID)
+	if conn == nil {
 		SendError(stream, fmt.Errorf("invalid accept id: %d", msg.ID))
 		return
 	}
 
-	delete(acceptMap, msg.ID)
 	defer conn.Close()
 
 	if err := SendSuccess(stream); err != nil { // ack ok
@@ -133,15 +133,47 @@ func handleAcceptEvent(stream net.Conn) {
 	forwardConnection(stream, conn)
 }
 
+func addAcceptConn(conn net.Conn) uint64 {
+	acceptMutex.Lock()
+	defer acceptMutex.Unlock()
+	id := acceptID.Add(1) - 1
+	acceptMap[id] = conn
+	return id
+}
+
+func getAcceptConn(id uint64) net.Conn {
+	acceptMutex.Lock()
+	defer acceptMutex.Unlock()
+	if conn, ok := acceptMap[id]; ok {
+		delete(acceptMap, id)
+		return conn
+	}
+	return nil
+}
+
 func forwardConnection(stream net.Conn, conn net.Conn) {
 	var wg sync.WaitGroup
 	wg.Add(2)
 	go func() {
 		_, _ = io.Copy(conn, stream)
+		if cw, ok := conn.(closeWriter); ok {
+			_ = cw.CloseWrite()
+		} else {
+			// close the entire stream since there is no half-close
+			time.Sleep(200 * time.Millisecond)
+			_ = conn.Close()
+		}
 		wg.Done()
 	}()
 	go func() {
 		_, _ = io.Copy(stream, conn)
+		if cw, ok := stream.(closeWriter); ok {
+			_ = cw.CloseWrite()
+		} else {
+			// close the entire stream since there is no half-close
+			time.Sleep(200 * time.Millisecond)
+			_ = stream.Close()
+		}
 		wg.Done()
 	}()
 	wg.Wait()

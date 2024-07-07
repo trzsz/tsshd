@@ -4,13 +4,15 @@
 [![GitHub Release](https://img.shields.io/github/v/release/trzsz/tsshd)](https://github.com/trzsz/tsshd/releases)
 [![中文文档](https://img.shields.io/badge/%E4%B8%AD%E6%96%87-%E6%96%87%E6%A1%A3-blue?style=flat)](https://github.com/trzsz/tsshd/blob/main/README.cn.md)
 
-The [`tssh --udp`](https://github.com/trzsz/trzsz-ssh) works like [`mosh`](https://github.com/mobile-shell/mosh), and the `tsshd` works like `mosh-server`.
+The `tsshd` works like `mosh-server`, while the [`tssh --udp`](https://github.com/trzsz/trzsz-ssh) works like [`mosh`](https://github.com/mobile-shell/mosh).
 
-## Advanced Features
+## Advantages
 
-- Low latency ( based on QUIC / KCP )
+- Low Latency ( based on [QUIC](https://github.com/quic-go/quic-go) / [KCP](https://github.com/xtaci/kcp-go) )
 
-- Port forwarding ( same as openssh )
+- Port Forwarding ( same as openssh, includes ssh agent forwarding and X11 forwarding )
+
+- _[TODO]_ Connection Migration ( supports network switching and reconnection, depends on [quic-go#234](https://github.com/quic-go/quic-go/issues/234) )
 
 ## How to use
 

@@ -65,6 +65,18 @@ type BusMessage struct {
 	Timeout time.Duration
 }
 
+type X11Request struct {
+	ChannelType      string
+	SingleConnection bool
+	AuthProtocol     string
+	AuthCookie       string
+	ScreenNumber     uint32
+}
+
+type AgentRequest struct {
+	ChannelType string
+}
+
 type StartMessage struct {
 	ID    uint64
 	Pty   bool
@@ -74,6 +86,8 @@ type StartMessage struct {
 	Cols  int
 	Rows  int
 	Envs  map[string]string
+	X11   *X11Request
+	Agent *AgentRequest
 }
 
 type ExitMessage struct {
@@ -89,6 +103,11 @@ type ResizeMessage struct {
 
 type StderrMessage struct {
 	ID uint64
+}
+
+type ChannelMessage struct {
+	ChannelType string
+	ID          uint64
 }
 
 type DialMessage struct {

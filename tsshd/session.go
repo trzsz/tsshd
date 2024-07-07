@@ -34,6 +34,7 @@ import (
 	"runtime"
 	"strings"
 	"sync"
+	"time"
 )
 
 type sessionContext struct {
@@ -172,6 +173,10 @@ func handleSessionEvent(stream net.Conn) {
 		SendError(stream, fmt.Errorf("recv start message failed: %v", err))
 		return
 	}
+
+	handleX11Request(&msg)
+
+	handleAgentRequest(&msg)
 
 	if errStream := getStderrStream(msg.ID); errStream != nil {
 		defer errStream.Close()
@@ -328,4 +333,117 @@ func handleResizeEvent(stream net.Conn) error {
 		return ctx.SetSize(msg.Cols, msg.Rows)
 	}
 	return fmt.Errorf("invalid session id: %d", msg.ID)
+}
+
+func handleX11Request(msg *StartMessage) {
+	if msg.X11 == nil {
+		return
+	}
+	listener, port, err := listenTcpOnFreePort("localhost", 6020, 6999)
+	if err != nil {
+		trySendErrorMessage("X11 forwarding listen failed: %v", err)
+		return
+	}
+	onExitFuncs = append(onExitFuncs, func() {
+		listener.Close()
+	})
+	displayNumber := port - 6000
+	if msg.X11.AuthProtocol != "" && msg.X11.AuthCookie != "" {
+		authDisplay := fmt.Sprintf("unix:%d.%d", displayNumber, msg.X11.ScreenNumber)
+		input := fmt.Sprintf("remove %s\nadd %s %s %s\n", authDisplay, authDisplay, msg.X11.AuthProtocol, msg.X11.AuthCookie)
+		if err := writeXauthData(input); err == nil {
+			onExitFuncs = append(onExitFuncs, func() {
+				_ = writeXauthData(fmt.Sprintf("remove %s\n", authDisplay))
+			})
+		}
+	}
+	go handleChannelAccept(listener, msg.X11.ChannelType)
+	msg.Envs["DISPLAY"] = fmt.Sprintf("localhost:%d.%d", displayNumber, msg.X11.ScreenNumber)
+}
+
+func listenTcpOnFreePort(host string, low, high int) (net.Listener, int, error) {
+	var err error
+	var listener net.Listener
+	for port := low; port <= high; port++ {
+		listener, err = net.Listen("tcp", fmt.Sprintf("%s:%d", host, port))
+		if err == nil {
+			return listener, port, nil
+		}
+	}
+	if err != nil {
+		return nil, 0, fmt.Errorf("listen tcp on %s:[%d,%d] failed: %v", host, low, high, err)
+	}
+	return nil, 0, fmt.Errorf("listen tcp on %s:[%d,%d] failed", host, low, high)
+}
+
+func writeXauthData(input string) error {
+	cmd := exec.Command("xauth", "-q", "-")
+	stdin, err := cmd.StdinPipe()
+	if err != nil {
+		return err
+	}
+	defer stdin.Close()
+	if err := cmd.Start(); err != nil {
+		return err
+	}
+	if _, err := stdin.Write([]byte(input)); err != nil {
+		return err
+	}
+	stdin.Close()
+	done := make(chan struct{}, 1)
+	go func() {
+		defer close(done)
+		_ = cmd.Wait()
+		done <- struct{}{}
+	}()
+	select {
+	case <-time.After(200 * time.Millisecond):
+	case <-done:
+	}
+	return nil
+}
+
+func handleAgentRequest(msg *StartMessage) {
+	if msg.Agent == nil {
+		return
+	}
+	tempDir, err := os.MkdirTemp("", "tsshd-")
+	if err != nil {
+		trySendErrorMessage("agent forwarding mkdir temp failed: %v", err)
+		return
+	}
+	onExitFuncs = append(onExitFuncs, func() {
+		_ = os.RemoveAll(tempDir)
+	})
+	agentPath := filepath.Join(tempDir, fmt.Sprintf("agent.%d", os.Getpid()))
+	listener, err := net.Listen("unix", agentPath)
+	if err != nil {
+		trySendErrorMessage("agent forwarding listen on [%s] failed: %v", agentPath, err)
+		return
+	}
+	if err := os.Chmod(agentPath, 0600); err != nil {
+		trySendErrorMessage("agent forwarding chmod [%s] failed: %v", agentPath, err)
+	}
+	onExitFuncs = append(onExitFuncs, func() {
+		listener.Close()
+		_ = os.Remove(agentPath)
+	})
+	go handleChannelAccept(listener, msg.Agent.ChannelType)
+	msg.Envs["SSH_AUTH_SOCK"] = agentPath
+}
+
+func handleChannelAccept(listener net.Listener, channelType string) {
+	for {
+		conn, err := listener.Accept()
+		if err != nil {
+			trySendErrorMessage("channel accept failed: %v", err)
+			break
+		}
+		go func(conn net.Conn) {
+			id := addAcceptConn(conn)
+			if err := sendBusMessage("channel", &ChannelMessage{ChannelType: channelType, ID: id}); err != nil {
+				trySendErrorMessage("send channel message failed: %v", err)
+			}
+		}(conn)
+	}
 }
