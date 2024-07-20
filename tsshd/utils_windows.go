@@ -31,7 +31,7 @@ import (
 	"strings"
 	"syscall"
 
-	"github.com/trzsz/tsshd/internal/conpty"
+	"github.com/UserExistsError/conpty"
 	"golang.org/x/sys/windows"
 )
 
