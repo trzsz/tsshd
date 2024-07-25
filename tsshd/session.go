@@ -48,6 +48,7 @@ type sessionContext struct {
 	stdout  io.ReadCloser
 	stderr  io.ReadCloser
 	started bool
+	closed  bool
 }
 
 type stderrStream struct {
@@ -130,6 +131,10 @@ func (c *sessionContext) Wait() {
 }
 
 func (c *sessionContext) Close() {
+	if c.closed {
+		return
+	}
+	c.closed = true
 	if err := sendBusMessage("exit", ExitMessage{
 		ID:       c.id,
 		ExitCode: c.cmd.ProcessState.ExitCode(),
@@ -445,5 +450,18 @@ func handleChannelAccept(listener net.Listener, channelType string) {
 				trySendErrorMessage("send channel message failed: %v", err)
 			}
 		}(conn)
+	}
+}
+
+func closeAllSessions() {
+	sessionMutex.Lock()
+	var sessions []*sessionContext
+	for _, session := range sessionMap {
+		sessions = append(sessions, session)
+	}
+	sessionMutex.Unlock()
+
+	for _, session := range sessions {
+		session.Close()
 	}
 }

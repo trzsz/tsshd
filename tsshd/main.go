@@ -29,6 +29,8 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"os/signal"
+	"syscall"
 	"time"
 
 	"github.com/trzsz/go-arg"
@@ -99,6 +101,9 @@ func TsshdMain() int {
 	// cleanup on exit
 	defer cleanupOnExit()
 
+	// handle exit signals
+	handleExitSignals()
+
 	kcpListener, quicListener, err := initServer(&args)
 	if err != nil {
 		fmt.Println(err)
@@ -126,4 +131,19 @@ func TsshdMain() int {
 	}()
 
 	return <-exitChan
+}
+
+func handleExitSignals() {
+	sigChan := make(chan os.Signal, 1)
+	signal.Notify(sigChan,
+		syscall.SIGTERM, // Default signal for the kill command
+		syscall.SIGINT,  // Ctrl+C signal
+		syscall.SIGHUP,  // Terminal closed (System reboot/shutdown)
+	)
+
+	go func() {
+		<-sigChan
+		trySendErrorMessage("tsshd has been terminated")
+		closeAllSessions()
+	}()
 }
