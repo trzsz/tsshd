@@ -41,7 +41,8 @@ const kTsshdVersion = "0.1.2"
 var exitChan = make(chan int, 1)
 
 type tsshdArgs struct {
-	KCP bool `arg:"--kcp" help:"KCP protocol (default is QUIC protocol)"`
+	KCP  bool   `arg:"--kcp" help:"KCP protocol (default is QUIC protocol)"`
+	Port string `arg:"--port" placeholder:"low-high" help:"UDP port range that the tsshd listens on"`
 }
 
 func (tsshdArgs) Description() string {

@@ -37,7 +37,10 @@ import (
 	"math/big"
 	math_rand "math/rand"
 	"net"
+	"strconv"
+	"strings"
 	"time"
+	"unicode"
 
 	"github.com/quic-go/quic-go"
 	"github.com/xtaci/kcp-go/v5"
@@ -60,8 +63,7 @@ var quicConfig = quic.Config{
 }
 
 func initServer(args *tsshdArgs) (*kcp.Listener, *quic.Listener, error) {
-	portRangeLow := kDefaultPortRangeLow
-	portRangeHigh := kDefaultPortRangeHigh
+	portRangeLow, portRangeHigh := getPortRange(args)
 	conn, port, err := listenUdpOnFreePort(portRangeLow, portRangeHigh)
 	if err != nil {
 		return nil, nil, err
@@ -96,6 +98,27 @@ func initServer(args *tsshdArgs) (*kcp.Listener, *quic.Listener, error) {
 	fmt.Printf("\a%s\r\n", string(infoStr))
 
 	return kcpListener, quicListener, nil
+}
+
+func getPortRange(args *tsshdArgs) (int, int) {
+	if args.Port == "" {
+		return kDefaultPortRangeLow, kDefaultPortRangeHigh
+	}
+	ports := strings.FieldsFunc(args.Port, func(c rune) bool {
+		return unicode.IsSpace(c) || c == ',' || c == '-'
+	})
+	if len(ports) == 1 {
+		if port, err := strconv.Atoi(ports[0]); err == nil {
+			return port, port
+		}
+	} else if len(ports) == 2 {
+		port0, err0 := strconv.Atoi(ports[0])
+		port1, err1 := strconv.Atoi(ports[1])
+		if err0 == nil && err1 == nil {
+			return port0, port1
+		}
+	}
+	return kDefaultPortRangeLow, kDefaultPortRangeHigh
 }
 
 func listenUdpOnFreePort(low, high int) (*net.UDPConn, int, error) {
