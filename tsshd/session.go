@@ -31,10 +31,13 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"runtime"
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/alessio/shellescape"
 )
 
 type sessionContext struct {
@@ -286,7 +289,42 @@ func getSessionStartCmd(msg *StartMessage) (*exec.Cmd, error) {
 	}
 
 	if !msg.Shell {
-		cmd := exec.Command(msg.Name, msg.Args...)
+		name := msg.Name
+		args := msg.Args
+		wrap := false
+		if name == "cd" {
+			wrap = true
+		} else if _, err := exec.LookPath(name); err != nil {
+			wrap = true
+		} else {
+			for _, arg := range args {
+				if strings.HasPrefix(arg, "~/") {
+					wrap = true
+					break
+				}
+			}
+		}
+		if wrap {
+			re := regexp.MustCompile(`\s`)
+			var buf strings.Builder
+			buf.WriteString(name)
+			for _, arg := range args {
+				buf.WriteByte(' ')
+				if re.MatchString(arg) {
+					buf.WriteString(shellescape.Quote(arg))
+				} else {
+					buf.WriteString(arg)
+				}
+			}
+			if runtime.GOOS == "windows" {
+				name = "cmd"
+				args = []string{"/c", buf.String()}
+			} else {
+				name = "sh"
+				args = []string{"-c", buf.String()}
+			}
+		}
+		cmd := exec.Command(name, args...)
 		cmd.Env = envs
 		return cmd, nil
 	}
