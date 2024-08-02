@@ -12,6 +12,7 @@ builds:
       - linux
       - windows
       - darwin
+      - freebsd
     goarch:
       - "386"
       - amd64
@@ -26,6 +27,10 @@ builds:
         goarch: arm
       - goos: darwin
         goarch: arm
+      - goos: freebsd
+        goarch: arm
+      - goos: freebsd
+        goarch: "386"
 archives:
   - id: tsshd
     name_template: >-
