@@ -36,7 +36,7 @@ import (
 	"github.com/trzsz/go-arg"
 )
 
-const kTsshdVersion = "0.1.2"
+const kTsshdVersion = "0.1.3"
 
 var exitChan = make(chan int, 1)
 
