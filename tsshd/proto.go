@@ -62,7 +62,8 @@ type ErrorMessage struct {
 }
 
 type BusMessage struct {
-	Timeout time.Duration
+	Timeout  time.Duration
+	Interval time.Duration
 }
 
 type X11Request struct {
@@ -211,13 +212,14 @@ func RecvError(stream net.Conn) error {
 		return fmt.Errorf("recv error failed: %v", err)
 	}
 	if errMsg.Msg != kNoErrorMsg {
-		return fmt.Errorf(errMsg.Msg)
+		return fmt.Errorf("%s", errMsg.Msg)
 	}
 	return nil
 }
 
 type Client interface {
 	Close() error
+	Reconnect() error
 	NewStream() (net.Conn, error)
 }
 
@@ -229,6 +231,10 @@ func (c *kcpClient) Close() error {
 	return c.session.Close()
 }
 
+func (c *kcpClient) Reconnect() error {
+	return fmt.Errorf("KCP mode does not support reconnection")
+}
+
 func (c *kcpClient) NewStream() (net.Conn, error) {
 	stream, err := c.session.OpenStream()
 	if err != nil {
@@ -238,11 +244,42 @@ func (c *kcpClient) NewStream() (net.Conn, error) {
 }
 
 type quicClient struct {
-	conn quic.Connection
+	conn      quic.Connection
+	transport *quic.Transport
 }
 
 func (c *quicClient) Close() error {
-	return c.conn.CloseWithError(0, "")
+	err1 := c.conn.CloseWithError(0, "")
+	// TODO do we need to close the transport manually?
+	err2 := c.transport.Close()
+	err3 := c.transport.Conn.Close()
+	if err1 != nil || err2 != nil || err3 != nil {
+		return fmt.Errorf("close failed: %v, %v, %v", err1, err2, err3)
+	}
+	return nil
+}
+
+func (c *quicClient) Reconnect() error {
+	transport, err := newQuicTransport()
+	if err != nil {
+		return fmt.Errorf("new quic transport failed: %v", err)
+	}
+	path, err := c.conn.AddPath(transport)
+	if err != nil {
+		return fmt.Errorf("quic add path failed: %v", err)
+	}
+	if err := path.Probe(context.Background()); err != nil {
+		return fmt.Errorf("quic path probe failed: %v", err)
+	}
+	time.Sleep(3 * 200 * time.Millisecond) // wait for ACKs
+	if err := path.Switch(); err != nil {
+		return fmt.Errorf("quic path switch failed: %v", err)
+	}
+	// TODO should we close the old transport here?
+	// _ = c.transport.Close()
+	// _ = c.transport.Conn.Close()
+	c.transport = transport
+	return nil
 }
 
 func (c *quicClient) NewStream() (net.Conn, error) {
@@ -319,11 +356,27 @@ func newQuicClient(host string, info *ServerInfo) (Client, error) {
 		ServerName:   "tsshd",
 	}
 	addr := joinHostPort(host, info.Port)
-	conn, err := quic.DialAddr(context.Background(), addr, tlsConfig, &quicConfig)
+	transport, err := newQuicTransport()
 	if err != nil {
-		return nil, fmt.Errorf("quic dail [%s] failed: %v", addr, err)
+		return nil, fmt.Errorf("new quic transport failed: %v", err)
 	}
-	return &quicClient{conn}, nil
+	udpAddr, err := net.ResolveUDPAddr("udp", addr)
+	if err != nil {
+		return nil, fmt.Errorf("resolve udp addr [%s] failed: %v", addr, err)
+	}
+	conn, err := transport.Dial(context.Background(), udpAddr, tlsConfig, &quicConfig)
+	if err != nil {
+		return nil, fmt.Errorf("quic transport dail [%s] failed: %v", addr, err)
+	}
+	return &quicClient{conn, transport}, nil
+}
+
+func newQuicTransport() (*quic.Transport, error) {
+	udpConn, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4zero, Port: 0})
+	if err != nil {
+		return nil, fmt.Errorf("listen udp failed: %v", err)
+	}
+	return &quic.Transport{Conn: udpConn}, nil
 }
 
 func joinHostPort(host string, port int) string {

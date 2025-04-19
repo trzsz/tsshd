@@ -96,7 +96,7 @@ func handleBusEvent(stream net.Conn) {
 	if msg.Timeout > 0 {
 		now := time.Now()
 		lastAliveTime.Store(&now)
-		go keepAlive(msg.Timeout)
+		go keepAlive(msg.Timeout, msg.Interval)
 	}
 
 	for {
@@ -132,23 +132,22 @@ func handleUnknownEvent(stream net.Conn) error {
 	return fmt.Errorf("unknown command")
 }
 
-func keepAlive(timeout time.Duration) {
-	sleepTime := timeout / 10
-	if sleepTime > 10*time.Second {
-		sleepTime = 10 * time.Second
+func keepAlive(totalTimeout time.Duration, intervalTimeout time.Duration) {
+	if intervalTimeout == 0 {
+		intervalTimeout = min(totalTimeout/10, 10*time.Second)
 	}
 	go func() {
 		for {
 			_ = sendBusCommand("alive")
-			time.Sleep(sleepTime)
+			time.Sleep(intervalTimeout)
 		}
 	}()
 	for {
-		if t := lastAliveTime.Load(); t != nil && time.Since(*t) > timeout {
+		if t := lastAliveTime.Load(); t != nil && time.Since(*t) > totalTimeout {
 			trySendErrorMessage("tsshd keep alive timeout")
 			exitChan <- 2
 			return
 		}
-		time.Sleep(sleepTime)
+		time.Sleep(intervalTimeout)
 	}
 }
