@@ -12,7 +12,7 @@ The `tsshd` works like `mosh-server`, while the [`tssh --udp`](https://github.co
 
 - Port Forwarding ( same as openssh, includes ssh agent forwarding and X11 forwarding )
 
-- _[TODO]_ Connection Migration ( supports network switching and reconnection, depends on [quic-go#234](https://github.com/quic-go/quic-go/issues/234) )
+- Connection Migration ( supports network switching and reconnection )
 
 ## How to use
 
@@ -112,7 +112,7 @@ The `tsshd` works like `mosh-server`, while the [`tssh --udp`](https://github.co
 
   </details>
 
-- Install with Go ( Requires go 1.21 or later )
+- Install with Go ( Requires go 1.24 or later )
 
   <details><summary><code>go install github.com/trzsz/tsshd/cmd/tsshd@latest</code></summary>
 
@@ -124,7 +124,7 @@ The `tsshd` works like `mosh-server`, while the [`tssh --udp`](https://github.co
 
   </details>
 
-- Build from source ( Requires go 1.21 or later )
+- Build from source ( Requires go 1.24 or later )
 
   <details><summary><code>sudo make install</code></summary>
 

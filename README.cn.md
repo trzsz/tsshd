@@ -11,7 +11,7 @@
 
 - 端口转发（ 与 openssh 相同，包括 ssh agent 转发和 X11 转发 ）
 
-- _[TODO]_ 连接迁移（ 支持网络切换和掉线重连，依赖于 [quic-go#234](https://github.com/quic-go/quic-go/issues/234) ）
+- 连接迁移（ 支持网络切换和掉线重连 ）
 
 ## 如何使用
 
@@ -111,7 +111,7 @@
 
   </details>
 
-- 用 Go 直接安装（ 要求 go 1.21 以上 ）
+- 用 Go 直接安装（ 要求 go 1.24 以上 ）
 
   <details><summary><code>go install github.com/trzsz/tsshd/cmd/tsshd@latest</code></summary>
 
@@ -123,7 +123,7 @@
 
   </details>
 
-- 用 Go 自己编译（ 要求 go 1.21 以上 ）
+- 用 Go 自己编译（ 要求 go 1.24 以上 ）
 
   <details><summary><code>sudo make install</code></summary>
 

@@ -250,7 +250,6 @@ type quicClient struct {
 
 func (c *quicClient) Close() error {
 	err1 := c.conn.CloseWithError(0, "")
-	// TODO do we need to close the transport manually?
 	err2 := c.transport.Close()
 	err3 := c.transport.Conn.Close()
 	if err1 != nil || err2 != nil || err3 != nil {
@@ -268,16 +267,16 @@ func (c *quicClient) Reconnect() error {
 	if err != nil {
 		return fmt.Errorf("quic add path failed: %v", err)
 	}
-	if err := path.Probe(context.Background()); err != nil {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := path.Probe(ctx); err != nil {
 		return fmt.Errorf("quic path probe failed: %v", err)
 	}
-	time.Sleep(3 * 200 * time.Millisecond) // wait for ACKs
 	if err := path.Switch(); err != nil {
 		return fmt.Errorf("quic path switch failed: %v", err)
 	}
-	// TODO should we close the old transport here?
-	// _ = c.transport.Close()
-	// _ = c.transport.Conn.Close()
+	_ = c.transport.Close()
+	_ = c.transport.Conn.Close()
 	c.transport = transport
 	return nil
 }
@@ -364,7 +363,9 @@ func newQuicClient(host string, info *ServerInfo) (Client, error) {
 	if err != nil {
 		return nil, fmt.Errorf("resolve udp addr [%s] failed: %v", addr, err)
 	}
-	conn, err := transport.Dial(context.Background(), udpAddr, tlsConfig, &quicConfig)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	conn, err := transport.Dial(ctx, udpAddr, tlsConfig, &quicConfig)
 	if err != nil {
 		return nil, fmt.Errorf("quic transport dail [%s] failed: %v", addr, err)
 	}
