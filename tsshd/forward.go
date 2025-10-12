@@ -28,6 +28,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"os"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -83,6 +84,12 @@ func handleListenEvent(stream net.Conn) {
 		return
 	}
 
+	onExitFuncs = append(onExitFuncs, func() {
+		listener.Close()
+		if msg.Network == "unix" {
+			_ = os.Remove(msg.Addr)
+		}
+	})
 	defer listener.Close()
 
 	if err := SendSuccess(stream); err != nil { // ack ok
