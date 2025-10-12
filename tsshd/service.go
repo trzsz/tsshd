@@ -43,8 +43,8 @@ var smuxConfig = smux.Config{
 }
 
 type quicStream struct {
-	quic.Stream
-	conn quic.Connection
+	*quic.Stream
+	conn *quic.Conn
 }
 
 func (s *quicStream) LocalAddr() net.Addr {
@@ -102,7 +102,7 @@ func serveQUIC(listener *quic.Listener) {
 	}
 }
 
-func handleQuicConn(conn quic.Connection) {
+func handleQuicConn(conn *quic.Conn) {
 	defer func() {
 		_ = conn.CloseWithError(0, "")
 	}()

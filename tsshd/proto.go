@@ -244,7 +244,7 @@ func (c *kcpClient) NewStream() (net.Conn, error) {
 }
 
 type quicClient struct {
-	conn      quic.Connection
+	conn      *quic.Conn
 	transport *quic.Transport
 }
 
