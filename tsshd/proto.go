@@ -55,6 +55,9 @@ type ServerInfo struct {
 	ServerCert string
 	ClientCert string
 	ClientKey  string
+	ProxyKey   string
+	ClientID   uint64
+	ServerID   uint64
 }
 
 type ErrorMessage struct {
@@ -224,7 +227,9 @@ type Client interface {
 }
 
 type kcpClient struct {
-	session *smux.Session
+	session        *smux.Session
+	proxy          *clientProxy
+	connectTimeout time.Duration
 }
 
 func (c *kcpClient) Close() error {
@@ -232,7 +237,10 @@ func (c *kcpClient) Close() error {
 }
 
 func (c *kcpClient) Reconnect() error {
-	return fmt.Errorf("KCP mode does not support reconnection")
+	if c.proxy != nil {
+		return c.proxy.renewUdpPath(c.connectTimeout)
+	}
+	return fmt.Errorf("no proxy for connection migration")
 }
 
 func (c *kcpClient) NewStream() (net.Conn, error) {
@@ -244,65 +252,59 @@ func (c *kcpClient) NewStream() (net.Conn, error) {
 }
 
 type quicClient struct {
-	conn      *quic.Conn
-	transport *quic.Transport
+	conn           *quic.Conn
+	proxy          *clientProxy
+	connectTimeout time.Duration
 }
 
 func (c *quicClient) Close() error {
-	err1 := c.conn.CloseWithError(0, "")
-	err2 := c.transport.Close()
-	err3 := c.transport.Conn.Close()
-	if err1 != nil || err2 != nil || err3 != nil {
-		return fmt.Errorf("close failed: %v, %v, %v", err1, err2, err3)
-	}
-	return nil
+	return c.conn.CloseWithError(0, "")
 }
 
 func (c *quicClient) Reconnect() error {
-	transport, err := newQuicTransport()
-	if err != nil {
-		return fmt.Errorf("new quic transport failed: %v", err)
+	if c.proxy != nil {
+		return c.proxy.renewUdpPath(c.connectTimeout)
 	}
-	path, err := c.conn.AddPath(transport)
-	if err != nil {
-		return fmt.Errorf("quic add path failed: %v", err)
-	}
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	if err := path.Probe(ctx); err != nil {
-		return fmt.Errorf("quic path probe failed: %v", err)
-	}
-	if err := path.Switch(); err != nil {
-		return fmt.Errorf("quic path switch failed: %v", err)
-	}
-	_ = c.transport.Close()
-	_ = c.transport.Conn.Close()
-	c.transport = transport
-	return nil
+	return fmt.Errorf("no proxy for connection migration")
 }
 
 func (c *quicClient) NewStream() (net.Conn, error) {
-	stream, err := c.conn.OpenStreamSync(context.Background())
+	ctx, cancel := context.WithTimeout(context.Background(), c.connectTimeout)
+	defer cancel()
+	stream, err := c.conn.OpenStreamSync(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("quic open stream sync failed: %v", err)
 	}
 	return &quicStream{stream, c.conn}, err
 }
 
-func NewClient(host string, info *ServerInfo) (Client, error) {
+func NewClient(host string, info *ServerInfo, connectTimeout time.Duration) (Client, error) {
+	var proxy *clientProxy
+	addr := joinHostPort(host, info.Port)
+	if info.ProxyKey != "" {
+		var err error
+		addr, proxy, err = startClientProxy(addr, info)
+		if err != nil {
+			return nil, err
+		}
+		if err := proxy.renewUdpPath(connectTimeout); err != nil {
+			return nil, err
+		}
+	}
+
 	switch info.Mode {
 	case "":
 		return nil, fmt.Errorf("Please upgrade tsshd.")
 	case kModeKCP:
-		return newKcpClient(host, info)
+		return newKcpClient(addr, info, proxy, connectTimeout)
 	case kModeQUIC:
-		return newQuicClient(host, info)
+		return newQuicClient(addr, info, proxy, connectTimeout)
 	default:
 		return nil, fmt.Errorf("unknown tsshd mode: %s", info.Mode)
 	}
 }
 
-func newKcpClient(host string, info *ServerInfo) (Client, error) {
+func newKcpClient(addr string, info *ServerInfo, proxy *clientProxy, connectTimeout time.Duration) (Client, error) {
 	pass, err := hex.DecodeString(info.Pass)
 	if err != nil {
 		return nil, fmt.Errorf("decode pass [%s] failed: %v", info.Pass, err)
@@ -311,7 +313,6 @@ func newKcpClient(host string, info *ServerInfo) (Client, error) {
 	if err != nil {
 		return nil, fmt.Errorf("decode salt [%s] failed: %v", info.Pass, err)
 	}
-	addr := joinHostPort(host, info.Port)
 	key := pbkdf2.Key(pass, salt, 4096, 32, sha1.New)
 	block, err := kcp.NewAESBlockCrypt(key)
 	if err != nil {
@@ -326,10 +327,10 @@ func newKcpClient(host string, info *ServerInfo) (Client, error) {
 	if err != nil {
 		return nil, fmt.Errorf("kcp smux client failed: %v", err)
 	}
-	return &kcpClient{session}, nil
+	return &kcpClient{session, proxy, connectTimeout}, nil
 }
 
-func newQuicClient(host string, info *ServerInfo) (Client, error) {
+func newQuicClient(addr string, info *ServerInfo, proxy *clientProxy, connectTimeout time.Duration) (Client, error) {
 	serverCert, err := hex.DecodeString(info.ServerCert)
 	if err != nil {
 		return nil, fmt.Errorf("decode server cert [%s] failed: %v", info.ServerCert, err)
@@ -354,30 +355,13 @@ func newQuicClient(host string, info *ServerInfo) (Client, error) {
 		RootCAs:      serverCertPool,
 		ServerName:   "tsshd",
 	}
-	addr := joinHostPort(host, info.Port)
-	transport, err := newQuicTransport()
-	if err != nil {
-		return nil, fmt.Errorf("new quic transport failed: %v", err)
-	}
-	udpAddr, err := net.ResolveUDPAddr("udp", addr)
-	if err != nil {
-		return nil, fmt.Errorf("resolve udp addr [%s] failed: %v", addr, err)
-	}
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), connectTimeout)
 	defer cancel()
-	conn, err := transport.Dial(ctx, udpAddr, tlsConfig, &quicConfig)
+	conn, err := quic.DialAddr(ctx, addr, tlsConfig, &quicConfig)
 	if err != nil {
-		return nil, fmt.Errorf("quic transport dail [%s] failed: %v", addr, err)
+		return nil, fmt.Errorf("quic dail [%s] failed: %v", addr, err)
 	}
-	return &quicClient{conn, transport}, nil
-}
-
-func newQuicTransport() (*quic.Transport, error) {
-	udpConn, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4zero, Port: 0})
-	if err != nil {
-		return nil, fmt.Errorf("listen udp failed: %v", err)
-	}
-	return &quic.Transport{Conn: udpConn}, nil
+	return &quicClient{conn, proxy, connectTimeout}, nil
 }
 
 func joinHostPort(host string, port int) string {

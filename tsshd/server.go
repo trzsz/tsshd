@@ -74,6 +74,13 @@ func initServer(args *tsshdArgs) (*kcp.Listener, *quic.Listener, error) {
 		Port: port,
 	}
 
+	if args.Proxy {
+		conn, err = startServerProxy(conn, info)
+		if err != nil {
+			return nil, nil, err
+		}
+	}
+
 	var kcpListener *kcp.Listener
 	var quicListener *quic.Listener
 	if args.KCP {

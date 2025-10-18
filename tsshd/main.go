@@ -30,10 +30,9 @@ import (
 	"os"
 	"os/exec"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
-
-	"github.com/trzsz/go-arg"
 )
 
 const kTsshdVersion = "0.1.4"
@@ -41,16 +40,50 @@ const kTsshdVersion = "0.1.4"
 var exitChan = make(chan int, 1)
 
 type tsshdArgs struct {
-	KCP  bool   `arg:"--kcp" help:"KCP protocol (default is QUIC protocol)"`
-	Port string `arg:"--port" placeholder:"low-high" help:"UDP port range that the tsshd listens on"`
+	Help    bool
+	Version bool
+	KCP     bool
+	Proxy   bool
+	Port    string
 }
 
-func (tsshdArgs) Description() string {
-	return "tsshd works with `tssh --udp`, just like mosh-server.\n"
+func printVersion() {
+	fmt.Printf("trzsz sshd %s\n", kTsshdVersion)
 }
 
-func (tsshdArgs) Version() string {
-	return fmt.Sprintf("trzsz sshd %s", kTsshdVersion)
+func printHelp() {
+	fmt.Printf("usage: tsshd [-h] [-v] [--kcp] [--proxy] [--port low-high]\n\n" +
+		"tsshd works with `tssh --udp`, just like mosh-server.\n\n" +
+		"optional arguments:\n" +
+		"  -h, --help             show this help message and exit\n" +
+		"  -v, --version          show program's version number and exit\n" +
+		"  --kcp                  KCP protocol (default is QUIC protocol)\n" +
+		"  --proxy                With UDP proxy for connection migration\n" +
+		"  --port low-high        UDP port range that the tsshd listens on\n")
+}
+
+func parseTsshdArgs() *tsshdArgs {
+	args := &tsshdArgs{}
+	for i := 1; i < len(os.Args); i++ {
+		switch os.Args[i] {
+		case "-h", "--help":
+			args.Help = true
+			return args
+		case "-v", "--version":
+			args.Version = true
+			return args
+		case "--kcp":
+			args.KCP = true
+		case "--proxy":
+			args.Proxy = true
+		case "--port":
+			if i+1 < len(os.Args) && !strings.HasPrefix(os.Args[i+1], "-") {
+				args.Port = os.Args[i+1]
+				i++
+			}
+		}
+	}
+	return args
 }
 
 func background() (bool, io.ReadCloser, error) {
@@ -81,8 +114,15 @@ func cleanupOnExit() {
 
 // TsshdMain is the main function of `tsshd` binary.
 func TsshdMain() int {
-	var args tsshdArgs
-	arg.MustParse(&args)
+	args := parseTsshdArgs()
+	if args.Help {
+		printHelp()
+		return 0
+	}
+	if args.Version {
+		printVersion()
+		return 0
+	}
 
 	parent, stdout, err := background()
 	if err != nil {
@@ -105,7 +145,7 @@ func TsshdMain() int {
 	// handle exit signals
 	handleExitSignals()
 
-	kcpListener, quicListener, err := initServer(&args)
+	kcpListener, quicListener, err := initServer(args)
 	if err != nil {
 		fmt.Println(err)
 		os.Stdout.Close()
