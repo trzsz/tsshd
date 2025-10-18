@@ -52,7 +52,7 @@ func (p *tsshdPty) Close() error {
 }
 
 func (p *tsshdPty) Resize(cols, rows int) error {
-	return p.cpty.Resize(cols, rows)
+	return p.cpty.Resize(cols-1, rows)
 }
 
 func newTsshdPty(cmd *exec.Cmd, cols, rows int) (*tsshdPty, error) {
@@ -63,7 +63,7 @@ func newTsshdPty(cmd *exec.Cmd, cols, rows int) (*tsshdPty, error) {
 		}
 		cmdLine.WriteString(windows.EscapeArg(arg))
 	}
-	cpty, err := conpty.Start(cmdLine.String(), conpty.ConPtyDimensions(cols, rows), conpty.ConPtyEnv(cmd.Env))
+	cpty, err := conpty.Start(cmdLine.String(), conpty.ConPtyDimensions(cols-1, rows), conpty.ConPtyEnv(cmd.Env))
 	if err != nil {
 		return nil, err
 	}
