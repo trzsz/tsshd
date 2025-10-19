@@ -12,7 +12,9 @@ The `tsshd` works like `mosh-server`, while the [`tssh --udp`](https://github.co
 
 - Port Forwarding ( same as openssh, includes ssh agent forwarding and X11 forwarding )
 
-- Connection Migration ( supports network switching and reconnection )
+- Connection Migration ( supports client sleep and wake-up, network switching, reconnection, etc. )
+
+- Proxy Jump ( First hop supports UDP: `Client ---udp--> JumpServer ---tcp--> TargetServer` )
 
 ## How to use
 
