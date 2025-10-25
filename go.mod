@@ -7,7 +7,6 @@ require (
 	github.com/alessio/shellescape v1.4.2
 	github.com/creack/pty v1.1.24
 	github.com/quic-go/quic-go v0.55.0
-	github.com/trzsz/go-arg v1.5.4
 	github.com/xtaci/kcp-go/v5 v5.6.24
 	github.com/xtaci/smux v1.5.35
 	golang.org/x/crypto v0.43.0
@@ -15,7 +14,6 @@ require (
 )
 
 require (
-	github.com/alexflint/go-scalar v1.2.0 // indirect
 	github.com/google/go-cmp v0.7.0 // indirect
 	github.com/klauspost/cpuid/v2 v2.3.0 // indirect
 	github.com/klauspost/reedsolomon v1.12.5 // indirect

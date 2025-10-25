@@ -27,6 +27,8 @@
    Host xxx
        #!! UdpMode yes
        #!! TsshdPath ~/go/bin/tsshd
+       #!! UdpPort 61000-62000
+       #!! UdpAliveTimeout 86400
    ```
 
 ## 原理简介
@@ -35,7 +37,9 @@
 
 - `tssh` 会先作为一个 ssh 客户端正常登录到服务器上，然后在服务器上启动一个新的 `tsshd` 进程。
 
-- `tsshd` 进程会随机侦听一个 61000 到 62000 之间的 UDP 端口，并将其端口和密钥通过 ssh 通道发回给 `tssh` 进程。登录的 ssh 连接会被关闭，然后 `tssh` 进程通过 UDP 与 `tsshd` 进程通讯。
+- `tsshd` 进程会随机侦听一个 61000 到 62000 之间的 UDP 端口（可通过 `UdpPort` 配置自定义），并将其端口和密钥通过 ssh 通道发回给 `tssh` 进程。登录的 ssh 连接会被关闭，然后 `tssh` 进程通过 UDP 与 `tsshd` 进程通讯。
+
+- `tsshd` 进程会在网络断开超过 24 小时后退出（默认情况下），可以通过修改 `UdpAliveTimeout` 配置来调整（单位：秒）。
 
 - `tsshd` 支持 `QUIC` 协议和 `KCP` 协议（默认是 `QUIC` 协议），可以命令行指定（如 `-oUdpMode=KCP`），或如下配置：
 
