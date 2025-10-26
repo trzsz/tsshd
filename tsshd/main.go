@@ -35,7 +35,7 @@ import (
 	"time"
 )
 
-const kTsshdVersion = "0.1.4"
+const kTsshdVersion = "0.1.5"
 
 var exitChan = make(chan int, 1)
 
