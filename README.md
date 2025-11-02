@@ -1,55 +1,90 @@
-# tsshd
+## tsshd - tssh server that supports connection migration for roaming
 
 [![MIT License](https://img.shields.io/badge/license-MIT-green.svg?style=flat)](https://choosealicense.com/licenses/mit/)
 [![GitHub Release](https://img.shields.io/github/v/release/trzsz/tsshd)](https://github.com/trzsz/tsshd/releases)
 [![中文文档](https://img.shields.io/badge/%E4%B8%AD%E6%96%87-%E6%96%87%E6%A1%A3-blue?style=flat)](https://github.com/trzsz/tsshd/blob/main/README.cn.md)
 
-The `tsshd` works like `mosh-server`, while the [`tssh --udp`](https://github.com/trzsz/trzsz-ssh) works like [`mosh`](https://github.com/mobile-shell/mosh).
+trzsz-ssh ( tssh ) with tsshd supports intermittent connectivity, allows roaming, and can be used on high-latency links such as cellular data connections, unstable Wi-Fi, etc.
 
-## Advantages
+It aims to provide complete compatibility with openssh, mirroring all its features, while also offering additional useful features not found in the openssh client, plus:
 
-- Low Latency ( based on [QUIC](https://github.com/quic-go/quic-go) / [KCP](https://github.com/xtaci/kcp-go) )
+- Keeps the session alive if the client goes to sleep and wakes up later, or temporarily loses its connection.
 
-- Port Forwarding ( same as openssh, includes ssh agent forwarding and X11 forwarding )
+- Allows the client to "roam" and change IP addresses, switching between any networks, while keeping alive.
 
-- Connection Migration ( supports client sleep and wake-up, network switching, reconnection, etc. )
+### Comparison
 
-- Proxy Jump ( First hop supports UDP: `Client ---udp--> JumpServer ---tcp--> TargetServer` )
+tsshd was inspired by [mosh](https://github.com/mobile-shell/mosh), and the `tsshd` works like `mosh-server`, while the `tssh --udp` works like `mosh`.
 
-## How to use
+| Feature                   |                     mosh ( mosh-server )                      |              tssh ( tsshd )               |
+| ------------------------- | :-----------------------------------------------------------: | :---------------------------------------: |
+| Low Latency               |                              ??                               | ✅ [KCP](https://github.com/xtaci/kcp-go) |
+| Keep Alive                |                              ✅                               |                    ✅                     |
+| Client Roaming            |                              ✅                               |                    ✅                     |
+| Local Echo & Line Editing |                              ✅                               |                Not Planned                |
+| Multi Platform / Windows  |  [mosh#293](https://github.com/mobile-shell/mosh/issues/293)  |                    ✅                     |
+| SSH X11 Forwarding        |   [mosh#41](https://github.com/mobile-shell/mosh/issues/41)   |                    ✅                     |
+| SSH Agent Forwarding      |  [mosh#120](https://github.com/mobile-shell/mosh/issues/120)  |                    ✅                     |
+| SSH Port Forwarding       |  [mosh#337](https://github.com/mobile-shell/mosh/issues/337)  |                    ✅                     |
+| Output Scrollback         |  [mosh#122](https://github.com/mobile-shell/mosh/issues/122)  |                    ✅                     |
+| OSC52 Sequence            |  [mosh#637](https://github.com/mobile-shell/mosh/issues/637)  |                    ✅                     |
+| tmux -CC Integration      | [mosh#1078](https://github.com/mobile-shell/mosh/issues/1078) |                    ✅                     |
+| ProxyJump / ProxyCommand  |  [mosh#970](https://github.com/mobile-shell/mosh/issues/970)  |               ✅ First Hop                |
+
+tssh and tsshd works exactly like ssh, there are no plans to support local echo and line editing, and will not have the mosh issues: [mosh#1041](https://github.com/mobile-shell/mosh/issues/1041), [mosh#1281](https://github.com/mobile-shell/mosh/issues/1281), [mosh#1295](https://github.com/mobile-shell/mosh/issues/1295), etc.
+
+### How to use
 
 1. Install [tssh](https://github.com/trzsz/trzsz-ssh) on the client ( the user's machine ).
 
 2. Install [tsshd](https://github.com/trzsz/tsshd) on the server ( the remote host ).
 
-3. Use `tssh --udp` to login to the server. Configure as follows to omit `--udp`:
+3. Use `tssh --udp` to login to the server. Or configure as follows in `~/.ssh/config` to omit `--udp`:
 
    ```
    Host xxx
        #!! UdpMode yes
-       #!! TsshdPath ~/go/bin/tsshd
-       #!! UdpPort 61000-62000
-       #!! UdpAliveTimeout 86400
    ```
 
-## How it works
+### How it works
 
 - The `tssh` plays the role of `ssh` on the client side, and the `tsshd` plays the role of `sshd` on the server side.
 
 - The `tssh` will first login to the server normally as an ssh client, and then run a new `tsshd` process on the server.
 
-- The `tsshd` process listens on a random udp port between 61000 and 62000 (can be customized by `UdpPort`), and sends its port number and a secret key back to the `tssh` process over the ssh channel. The ssh connection is then shut down, and the `tssh` process communicates with the `tsshd` process over udp.
+- The `tsshd` process listens on a random udp port between 61001 and 61999 (can be customized by `UdpPort`), and sends its port number and a secret key back to the `tssh` process over the ssh channel. The ssh connection is then shut down, and the `tssh` process communicates with the `tsshd` process over udp.
 
-- The `tsshd` process will exit if the network is disconnected for more than 24 hours by default, and no longer support reconnection. This can be adjusted by modifying the configuration `UdpAliveTimeout` in seconds.
+### Configurations
 
-- The `tsshd` supports `QUIC` protocol and `KCP` protocol (the default is `QUIC`), which can be specified on the command line (such as `-oUdpMode=KCP`), or configured as follows:
+```
+Host xxx
+    #!! UdpMode KCP
+    #!! UdpPort 61001-61999
+    #!! TsshdPath ~/go/bin/tsshd
+    #!! UdpAliveTimeout 86400
+    #!! UdpHeartbeatTimeout 3
+    #!! UdpReconnectTimeout 15
+    #!! ShowNotificationOnTop yes
+    #!! ShowFullNotifications yes
+```
 
-  ```
-  Host xxx
-      #!! UdpMode KCP
-  ```
+- `UdpMode`: `No` (the default: tssh works in TCP mode), `Yes` (default protocol: `KCP`), `QUIC` ([QUIC](https://github.com/quic-go/quic-go) protocol), `KCP` ([KCP](https://github.com/xtaci/kcp-go) protocol).
 
-## Installation
+- `UdpPort`: Specifies the range of UDP ports that tsshd listens on, the default value is [61001, 61999].
+
+- `TsshdPath`: Specifies the path to the tsshd binary on the server, lookup in $PATH if not configured.
+
+- `UdpAliveTimeout`: If the disconnection lasts longer than `UdpAliveTimeout` in seconds, tssh and tsshd will both exit, and no longer support reconnection. The default is 86400 seconds.
+
+- `UdpHeartbeatTimeout`: If the disconnection lasts longer than `UdpHeartbeatTimeout` in seconds, tssh will try to reconnect to the server by a new path. The default is 3 seconds.
+
+- `UdpReconnectTimeout`: If the disconnection lasts longer than `UdpReconnectTimeout` in seconds, tssh will display a notification indicating that the connection has been lost. The default is 15 seconds.
+
+- `ShowNotificationOnTop`: Whether the connection loss notification is displayed on the top. The default is yes, which may overwrite some of the previous output. Set it to `No` to display notifications on the current line of the cursor.
+
+- `ShowFullNotifications`: Whether to display the full notifications or a brief notification. The default is yes, which may output several lines to the screen. Set it to `No` will output only one line.
+
+### Installation
 
 - Install with apt on Ubuntu
 
@@ -107,7 +142,7 @@ The `tsshd` works like `mosh-server`, while the [`tssh --udp`](https://github.co
 
   </details>
 
-- Install with [yay](https://github.com/Jguer/yay) on ArchLinux
+- Install with yay on ArchLinux
 
   <details><summary><code>yay -S tsshd</code></summary>
 
@@ -145,10 +180,10 @@ The `tsshd` works like `mosh-server`, while the [`tssh --udp`](https://github.co
 
 - Download from the [GitHub Releases](https://github.com/trzsz/tsshd/releases), unzip and add to `PATH` environment.
 
-## Contact
+### Contact
 
 Feel free to email the author <lonnywong@qq.com>, or create an [issue](https://github.com/trzsz/tsshd/issues). Welcome to join the QQ group: 318578930.
 
-## Sponsor
+### Sponsor
 
 [❤️ Sponsor trzsz ❤️](https://github.com/trzsz), buy the author a drink 🍺 ? Thank you for your support!

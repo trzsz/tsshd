@@ -1,19 +1,36 @@
-# tsshd
+# tsshd - 支持连接迁移的 ssh 服务端
 
 [![MIT License](https://img.shields.io/badge/license-MIT-green.svg?style=flat)](https://choosealicense.com/licenses/mit/)
 [![GitHub Release](https://img.shields.io/github/v/release/trzsz/tsshd)](https://github.com/trzsz/tsshd/releases)
 
-`tsshd` 类似于 `mosh-server`，而 [`tssh --udp`](https://github.com/trzsz/trzsz-ssh) 类似于 [`mosh`](https://github.com/mobile-shell/mosh)。
+trzsz-ssh ( tssh ) 与 tsshd 一起，适用于高延迟的弱网连接，切换网络、休眠与唤醒都不会掉线，让 ssh 会话永远保持。
 
-## 优点简介
+tssh 设计为 ssh 客户端的直接替代品，提供与 openssh 完全兼容的基础功能，同时实现其他有用的扩展功能，外加：
 
-- 降低延迟（ 基于 [QUIC](https://github.com/quic-go/quic-go) / [KCP](https://github.com/xtaci/kcp-go) ）
+- 客户端进入休眠并且迟些再唤醒，或者暂时断开网络，ssh 会话可以保持不掉线。
 
-- 端口转发（ 与 openssh 相同，包括 ssh agent 转发和 X11 转发 ）
+- 客户端换地方接入，更换 IP 地址，任意切换网络等，ssh 会话可以保持不中断。
 
-- 连接迁移（ 支持 tssh 客户端休眠与唤醒、网络切换、断线重连等 ）
+## 功能对比
 
-- 代理跳转 ( 第一跳支持 UDP：`客户端 ---udp--> 跳板机 ---tcp--> 服务器` )
+tsshd 的灵感来源于 [mosh](https://github.com/mobile-shell/mosh)，`tsshd` 类似于 `mosh-server`，而 `tssh --udp` 类似于 `mosh`。
+
+| Feature                  |                     mosh ( mosh-server )                      |              tssh ( tsshd )               |
+| ------------------------ | :-----------------------------------------------------------: | :---------------------------------------: |
+| 超低延迟                 |                              ??                               | ✅ [KCP](https://github.com/xtaci/kcp-go) |
+| 保持连接                 |                              ✅                               |                    ✅                     |
+| 切换网络                 |                              ✅                               |                    ✅                     |
+| 本地回显 & 行编辑        |                              ✅                               |                无支持计划                 |
+| 支持多平台 / Windows     |  [mosh#293](https://github.com/mobile-shell/mosh/issues/293)  |                    ✅                     |
+| SSH X11 转发             |   [mosh#41](https://github.com/mobile-shell/mosh/issues/41)   |                    ✅                     |
+| SSH Agent 转发           |  [mosh#120](https://github.com/mobile-shell/mosh/issues/120)  |                    ✅                     |
+| SSH 端口转发             |  [mosh#337](https://github.com/mobile-shell/mosh/issues/337)  |                    ✅                     |
+| 输出上下滚动             |  [mosh#122](https://github.com/mobile-shell/mosh/issues/122)  |                    ✅                     |
+| OSC52 复制粘贴           |  [mosh#637](https://github.com/mobile-shell/mosh/issues/637)  |                    ✅                     |
+| tmux -CC 集成            | [mosh#1078](https://github.com/mobile-shell/mosh/issues/1078) |                    ✅                     |
+| ProxyJump / ProxyCommand |  [mosh#970](https://github.com/mobile-shell/mosh/issues/970)  |                 ✅ 第一跳                 |
+
+tssh 和 tsshd 的工作方式与 ssh 完全相同，没有计划支持本地回显和行编辑，也不会出现 mosh 的问题：[mosh#1041](https://github.com/mobile-shell/mosh/issues/1041)、[mosh#1281](https://github.com/mobile-shell/mosh/issues/1281)、[mosh#1295](https://github.com/mobile-shell/mosh/issues/1295) 等。
 
 ## 如何使用
 
@@ -21,14 +38,11 @@
 
 2. 在服务端（远程机器）上安装 [tsshd](https://github.com/trzsz/tsshd)。
 
-3. 使用 `tssh --udp` 登录服务器。如下配置可省略 `--udp` 参数：
+3. 使用 `tssh --udp` 登录服务器。在 `~/.ssh/config` 中如下配置可省略 `--udp` 参数：
 
    ```
    Host xxx
        #!! UdpMode yes
-       #!! TsshdPath ~/go/bin/tsshd
-       #!! UdpPort 61000-62000
-       #!! UdpAliveTimeout 86400
    ```
 
 ## 原理简介
@@ -37,16 +51,37 @@
 
 - `tssh` 会先作为一个 ssh 客户端正常登录到服务器上，然后在服务器上启动一个新的 `tsshd` 进程。
 
-- `tsshd` 进程会随机侦听一个 61000 到 62000 之间的 UDP 端口（可通过 `UdpPort` 配置自定义），并将其端口和密钥通过 ssh 通道发回给 `tssh` 进程。登录的 ssh 连接会被关闭，然后 `tssh` 进程通过 UDP 与 `tsshd` 进程通讯。
+- `tsshd` 进程会随机侦听一个 61001 到 61999 之间的 UDP 端口（可通过 `UdpPort` 配置自定义），并将其端口和密钥通过 ssh 通道发回给 `tssh` 进程。登录的 ssh 连接会被关闭，然后 `tssh` 进程通过 UDP 与 `tsshd` 进程通讯。
 
-- `tsshd` 进程会在网络断开超过 24 小时后退出（默认情况下），可以通过修改 `UdpAliveTimeout` 配置来调整（单位：秒）。
+## 配置说明
 
-- `tsshd` 支持 `QUIC` 协议和 `KCP` 协议（默认是 `QUIC` 协议），可以命令行指定（如 `-oUdpMode=KCP`），或如下配置：
+```
+Host xxx
+    #!! UdpMode KCP
+    #!! UdpPort 61001-61999
+    #!! TsshdPath ~/go/bin/tsshd
+    #!! UdpAliveTimeout 86400
+    #!! UdpHeartbeatTimeout 3
+    #!! UdpReconnectTimeout 15
+    #!! ShowNotificationOnTop yes
+    #!! ShowFullNotifications yes
+```
 
-  ```
-  Host xxx
-      #!! UdpMode KCP
-  ```
+- `UdpMode`: `No` (默认为`No`: tssh 工作在 TCP 模式), `Yes` (默认协议: `KCP`), `QUIC` ([QUIC](https://github.com/quic-go/quic-go) 协议), `KCP` ([KCP](https://github.com/xtaci/kcp-go) 协议).
+
+- `UdpPort`: 指定 tsshd 监听的 UDP 端口范围，默认值为 [61001, 61999]。
+
+- `TsshdPath`: 指定服务器上 tsshd 二进制程序的路径，如果未配置，则在 $PATH 中查找。
+
+- `UdpAliveTimeout`: 如果断开连接的时间超过 `UdpAliveTimeout` 秒，tssh 和 tsshd 都会退出，不再支持重连。默认值为 86400 秒。
+
+- `UdpHeartbeatTimeout`: 如果断开连接的时间超过 `UdpHeartbeatTimeout` 秒，tssh 将会尝试换条路重新连到服务器。默认值为 3 秒。
+
+- `UdpReconnectTimeout`: 如果断开连接的时间超过 `UdpReconnectTimeout` 秒，tssh 将会显示失去连接的通知公告。默认值为 15 秒。
+
+- `ShowNotificationOnTop`: 是否在屏幕顶部显示失去连接的通知。默认为 yes，这可能会覆盖之前的一些输出。设置为 `No` 在光标当前行显示通知。
+
+- `ShowFullNotifications`: 是显示完整的通知，还是显示简短的通知。默认为 yes，这可能会输出几行通知到屏幕上。设置为 `No` 只输出一行通知。
 
 ## 安装方法
 
@@ -106,7 +141,7 @@
 
   </details>
 
-- ArchLinux 可用 [yay](https://github.com/Jguer/yay) 安装
+- ArchLinux 可用 yay 安装
 
   <details><summary><code>yay -S tsshd</code></summary>
 

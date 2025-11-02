@@ -64,7 +64,16 @@ func sendBusMessage(command string, msg any) error {
 }
 
 func trySendErrorMessage(format string, a ...any) {
-	_ = sendBusMessage("error", ErrorMessage{fmt.Sprintf(format, a...)})
+	done := make(chan struct{}, 1)
+	go func() {
+		defer close(done)
+		_ = sendBusMessage("error", ErrorMessage{fmt.Sprintf(format, a...)})
+		done <- struct{}{}
+	}()
+	select {
+	case <-time.After(1 * time.Second):
+	case <-done:
+	}
 }
 
 func handleBusEvent(stream net.Conn) {
@@ -93,11 +102,12 @@ func handleBusEvent(stream net.Conn) {
 
 	serving.Store(true)
 
-	if msg.Timeout > 0 {
-		now := time.Now()
-		lastAliveTime.Store(&now)
-		go keepAlive(msg.Timeout, msg.Interval)
+	if msg.Timeout <= 0 {
+		msg.Timeout = 365 * 24 * time.Hour
 	}
+	now := time.Now()
+	lastAliveTime.Store(&now)
+	go keepAlive(msg.Timeout, msg.Interval)
 
 	for {
 		command, err := RecvCommand(stream)
@@ -133,7 +143,7 @@ func handleUnknownEvent(stream net.Conn) error {
 }
 
 func keepAlive(totalTimeout time.Duration, intervalTimeout time.Duration) {
-	if intervalTimeout == 0 {
+	if intervalTimeout <= 0 {
 		intervalTimeout = min(totalTimeout/10, 10*time.Second)
 	}
 	go func() {

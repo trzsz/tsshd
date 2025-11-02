@@ -30,6 +30,7 @@ import (
 	"os"
 	"os/exec"
 	"os/signal"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -40,11 +41,14 @@ const kTsshdVersion = "0.1.5"
 var exitChan = make(chan int, 1)
 
 type tsshdArgs struct {
-	Help    bool
-	Version bool
-	KCP     bool
-	Proxy   bool
-	Port    string
+	Help           bool
+	Version        bool
+	KCP            bool
+	IPv4           bool
+	IPv6           bool
+	Proxy          bool
+	Port           string
+	ConnectTimeout time.Duration
 }
 
 func printVersion() {
@@ -52,14 +56,17 @@ func printVersion() {
 }
 
 func printHelp() {
-	fmt.Printf("usage: tsshd [-h] [-v] [--kcp] [--proxy] [--port low-high]\n\n" +
-		"tsshd works with `tssh --udp`, just like mosh-server.\n\n" +
+	fmt.Printf("usage: tsshd [-h] [-v] [--kcp] [--ipv4] [--ipv6] [--proxy] [--port low-high] [--connect-timeout t]\n\n" +
+		"tsshd: trzsz-ssh(tssh) server that supports connection migration for roaming.\n\n" +
 		"optional arguments:\n" +
 		"  -h, --help             show this help message and exit\n" +
 		"  -v, --version          show program's version number and exit\n" +
 		"  --kcp                  KCP protocol (default is QUIC protocol)\n" +
+		"  --ipv4                 UDP only listens on IPv4, ignoring IPv6\n" +
+		"  --ipv6                 UDP only listens on IPv6, ignoring IPv4\n" +
 		"  --proxy                With UDP proxy for connection migration\n" +
-		"  --port low-high        UDP port range that the tsshd listens on\n")
+		"  --port low-high        UDP port range that the tsshd listens on\n" +
+		"  --connect-timeout t    The timeout for tssh connecting to tsshd\n")
 }
 
 func parseTsshdArgs() *tsshdArgs {
@@ -74,11 +81,22 @@ func parseTsshdArgs() *tsshdArgs {
 			return args
 		case "--kcp":
 			args.KCP = true
+		case "--ipv4":
+			args.IPv4 = true
+		case "--ipv6":
+			args.IPv6 = true
 		case "--proxy":
 			args.Proxy = true
 		case "--port":
 			if i+1 < len(os.Args) && !strings.HasPrefix(os.Args[i+1], "-") {
 				args.Port = os.Args[i+1]
+				i++
+			}
+		case "--connect-timeout":
+			if i+1 < len(os.Args) && !strings.HasPrefix(os.Args[i+1], "-") {
+				if timeout, err := strconv.ParseUint(os.Args[i+1], 10, 32); err == nil {
+					args.ConnectTimeout = time.Duration(timeout) * time.Second
+				}
 				i++
 			}
 		}
@@ -164,8 +182,12 @@ func TsshdMain() int {
 	}
 
 	go func() {
-		// should be connected within 20 seconds
-		time.Sleep(20 * time.Second)
+		// should be connected in time
+		connectTimeout := args.ConnectTimeout
+		if connectTimeout <= 0 {
+			connectTimeout = 10 * time.Second
+		}
+		time.Sleep(connectTimeout)
 		if !serving.Load() {
 			exitChan <- 1
 		}

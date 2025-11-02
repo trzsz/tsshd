@@ -222,7 +222,7 @@ func RecvError(stream net.Conn) error {
 
 type Client interface {
 	Close() error
-	Reconnect() error
+	Reconnect(timeout time.Duration) error
 	NewStream() (net.Conn, error)
 }
 
@@ -236,9 +236,9 @@ func (c *kcpClient) Close() error {
 	return c.session.Close()
 }
 
-func (c *kcpClient) Reconnect() error {
+func (c *kcpClient) Reconnect(timeout time.Duration) error {
 	if c.proxy != nil {
-		return c.proxy.renewUdpPath(c.connectTimeout)
+		return c.proxy.renewUdpPath(timeout)
 	}
 	return fmt.Errorf("no proxy for connection migration")
 }
@@ -261,9 +261,9 @@ func (c *quicClient) Close() error {
 	return c.conn.CloseWithError(0, "")
 }
 
-func (c *quicClient) Reconnect() error {
+func (c *quicClient) Reconnect(timeout time.Duration) error {
 	if c.proxy != nil {
-		return c.proxy.renewUdpPath(c.connectTimeout)
+		return c.proxy.renewUdpPath(timeout)
 	}
 	return fmt.Errorf("no proxy for connection migration")
 }

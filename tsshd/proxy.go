@@ -70,39 +70,56 @@ func aesDecrypt(cipherBlock *cipher.Block, buf []byte) []byte {
 	return plainText
 }
 
-type serverProxy struct {
+type udpConn struct {
 	frontendConn *net.UDPConn
+	clientAddr   *net.UDPAddr
+}
+
+type udpBuffer struct {
+	conn *udpConn
+	data []byte
+}
+
+type serverProxy struct {
+	frontendList []*net.UDPConn
 	backendConn  *net.UDPConn
-	clientAddr   atomic.Pointer[net.UDPAddr]
-	authedAddr   *net.UDPAddr
+	clientConn   atomic.Pointer[udpConn]
+	authedConn   *udpConn
 	cipherBlock  *cipher.Block
 	clientID     uint64
 	serverID     uint64
 	serialNumber uint64
+	bufChan      chan *udpBuffer
 }
 
-func (p *serverProxy) isClientAddr(addr *net.UDPAddr) bool {
-	clientAddr := p.clientAddr.Load()
-	if clientAddr == nil {
+func (p *serverProxy) isClientConn(conn *udpConn) bool {
+	clientConn := p.clientConn.Load()
+	if clientConn == nil {
 		return false
 	}
-	if clientAddr.Port != addr.Port {
+	if clientConn.frontendConn != conn.frontendConn {
 		return false
 	}
-	return clientAddr.IP.Equal(addr.IP)
+	if clientConn.clientAddr.Port != conn.clientAddr.Port {
+		return false
+	}
+	return clientConn.clientAddr.IP.Equal(conn.clientAddr.IP)
 }
 
-func (p *serverProxy) isAuthedAddr(addr *net.UDPAddr) bool {
-	if p.authedAddr == nil {
+func (p *serverProxy) isAuthedConn(conn *udpConn) bool {
+	if p.authedConn == nil {
 		return false
 	}
-	if p.authedAddr.Port != addr.Port {
+	if p.authedConn.frontendConn != conn.frontendConn {
 		return false
 	}
-	return p.authedAddr.IP.Equal(addr.IP)
+	if p.authedConn.clientAddr.Port != conn.clientAddr.Port {
+		return false
+	}
+	return p.authedConn.clientAddr.IP.Equal(conn.clientAddr.IP)
 }
 
-func (p *serverProxy) sendAuthPacket(addr *net.UDPAddr) {
+func (p *serverProxy) sendAuthPacket(conn *udpConn) {
 	data := make([]byte, 16)
 	binary.BigEndian.PutUint64(data[0:8], p.serverID)
 	binary.BigEndian.PutUint64(data[8:16], p.serialNumber)
@@ -110,7 +127,7 @@ func (p *serverProxy) sendAuthPacket(addr *net.UDPAddr) {
 	if buf == nil {
 		return
 	}
-	_, _ = p.frontendConn.WriteToUDP(buf, addr)
+	_, _ = conn.frontendConn.WriteToUDP(buf, conn.clientAddr)
 }
 
 func (p *serverProxy) verifyAuthPacket(buf []byte) (bool, uint64) {
@@ -127,40 +144,34 @@ func (p *serverProxy) verifyAuthPacket(buf []byte) (bool, uint64) {
 }
 
 func (p *serverProxy) frontendToBackend() {
-	buffer := make([]byte, 65536)
-	for {
-		n, addr, err := p.frontendConn.ReadFromUDP(buffer)
-		if err != nil || n <= 0 {
+	for buf := range p.bufChan {
+		if p.isClientConn(buf.conn) {
+			_, _ = p.backendConn.Write(buf.data)
 			continue
 		}
 
-		if p.isClientAddr(addr) {
-			_, _ = p.backendConn.Write(buffer[:n])
-			continue
-		}
-
-		if p.isAuthedAddr(addr) {
-			isAuthPacket, serialNumber := p.verifyAuthPacket(buffer[:n])
+		if p.isAuthedConn(buf.conn) {
+			isAuthPacket, serialNumber := p.verifyAuthPacket(buf.data)
 			if !isAuthPacket { // auth success
-				p.clientAddr.Store(p.authedAddr)
-				p.authedAddr = nil
-				_, _ = p.backendConn.Write(buffer[:n])
+				p.clientConn.Store(p.authedConn)
+				p.authedConn = nil
+				_, _ = p.backendConn.Write(buf.data)
 				continue
 			}
 			if serialNumber > p.serialNumber {
 				p.serialNumber = serialNumber
 			}
 			if serialNumber == p.serialNumber {
-				p.sendAuthPacket(addr)
+				p.sendAuthPacket(buf.conn)
 			}
 			continue
 		}
 
-		isAuthPacket, serialNumber := p.verifyAuthPacket(buffer[:n])
+		isAuthPacket, serialNumber := p.verifyAuthPacket(buf.data)
 		if isAuthPacket && serialNumber > p.serialNumber {
-			p.authedAddr = addr
+			p.authedConn = buf.conn
 			p.serialNumber = serialNumber
-			p.sendAuthPacket(addr)
+			p.sendAuthPacket(buf.conn)
 			continue
 		}
 	}
@@ -173,22 +184,44 @@ func (p *serverProxy) backendToFrontend() {
 		if err != nil || n <= 0 {
 			continue
 		}
-		if addr := p.clientAddr.Load(); addr != nil {
-			_, _ = p.frontendConn.WriteToUDP(buffer[:n], addr)
+		if conn := p.clientConn.Load(); conn != nil {
+			_, _ = conn.frontendConn.WriteToUDP(buffer[:n], conn.clientAddr)
 		}
 	}
 }
 
+func (p *serverProxy) serveFrontendConn(conn *net.UDPConn) {
+	current := 0
+	buffers := [2][]byte{make([]byte, 65536), make([]byte, 65536)}
+	for {
+		n, addr, err := conn.ReadFromUDP(buffers[current])
+		if err != nil || n <= 0 {
+			continue
+		}
+		p.bufChan <- &udpBuffer{
+			conn: &udpConn{
+				frontendConn: conn,
+				clientAddr:   addr,
+			},
+			data: buffers[current][:n],
+		}
+		current = 1 - current
+	}
+}
+
 func (p *serverProxy) serveProxy() {
-	p.frontendConn.SetReadBuffer(kProxyBufferSize)
-	p.frontendConn.SetWriteBuffer(kProxyBufferSize)
-	p.backendConn.SetReadBuffer(kProxyBufferSize)
-	p.backendConn.SetWriteBuffer(kProxyBufferSize)
+	for _, conn := range p.frontendList {
+		_ = conn.SetReadBuffer(kProxyBufferSize)
+		_ = conn.SetWriteBuffer(kProxyBufferSize)
+		go p.serveFrontendConn(conn)
+	}
+	_ = p.backendConn.SetReadBuffer(kProxyBufferSize)
+	_ = p.backendConn.SetWriteBuffer(kProxyBufferSize)
 	go p.frontendToBackend()
 	go p.backendToFrontend()
 }
 
-func startServerProxy(frontendConn *net.UDPConn, info *ServerInfo) (*net.UDPConn, error) {
+func startServerProxy(frontendList []*net.UDPConn, info *ServerInfo) ([]*net.UDPConn, error) {
 	localAddr := "127.0.0.1:0"
 	udpAddr, err := net.ResolveUDPAddr("udp", localAddr)
 	if err != nil {
@@ -230,15 +263,16 @@ func startServerProxy(frontendConn *net.UDPConn, info *ServerInfo) (*net.UDPConn
 	info.ServerID = binary.BigEndian.Uint64(serverID)
 
 	proxy := &serverProxy{
-		frontendConn: frontendConn,
+		frontendList: frontendList,
 		backendConn:  backendConn,
 		cipherBlock:  &cipherBlock,
 		clientID:     info.ClientID,
 		serverID:     info.ServerID,
+		bufChan:      make(chan *udpBuffer), // unbuffered channel to avaid copying buffer
 	}
 	go proxy.serveProxy()
 
-	return serverConn, nil
+	return []*net.UDPConn{serverConn}, nil
 }
 
 type clientProxy struct {
@@ -307,8 +341,8 @@ func (p *clientProxy) renewUdpPath(connectTimeout time.Duration) error {
 	if err != nil {
 		return fmt.Errorf("dial udp [%s] failed: %v", p.serverAddr.String(), err)
 	}
-	newConn.SetReadBuffer(kProxyBufferSize)
-	newConn.SetWriteBuffer(kProxyBufferSize)
+	_ = newConn.SetReadBuffer(kProxyBufferSize)
+	_ = newConn.SetWriteBuffer(kProxyBufferSize)
 
 	ctx, cancel := context.WithTimeout(context.Background(), connectTimeout)
 	defer cancel()
@@ -376,8 +410,8 @@ func (p *clientProxy) isAuthSuccessful(buf []byte) bool {
 }
 
 func (p *clientProxy) serveProxy() {
-	p.frontendConn.SetReadBuffer(kProxyBufferSize)
-	p.frontendConn.SetWriteBuffer(kProxyBufferSize)
+	_ = p.frontendConn.SetReadBuffer(kProxyBufferSize)
+	_ = p.frontendConn.SetWriteBuffer(kProxyBufferSize)
 	for p.backendConn.Load() == nil {
 		time.Sleep(10 * time.Millisecond)
 	}
