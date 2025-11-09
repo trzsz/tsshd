@@ -28,18 +28,18 @@ tsshd was inspired by [mosh](https://github.com/mobile-shell/mosh), and the `tss
 | SSH Port Forwarding       |  [mosh#337](https://github.com/mobile-shell/mosh/issues/337)  |                    ✅                     |
 | Output Scrollback         |  [mosh#122](https://github.com/mobile-shell/mosh/issues/122)  |                    ✅                     |
 | OSC52 Sequence            |  [mosh#637](https://github.com/mobile-shell/mosh/issues/637)  |                    ✅                     |
+| ProxyJump                 |  [mosh#970](https://github.com/mobile-shell/mosh/issues/970)  |                    ✅                     |
 | tmux -CC Integration      | [mosh#1078](https://github.com/mobile-shell/mosh/issues/1078) |                    ✅                     |
-| ProxyJump / ProxyCommand  |  [mosh#970](https://github.com/mobile-shell/mosh/issues/970)  |               ✅ First Hop                |
 
 tssh and tsshd works exactly like ssh, there are no plans to support local echo and line editing, and will not have the mosh issues: [mosh#1041](https://github.com/mobile-shell/mosh/issues/1041), [mosh#1281](https://github.com/mobile-shell/mosh/issues/1281), [mosh#1295](https://github.com/mobile-shell/mosh/issues/1295), etc.
 
 ### How to use
 
-1. Install [tssh](https://github.com/trzsz/trzsz-ssh) on the client ( the user's machine ).
+1. Install [tssh](https://github.com/trzsz/trzsz-ssh?tab=readme-ov-file#installation) on the client ( your local machine ).
 
-2. Install [tsshd](https://github.com/trzsz/tsshd) on the server ( the remote host ).
+2. Install [tsshd](https://github.com/trzsz/tsshd?tab=readme-ov-file#installation) on the server ( the remote host ).
 
-3. Use `tssh --udp` to login to the server. Or configure as follows in `~/.ssh/config` to omit `--udp`:
+3. Use `tssh --udp xxx` to login to the server. Or configure as follows in `~/.ssh/config` to omit `--udp`:
 
    ```
    Host xxx

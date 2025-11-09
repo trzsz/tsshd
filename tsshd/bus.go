@@ -47,7 +47,7 @@ func sendBusCommand(command string) error {
 	if stream == nil {
 		return fmt.Errorf("bus stream is nil")
 	}
-	return SendCommand(*stream, command)
+	return sendCommand(*stream, command)
 }
 
 func sendBusMessage(command string, msg any) error {
@@ -57,29 +57,23 @@ func sendBusMessage(command string, msg any) error {
 	if stream == nil {
 		return fmt.Errorf("bus stream is nil")
 	}
-	if err := SendCommand(*stream, command); err != nil {
+	if err := sendCommand(*stream, command); err != nil {
 		return err
 	}
-	return SendMessage(*stream, msg)
+	return sendMessage(*stream, msg)
 }
 
 func trySendErrorMessage(format string, a ...any) {
-	done := make(chan struct{}, 1)
-	go func() {
-		defer close(done)
-		_ = sendBusMessage("error", ErrorMessage{fmt.Sprintf(format, a...)})
-		done <- struct{}{}
-	}()
-	select {
-	case <-time.After(1 * time.Second):
-	case <-done:
-	}
+	_, _ = doWithTimeout(func() (int, error) {
+		_ = sendBusMessage("error", errorMessage{fmt.Sprintf(format, a...)})
+		return 0, nil
+	}, 1*time.Second)
 }
 
 func handleBusEvent(stream net.Conn) {
-	var msg BusMessage
-	if err := RecvMessage(stream, &msg); err != nil {
-		SendError(stream, fmt.Errorf("recv bus message failed: %v", err))
+	var msg busMessage
+	if err := recvMessage(stream, &msg); err != nil {
+		sendError(stream, fmt.Errorf("recv bus message failed: %v", err))
 		return
 	}
 
@@ -88,11 +82,11 @@ func handleBusEvent(stream net.Conn) {
 	// only one bus
 	if !busStream.CompareAndSwap(nil, &stream) {
 		busMutex.Unlock()
-		SendError(stream, fmt.Errorf("bus has been initialized"))
+		sendError(stream, fmt.Errorf("bus has been initialized"))
 		return
 	}
 
-	if err := SendSuccess(stream); err != nil { // ack ok
+	if err := sendSuccess(stream); err != nil { // ack ok
 		busMutex.Unlock()
 		trySendErrorMessage("bus ack ok failed: %v", err)
 		return
@@ -110,7 +104,7 @@ func handleBusEvent(stream net.Conn) {
 	go keepAlive(msg.Timeout, msg.Interval)
 
 	for {
-		command, err := RecvCommand(stream)
+		command, err := recvCommand(stream)
 		if err != nil {
 			trySendErrorMessage("recv bus command failed: %v", err)
 			return
@@ -136,7 +130,7 @@ func handleBusEvent(stream net.Conn) {
 
 func handleUnknownEvent(stream net.Conn) error {
 	var msg struct{}
-	if err := RecvMessage(stream, &msg); err != nil {
+	if err := recvMessage(stream, &msg); err != nil {
 		return fmt.Errorf("recv unknown message failed: %v", err)
 	}
 	return fmt.Errorf("unknown command")

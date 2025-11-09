@@ -36,8 +36,6 @@ import (
 	"time"
 )
 
-const kTsshdVersion = "0.1.5"
-
 var exitChan = make(chan int, 1)
 
 type tsshdArgs struct {
@@ -149,7 +147,7 @@ func TsshdMain() int {
 	}
 
 	if parent {
-		defer stdout.Close()
+		defer func() { _ = stdout.Close() }()
 		if _, err := io.Copy(os.Stdout, stdout); err != nil {
 			fmt.Fprintf(os.Stderr, "copy stdout failed: %v\n", err)
 			return 2
@@ -166,18 +164,18 @@ func TsshdMain() int {
 	kcpListener, quicListener, err := initServer(args)
 	if err != nil {
 		fmt.Println(err)
-		os.Stdout.Close()
+		_ = os.Stdout.Close()
 		return 3
 	}
 
-	os.Stdout.Close()
+	_ = os.Stdout.Close()
 
 	if kcpListener != nil {
-		defer kcpListener.Close()
+		defer func() { _ = kcpListener.Close() }()
 		go serveKCP(kcpListener)
 	}
 	if quicListener != nil {
-		defer quicListener.Close()
+		defer func() { _ = quicListener.Close() }()
 		go serveQUIC(quicListener)
 	}
 

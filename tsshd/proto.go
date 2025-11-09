@@ -35,7 +35,6 @@ import (
 	"fmt"
 	"io"
 	"net"
-	"strings"
 	"time"
 
 	"github.com/quic-go/quic-go"
@@ -60,16 +59,16 @@ type ServerInfo struct {
 	ServerID   uint64
 }
 
-type ErrorMessage struct {
+type errorMessage struct {
 	Msg string
 }
 
-type BusMessage struct {
+type busMessage struct {
 	Timeout  time.Duration
 	Interval time.Duration
 }
 
-type X11Request struct {
+type x11RequestMessage struct {
 	ChannelType      string
 	SingleConnection bool
 	AuthProtocol     string
@@ -77,11 +76,11 @@ type X11Request struct {
 	ScreenNumber     uint32
 }
 
-type AgentRequest struct {
+type agentRequestMessage struct {
 	ChannelType string
 }
 
-type StartMessage struct {
+type startMessage struct {
 	ID    uint64
 	Pty   bool
 	Shell bool
@@ -90,43 +89,49 @@ type StartMessage struct {
 	Cols  int
 	Rows  int
 	Envs  map[string]string
-	X11   *X11Request
-	Agent *AgentRequest
+	X11   *x11RequestMessage
+	Agent *agentRequestMessage
 }
 
-type ExitMessage struct {
+type exitMessage struct {
 	ID       uint64
 	ExitCode int
 }
 
-type ResizeMessage struct {
-	ID   uint64
-	Cols int
-	Rows int
+type resizeMessage struct {
+	ID     uint64
+	Cols   int
+	Rows   int
+	Redraw bool
 }
 
-type StderrMessage struct {
+type stderrMessage struct {
 	ID uint64
 }
 
-type ChannelMessage struct {
+type channelMessage struct {
 	ChannelType string
 	ID          uint64
 }
 
-type DialMessage struct {
+type dialMessage struct {
 	Network string
 	Addr    string
 	Timeout time.Duration
 }
 
-type ListenMessage struct {
+type listenMessage struct {
 	Network string
 	Addr    string
 }
 
-type AcceptMessage struct {
+type acceptMessage struct {
 	ID uint64
+}
+
+type udpv1Message struct {
+	Addr    string
+	Timeout time.Duration
 }
 
 func writeAll(dst io.Writer, data []byte) error {
@@ -142,7 +147,7 @@ func writeAll(dst io.Writer, data []byte) error {
 	return nil
 }
 
-func SendCommand(stream net.Conn, command string) error {
+func sendCommand(stream net.Conn, command string) error {
 	if len(command) == 0 {
 		return fmt.Errorf("send command is empty")
 	}
@@ -158,7 +163,7 @@ func SendCommand(stream net.Conn, command string) error {
 	return nil
 }
 
-func RecvCommand(stream net.Conn) (string, error) {
+func recvCommand(stream net.Conn) (string, error) {
 	length := make([]byte, 1)
 	if _, err := stream.Read(length); err != nil {
 		return "", fmt.Errorf("recv command read length failed: %v", err)
@@ -170,7 +175,7 @@ func RecvCommand(stream net.Conn) (string, error) {
 	return string(command), nil
 }
 
-func SendMessage(stream net.Conn, msg any) error {
+func sendMessage(stream net.Conn, msg any) error {
 	msgBuf, err := json.Marshal(msg)
 	if err != nil {
 		return fmt.Errorf("send message marshal failed: %v", err)
@@ -184,7 +189,7 @@ func SendMessage(stream net.Conn, msg any) error {
 	return nil
 }
 
-func RecvMessage(stream net.Conn, msg any) error {
+func recvMessage(stream net.Conn, msg any) error {
 	lenBuf := make([]byte, 4)
 	if _, err := io.ReadFull(stream, lenBuf); err != nil {
 		return fmt.Errorf("recv message read length failed: %v", err)
@@ -199,19 +204,19 @@ func RecvMessage(stream net.Conn, msg any) error {
 	return nil
 }
 
-func SendError(stream net.Conn, err error) {
-	if e := SendMessage(stream, ErrorMessage{err.Error()}); e != nil {
+func sendError(stream net.Conn, err error) {
+	if e := sendMessage(stream, errorMessage{err.Error()}); e != nil {
 		trySendErrorMessage("send error [%v] failed: %v", err, e)
 	}
 }
 
-func SendSuccess(stream net.Conn) error {
-	return SendMessage(stream, ErrorMessage{kNoErrorMsg})
+func sendSuccess(stream net.Conn) error {
+	return sendMessage(stream, errorMessage{kNoErrorMsg})
 }
 
-func RecvError(stream net.Conn) error {
-	var errMsg ErrorMessage
-	if err := RecvMessage(stream, &errMsg); err != nil {
+func recvError(stream net.Conn) error {
+	var errMsg errorMessage
+	if err := recvMessage(stream, &errMsg); err != nil {
 		return fmt.Errorf("recv error failed: %v", err)
 	}
 	if errMsg.Msg != kNoErrorMsg {
@@ -220,30 +225,52 @@ func RecvError(stream net.Conn) error {
 	return nil
 }
 
-type Client interface {
-	Close() error
-	Reconnect(timeout time.Duration) error
-	NewStream() (net.Conn, error)
+func sendUDPv1Packet(stream net.Conn, port uint16, data []byte) error {
+	if len(data) == 0 {
+		return fmt.Errorf("send UDPv1 packet udp data is empty")
+	}
+	if len(data) > 0xffff {
+		return fmt.Errorf("send UDPv1 packet udp data too long %d", len(data))
+	}
+	buffer := make([]byte, len(data)+4)
+	binary.BigEndian.PutUint16(buffer, uint16(port))
+	binary.BigEndian.PutUint16(buffer[2:], uint16(len(data)))
+	copy(buffer[4:], data)
+	if err := writeAll(stream, buffer); err != nil {
+		return fmt.Errorf("send UDPv1 packet write buffer failed: %v", err)
+	}
+	return nil
+}
+
+func recvUDPv1Packet(stream net.Conn) (uint16, []byte, error) {
+	portBuf := make([]byte, 2)
+	if _, err := io.ReadFull(stream, portBuf); err != nil {
+		return 0, nil, fmt.Errorf("recv UDPv1 packet read port failed: %v", err)
+	}
+	lenBuf := make([]byte, 2)
+	if _, err := io.ReadFull(stream, lenBuf); err != nil {
+		return 0, nil, fmt.Errorf("recv UDPv1 packet read length failed: %v", err)
+	}
+	dataLen := binary.BigEndian.Uint16(lenBuf)
+	if dataLen == 0 {
+		return 0, nil, fmt.Errorf("recv UDPv1 packet length [%d] invalid", dataLen)
+	}
+	dataBuf := make([]byte, dataLen)
+	if _, err := io.ReadFull(stream, dataBuf); err != nil {
+		return 0, nil, fmt.Errorf("recv UDPv1 packet read buffer failed: %v", err)
+	}
+	return binary.BigEndian.Uint16(portBuf), dataBuf, nil
 }
 
 type kcpClient struct {
-	session        *smux.Session
-	proxy          *clientProxy
-	connectTimeout time.Duration
+	session *smux.Session
 }
 
-func (c *kcpClient) Close() error {
+func (c *kcpClient) closeClient() error {
 	return c.session.Close()
 }
 
-func (c *kcpClient) Reconnect(timeout time.Duration) error {
-	if c.proxy != nil {
-		return c.proxy.renewUdpPath(timeout)
-	}
-	return fmt.Errorf("no proxy for connection migration")
-}
-
-func (c *kcpClient) NewStream() (net.Conn, error) {
+func (c *kcpClient) newStream(connectTimeout time.Duration) (net.Conn, error) {
 	stream, err := c.session.OpenStream()
 	if err != nil {
 		return nil, fmt.Errorf("kcp smux open stream failed: %v", err)
@@ -252,24 +279,15 @@ func (c *kcpClient) NewStream() (net.Conn, error) {
 }
 
 type quicClient struct {
-	conn           *quic.Conn
-	proxy          *clientProxy
-	connectTimeout time.Duration
+	conn *quic.Conn
 }
 
-func (c *quicClient) Close() error {
+func (c *quicClient) closeClient() error {
 	return c.conn.CloseWithError(0, "")
 }
 
-func (c *quicClient) Reconnect(timeout time.Duration) error {
-	if c.proxy != nil {
-		return c.proxy.renewUdpPath(timeout)
-	}
-	return fmt.Errorf("no proxy for connection migration")
-}
-
-func (c *quicClient) NewStream() (net.Conn, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), c.connectTimeout)
+func (c *quicClient) newStream(connectTimeout time.Duration) (net.Conn, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), connectTimeout)
 	defer cancel()
 	stream, err := c.conn.OpenStreamSync(ctx)
 	if err != nil {
@@ -278,33 +296,20 @@ func (c *quicClient) NewStream() (net.Conn, error) {
 	return &quicStream{stream, c.conn}, err
 }
 
-func NewClient(host string, info *ServerInfo, connectTimeout time.Duration) (Client, error) {
-	var proxy *clientProxy
-	addr := joinHostPort(host, info.Port)
-	if info.ProxyKey != "" {
-		var err error
-		addr, proxy, err = startClientProxy(addr, info)
-		if err != nil {
-			return nil, err
-		}
-		if err := proxy.renewUdpPath(connectTimeout); err != nil {
-			return nil, err
-		}
-	}
-
+func newUdpClient(addr string, info *ServerInfo, connectTimeout time.Duration) (udpClient, error) {
 	switch info.Mode {
 	case "":
-		return nil, fmt.Errorf("Please upgrade tsshd.")
+		return nil, fmt.Errorf("%s", "Please upgrade tsshd")
 	case kModeKCP:
-		return newKcpClient(addr, info, proxy, connectTimeout)
+		return newKcpClient(addr, info)
 	case kModeQUIC:
-		return newQuicClient(addr, info, proxy, connectTimeout)
+		return newQuicClient(addr, info, connectTimeout)
 	default:
 		return nil, fmt.Errorf("unknown tsshd mode: %s", info.Mode)
 	}
 }
 
-func newKcpClient(addr string, info *ServerInfo, proxy *clientProxy, connectTimeout time.Duration) (Client, error) {
+func newKcpClient(addr string, info *ServerInfo) (udpClient, error) {
 	pass, err := hex.DecodeString(info.Pass)
 	if err != nil {
 		return nil, fmt.Errorf("decode pass [%s] failed: %v", info.Pass, err)
@@ -327,10 +332,10 @@ func newKcpClient(addr string, info *ServerInfo, proxy *clientProxy, connectTime
 	if err != nil {
 		return nil, fmt.Errorf("kcp smux client failed: %v", err)
 	}
-	return &kcpClient{session, proxy, connectTimeout}, nil
+	return &kcpClient{session}, nil
 }
 
-func newQuicClient(addr string, info *ServerInfo, proxy *clientProxy, connectTimeout time.Duration) (Client, error) {
+func newQuicClient(addr string, info *ServerInfo, connectTimeout time.Duration) (udpClient, error) {
 	serverCert, err := hex.DecodeString(info.ServerCert)
 	if err != nil {
 		return nil, fmt.Errorf("decode server cert [%s] failed: %v", info.ServerCert, err)
@@ -361,12 +366,5 @@ func newQuicClient(addr string, info *ServerInfo, proxy *clientProxy, connectTim
 	if err != nil {
 		return nil, fmt.Errorf("quic dail [%s] failed: %v", addr, err)
 	}
-	return &quicClient{conn, proxy, connectTimeout}, nil
-}
-
-func joinHostPort(host string, port int) string {
-	if !strings.HasPrefix(host, "[") && strings.ContainsRune(host, ':') {
-		return fmt.Sprintf("[%s]:%d", host, port)
-	}
-	return fmt.Sprintf("%s:%d", host, port)
+	return &quicClient{conn}, nil
 }

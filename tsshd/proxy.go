@@ -178,7 +178,7 @@ func (p *serverProxy) frontendToBackend() {
 }
 
 func (p *serverProxy) backendToFrontend() {
-	buffer := make([]byte, 65536)
+	buffer := make([]byte, 0xffff)
 	for {
 		n, _, err := p.backendConn.ReadFromUDP(buffer)
 		if err != nil || n <= 0 {
@@ -192,7 +192,7 @@ func (p *serverProxy) backendToFrontend() {
 
 func (p *serverProxy) serveFrontendConn(conn *net.UDPConn) {
 	current := 0
-	buffers := [2][]byte{make([]byte, 65536), make([]byte, 65536)}
+	buffers := [2][]byte{make([]byte, 0xffff), make([]byte, 0xffff)}
 	for {
 		n, addr, err := conn.ReadFromUDP(buffers[current])
 		if err != nil || n <= 0 {
@@ -299,7 +299,7 @@ func (p *clientProxy) isClientAddr(addr *net.UDPAddr) bool {
 }
 
 func (p *clientProxy) frontendToBackend() {
-	buffer := make([]byte, 65536)
+	buffer := make([]byte, 0xffff)
 	for {
 		n, addr, err := p.frontendConn.ReadFromUDP(buffer)
 		if err != nil || n <= 0 {
@@ -318,7 +318,7 @@ func (p *clientProxy) frontendToBackend() {
 }
 
 func (p *clientProxy) backendToFrontend() {
-	buffer := make([]byte, 65536)
+	buffer := make([]byte, 0xffff)
 	for {
 		if conn := p.backendConn.Load(); conn != nil {
 			n, _, err := conn.ReadFromUDP(buffer)

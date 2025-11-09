@@ -67,7 +67,7 @@ func serveKCP(listener *kcp.Listener) {
 }
 
 func handleKcpConn(conn *kcp.UDPSession) {
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 
 	if serving.Load() {
 		return
@@ -122,11 +122,11 @@ func handleQuicConn(conn *quic.Conn) {
 }
 
 func handleStream(stream net.Conn) {
-	defer stream.Close()
+	defer func() { _ = stream.Close() }()
 
-	command, err := RecvCommand(stream)
+	command, err := recvCommand(stream)
 	if err != nil {
-		SendError(stream, fmt.Errorf("recv stream command failed: %v", err))
+		sendError(stream, fmt.Errorf("recv stream command failed: %v", err))
 		return
 	}
 
@@ -145,12 +145,14 @@ func handleStream(stream net.Conn) {
 		handler = handleListenEvent
 	case "accept":
 		handler = handleAcceptEvent
+	case "UDPv1":
+		handler = handleUDPv1Event
 	default:
-		SendError(stream, fmt.Errorf("unknown stream command: %s", command))
+		sendError(stream, fmt.Errorf("unknown stream command: %s", command))
 		return
 	}
 
-	if err := SendSuccess(stream); err != nil { // say hello
+	if err := sendSuccess(stream); err != nil { // say hello
 		trySendErrorMessage("tsshd say hello failed: %v", err)
 		return
 	}

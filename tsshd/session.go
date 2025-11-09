@@ -25,6 +25,7 @@ SOFTWARE.
 package tsshd
 
 import (
+	"bufio"
 	"fmt"
 	"io"
 	"net"
@@ -35,6 +36,7 @@ import (
 	"runtime"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/alessio/shellescape"
@@ -51,7 +53,7 @@ type sessionContext struct {
 	stdout  io.ReadCloser
 	stderr  io.ReadCloser
 	started bool
-	closed  bool
+	closed  atomic.Bool
 }
 
 type stderrStream struct {
@@ -96,6 +98,37 @@ func (c *sessionContext) StartCmd() error {
 	return nil
 }
 
+func (c *sessionContext) showMotd(stream net.Conn) {
+	printMotd := func(paths []string) {
+		for _, path := range paths {
+			file, err := os.Open(path)
+			if err != nil {
+				continue
+			}
+			defer func() { _ = file.Close() }()
+			reader := bufio.NewReader(file)
+			for {
+				line, err := reader.ReadBytes('\n')
+				if err != nil {
+					return
+				}
+				if len(line) <= 1 {
+					_, _ = stream.Write([]byte("\r\n"))
+					continue
+				}
+				if line[len(line)-2] != '\r' {
+					_, _ = stream.Write(line[:len(line)-1])
+					_, _ = stream.Write([]byte("\r\n"))
+					continue
+				}
+				_, _ = stream.Write(line)
+			}
+		}
+	}
+	printMotd([]string{"/run/motd.dynamic", "/var/run/motd.dynamic"})
+	printMotd([]string{"/etc/motd"}) // always print traditional /etc/motd.
+}
+
 func (c *sessionContext) forwardIO(stream net.Conn) {
 	if c.stdin != nil {
 		go func() {
@@ -104,23 +137,19 @@ func (c *sessionContext) forwardIO(stream net.Conn) {
 	}
 
 	if c.stdout != nil {
-		c.wg.Add(1)
-		go func() {
+		c.wg.Go(func() {
 			_, _ = io.Copy(stream, c.stdout)
-			c.wg.Done()
-		}()
+		})
 	}
 
 	if c.stderr != nil {
-		c.wg.Add(1)
-		go func() {
+		c.wg.Go(func() {
 			if stderr, ok := stderrMap[c.id]; ok {
 				_, _ = io.Copy(stderr.stream, c.stderr)
 			} else {
 				_, _ = io.Copy(stream, c.stderr)
 			}
-			c.wg.Done()
-		}()
+		})
 	}
 }
 
@@ -134,24 +163,23 @@ func (c *sessionContext) Wait() {
 }
 
 func (c *sessionContext) Close() {
-	if c.closed {
+	if !c.closed.CompareAndSwap(false, true) {
 		return
 	}
-	c.closed = true
-	if err := sendBusMessage("exit", ExitMessage{
+	if err := sendBusMessage("exit", exitMessage{
 		ID:       c.id,
 		ExitCode: c.cmd.ProcessState.ExitCode(),
 	}); err != nil {
 		trySendErrorMessage("send exit message failed: %v", err)
 	}
 	if c.stdin != nil {
-		c.stdin.Close()
+		_ = c.stdin.Close()
 	}
 	if c.stdout != nil {
-		c.stdout.Close()
+		_ = c.stdout.Close()
 	}
 	if c.stderr != nil {
-		c.stderr.Close()
+		_ = c.stderr.Close()
 	}
 	if c.started {
 		if c.pty != nil {
@@ -165,9 +193,12 @@ func (c *sessionContext) Close() {
 	delete(sessionMap, c.id)
 }
 
-func (c *sessionContext) SetSize(cols, rows int) error {
+func (c *sessionContext) SetSize(cols, rows int, redraw bool) error {
 	if c.pty == nil {
 		return fmt.Errorf("session %d %v is not pty", c.id, c.cmd.Args)
+	}
+	if redraw {
+		_ = c.pty.Resize(cols+1, rows)
 	}
 	if err := c.pty.Resize(cols, rows); err != nil {
 		return fmt.Errorf("pty set size failed: %v", err)
@@ -176,9 +207,9 @@ func (c *sessionContext) SetSize(cols, rows int) error {
 }
 
 func handleSessionEvent(stream net.Conn) {
-	var msg StartMessage
-	if err := RecvMessage(stream, &msg); err != nil {
-		SendError(stream, fmt.Errorf("recv start message failed: %v", err))
+	var msg startMessage
+	if err := recvMessage(stream, &msg); err != nil {
+		sendError(stream, fmt.Errorf("recv start message failed: %v", err))
 		return
 	}
 
@@ -192,7 +223,7 @@ func handleSessionEvent(stream net.Conn) {
 
 	ctx, err := newSessionContext(&msg)
 	if err != nil {
-		SendError(stream, err)
+		sendError(stream, err)
 		return
 	}
 	defer ctx.Close()
@@ -203,13 +234,17 @@ func handleSessionEvent(stream net.Conn) {
 		err = ctx.StartCmd()
 	}
 	if err != nil {
-		SendError(stream, err)
+		sendError(stream, err)
 		return
 	}
 
-	if err := SendSuccess(stream); err != nil { // ack ok
+	if err := sendSuccess(stream); err != nil { // ack ok
 		trySendErrorMessage("session ack ok failed: %v", err)
 		return
+	}
+
+	if msg.Shell {
+		ctx.showMotd(stream)
 	}
 
 	ctx.forwardIO(stream)
@@ -217,7 +252,7 @@ func handleSessionEvent(stream net.Conn) {
 	ctx.Wait()
 }
 
-func newSessionContext(msg *StartMessage) (*sessionContext, error) {
+func newSessionContext(msg *startMessage) (*sessionContext, error) {
 	cmd, err := getSessionStartCmd(msg)
 	if err != nil {
 		return nil, fmt.Errorf("build start command failed: %v", err)
@@ -272,7 +307,7 @@ func getStderrStream(id uint64) *stderrStream {
 	return nil
 }
 
-func getSessionStartCmd(msg *StartMessage) (*exec.Cmd, error) {
+func getSessionStartCmd(msg *startMessage) (*exec.Cmd, error) {
 	var envs []string
 	for _, env := range os.Environ() {
 		pos := strings.IndexRune(env, '=')
@@ -342,19 +377,19 @@ func getSessionStartCmd(msg *StartMessage) (*exec.Cmd, error) {
 }
 
 func handleStderrEvent(stream net.Conn) {
-	var msg StderrMessage
-	if err := RecvMessage(stream, &msg); err != nil {
-		SendError(stream, fmt.Errorf("recv stderr message failed: %v", err))
+	var msg stderrMessage
+	if err := recvMessage(stream, &msg); err != nil {
+		sendError(stream, fmt.Errorf("recv stderr message failed: %v", err))
 		return
 	}
 
 	errStream, err := newStderrStream(msg.ID, stream)
 	if err != nil {
-		SendError(stream, err)
+		sendError(stream, err)
 		return
 	}
 
-	if err := SendSuccess(stream); err != nil { // ack ok
+	if err := sendSuccess(stream); err != nil { // ack ok
 		trySendErrorMessage("stderr ack ok failed: %v", err)
 		return
 	}
@@ -363,8 +398,8 @@ func handleStderrEvent(stream net.Conn) {
 }
 
 func handleResizeEvent(stream net.Conn) error {
-	var msg ResizeMessage
-	if err := RecvMessage(stream, &msg); err != nil {
+	var msg resizeMessage
+	if err := recvMessage(stream, &msg); err != nil {
 		return fmt.Errorf("recv resize message failed: %v", err)
 	}
 	if msg.Cols <= 0 || msg.Rows <= 0 {
@@ -373,12 +408,12 @@ func handleResizeEvent(stream net.Conn) error {
 	sessionMutex.Lock()
 	defer sessionMutex.Unlock()
 	if ctx, ok := sessionMap[msg.ID]; ok {
-		return ctx.SetSize(msg.Cols, msg.Rows)
+		return ctx.SetSize(msg.Cols, msg.Rows, msg.Redraw)
 	}
 	return fmt.Errorf("invalid session id: %d", msg.ID)
 }
 
-func handleX11Request(msg *StartMessage) {
+func handleX11Request(msg *startMessage) {
 	if msg.X11 == nil {
 		return
 	}
@@ -388,7 +423,7 @@ func handleX11Request(msg *StartMessage) {
 		return
 	}
 	onExitFuncs = append(onExitFuncs, func() {
-		listener.Close()
+		_ = listener.Close()
 	})
 	displayNumber := port - 6000
 	if msg.X11.AuthProtocol != "" && msg.X11.AuthCookie != "" {
@@ -425,28 +460,22 @@ func writeXauthData(input string) error {
 	if err != nil {
 		return err
 	}
-	defer stdin.Close()
+	defer func() { _ = stdin.Close() }()
 	if err := cmd.Start(); err != nil {
 		return err
 	}
 	if _, err := stdin.Write([]byte(input)); err != nil {
 		return err
 	}
-	stdin.Close()
-	done := make(chan struct{}, 1)
-	go func() {
-		defer close(done)
+	_ = stdin.Close()
+	_, _ = doWithTimeout(func() (int, error) {
 		_ = cmd.Wait()
-		done <- struct{}{}
-	}()
-	select {
-	case <-time.After(200 * time.Millisecond):
-	case <-done:
-	}
+		return 0, nil
+	}, 200*time.Millisecond)
 	return nil
 }
 
-func handleAgentRequest(msg *StartMessage) {
+func handleAgentRequest(msg *startMessage) {
 	if msg.Agent == nil {
 		return
 	}
@@ -468,7 +497,7 @@ func handleAgentRequest(msg *StartMessage) {
 		trySendErrorMessage("agent forwarding chmod [%s] failed: %v", agentPath, err)
 	}
 	onExitFuncs = append(onExitFuncs, func() {
-		listener.Close()
+		_ = listener.Close()
 		_ = os.Remove(agentPath)
 	})
 	go handleChannelAccept(listener, msg.Agent.ChannelType)
@@ -484,7 +513,7 @@ func handleChannelAccept(listener net.Listener, channelType string) {
 		}
 		go func(conn net.Conn) {
 			id := addAcceptConn(conn)
-			if err := sendBusMessage("channel", &ChannelMessage{ChannelType: channelType, ID: id}); err != nil {
+			if err := sendBusMessage("channel", &channelMessage{ChannelType: channelType, ID: id}); err != nil {
 				trySendErrorMessage("send channel message failed: %v", err)
 			}
 		}(conn)

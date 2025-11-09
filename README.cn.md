@@ -15,30 +15,30 @@ tssh 设计为 ssh 客户端的直接替代品，提供与 openssh 完全兼容�
 
 tsshd 的灵感来源于 [mosh](https://github.com/mobile-shell/mosh)，`tsshd` 类似于 `mosh-server`，而 `tssh --udp` 类似于 `mosh`。
 
-| Feature                  |                     mosh ( mosh-server )                      |              tssh ( tsshd )               |
-| ------------------------ | :-----------------------------------------------------------: | :---------------------------------------: |
-| 超低延迟                 |                              ??                               | ✅ [KCP](https://github.com/xtaci/kcp-go) |
-| 保持连接                 |                              ✅                               |                    ✅                     |
-| 切换网络                 |                              ✅                               |                    ✅                     |
-| 本地回显 & 行编辑        |                              ✅                               |                无支持计划                 |
-| 支持多平台 / Windows     |  [mosh#293](https://github.com/mobile-shell/mosh/issues/293)  |                    ✅                     |
-| SSH X11 转发             |   [mosh#41](https://github.com/mobile-shell/mosh/issues/41)   |                    ✅                     |
-| SSH Agent 转发           |  [mosh#120](https://github.com/mobile-shell/mosh/issues/120)  |                    ✅                     |
-| SSH 端口转发             |  [mosh#337](https://github.com/mobile-shell/mosh/issues/337)  |                    ✅                     |
-| 输出上下滚动             |  [mosh#122](https://github.com/mobile-shell/mosh/issues/122)  |                    ✅                     |
-| OSC52 复制粘贴           |  [mosh#637](https://github.com/mobile-shell/mosh/issues/637)  |                    ✅                     |
-| tmux -CC 集成            | [mosh#1078](https://github.com/mobile-shell/mosh/issues/1078) |                    ✅                     |
-| ProxyJump / ProxyCommand |  [mosh#970](https://github.com/mobile-shell/mosh/issues/970)  |                 ✅ 第一跳                 |
+| Feature              |                     mosh ( mosh-server )                      |              tssh ( tsshd )               |
+| -------------------- | :-----------------------------------------------------------: | :---------------------------------------: |
+| 超低延迟             |                              ??                               | ✅ [KCP](https://github.com/xtaci/kcp-go) |
+| 保持连接             |                              ✅                               |                    ✅                     |
+| 切换网络             |                              ✅                               |                    ✅                     |
+| 本地回显 & 行编辑    |                              ✅                               |                无支持计划                 |
+| 支持多平台 / Windows |  [mosh#293](https://github.com/mobile-shell/mosh/issues/293)  |                    ✅                     |
+| SSH X11 转发         |   [mosh#41](https://github.com/mobile-shell/mosh/issues/41)   |                    ✅                     |
+| SSH Agent 转发       |  [mosh#120](https://github.com/mobile-shell/mosh/issues/120)  |                    ✅                     |
+| SSH 端口转发         |  [mosh#337](https://github.com/mobile-shell/mosh/issues/337)  |                    ✅                     |
+| 输出上下滚动         |  [mosh#122](https://github.com/mobile-shell/mosh/issues/122)  |                    ✅                     |
+| OSC52 复制粘贴       |  [mosh#637](https://github.com/mobile-shell/mosh/issues/637)  |                    ✅                     |
+| ProxyJump            |  [mosh#970](https://github.com/mobile-shell/mosh/issues/970)  |                    ✅                     |
+| tmux -CC 集成        | [mosh#1078](https://github.com/mobile-shell/mosh/issues/1078) |                    ✅                     |
 
 tssh 和 tsshd 的工作方式与 ssh 完全相同，没有计划支持本地回显和行编辑，也不会出现 mosh 的问题：[mosh#1041](https://github.com/mobile-shell/mosh/issues/1041)、[mosh#1281](https://github.com/mobile-shell/mosh/issues/1281)、[mosh#1295](https://github.com/mobile-shell/mosh/issues/1295) 等。
 
 ## 如何使用
 
-1. 在客户端（本地电脑）上安装 [tssh](https://github.com/trzsz/trzsz-ssh)。
+1. 在客户端（本地电脑）上安装 [tssh](https://github.com/trzsz/trzsz-ssh?tab=readme-ov-file#installation)。
 
-2. 在服务端（远程机器）上安装 [tsshd](https://github.com/trzsz/tsshd)。
+2. 在服务端（远程机器）上安装 [tsshd](https://github.com/trzsz/tsshd?tab=readme-ov-file#installation)。
 
-3. 使用 `tssh --udp` 登录服务器。在 `~/.ssh/config` 中如下配置可省略 `--udp` 参数：
+3. 使用 `tssh --udp xxx` 登录服务器。在 `~/.ssh/config` 中如下配置可省略 `--udp` 参数：
 
    ```
    Host xxx
