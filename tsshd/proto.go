@@ -327,6 +327,7 @@ func newKcpClient(addr string, info *ServerInfo) (udpClient, error) {
 	if err != nil {
 		return nil, fmt.Errorf("kcp dial [%s] failed: %v", addr, err)
 	}
+	conn.SetWindowSize(1024, 1024)
 	conn.SetNoDelay(1, 10, 2, 1)
 	session, err := smux.Client(conn, &smuxConfig)
 	if err != nil {

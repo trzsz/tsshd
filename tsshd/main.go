@@ -36,6 +36,8 @@ import (
 	"time"
 )
 
+var kDefaultConnectTimeout = 10 * time.Second
+
 var exitChan = make(chan int, 1)
 
 type tsshdArgs struct {
@@ -158,6 +160,11 @@ func TsshdMain() int {
 	// cleanup on exit
 	defer cleanupOnExit()
 
+	// default connect timeout
+	if args.ConnectTimeout <= 0 {
+		args.ConnectTimeout = kDefaultConnectTimeout
+	}
+
 	// handle exit signals
 	handleExitSignals()
 
@@ -181,11 +188,7 @@ func TsshdMain() int {
 
 	go func() {
 		// should be connected in time
-		connectTimeout := args.ConnectTimeout
-		if connectTimeout <= 0 {
-			connectTimeout = 10 * time.Second
-		}
-		time.Sleep(connectTimeout)
+		time.Sleep(args.ConnectTimeout)
 		if !serving.Load() {
 			exitChan <- 1
 		}

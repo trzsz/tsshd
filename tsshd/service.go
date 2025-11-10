@@ -37,9 +37,9 @@ import (
 var smuxConfig = smux.Config{
 	Version:           2,
 	KeepAliveDisabled: true,
-	MaxFrameSize:      32 * 1024,
-	MaxStreamBuffer:   64 * 1024,
-	MaxReceiveBuffer:  4 * 1024 * 1024,
+	MaxFrameSize:      48 * 1024,
+	MaxStreamBuffer:   10 * 1024 * 1024,
+	MaxReceiveBuffer:  20 * 1024 * 1024,
 }
 
 type quicStream struct {
@@ -73,6 +73,7 @@ func handleKcpConn(conn *kcp.UDPSession) {
 		return
 	}
 
+	conn.SetWindowSize(1024, 1024)
 	conn.SetNoDelay(1, 10, 2, 1)
 
 	session, err := smux.Server(conn, &smuxConfig)

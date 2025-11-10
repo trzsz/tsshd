@@ -37,6 +37,7 @@ import (
 	"math/big"
 	math_rand "math/rand"
 	"net"
+	"os"
 	"strconv"
 	"strings"
 	"time"
@@ -74,7 +75,7 @@ func initServer(args *tsshdArgs) (*kcp.Listener, *quic.Listener, error) {
 	}
 
 	if args.Proxy {
-		conn, err = startServerProxy(conn, info)
+		conn, err = startServerProxy(conn, info, args.ConnectTimeout)
 		if err != nil {
 			return nil, nil, err
 		}
@@ -131,41 +132,67 @@ func getPortRange(args *tsshdArgs) (int, int) {
 	return kDefaultPortRangeLow, kDefaultPortRangeHigh
 }
 
-func getUdpNetworks(args *tsshdArgs) []string {
-	if args.IPv4 && !args.IPv6 {
-		return []string{"udp4"}
-	}
-	if !args.IPv4 && args.IPv6 {
-		return []string{"udp6"}
-	}
-	ipv4, ipv6 := false, false
-	addrs, err := net.InterfaceAddrs()
+func canListenOnUDP(udpAddr *net.UDPAddr) bool {
+	conn, err := net.ListenUDP("udp", udpAddr)
 	if err != nil {
-		return []string{"udp"}
+		return false
 	}
-	for _, addr := range addrs {
-		if ipNet, ok := addr.(*net.IPNet); ok {
-			if ipNet.IP.IsLoopback() {
-				continue
+	_ = conn.Close()
+	return true
+}
+
+func getUdpAddrs(args *tsshdArgs) ([]*net.UDPAddr, error) {
+	if sshConnection := os.Getenv("SSH_CONNECTION"); sshConnection != "" {
+		if tokens := strings.Fields(sshConnection); len(tokens) >= 3 {
+			ip := tokens[2]
+			if strings.HasPrefix(strings.ToLower(ip), "::ffff:") {
+				ip = ip[7:]
 			}
-			if ipNet.IP.To4() != nil {
-				ipv4 = true
-			} else if ipNet.IP.To16() != nil {
-				ipv6 = true
+			udpAddr, err := net.ResolveUDPAddr("udp", fmt.Sprintf("%s:0", ip))
+			if err == nil && canListenOnUDP(udpAddr) {
+				return []*net.UDPAddr{udpAddr}, nil
 			}
 		}
 	}
-	if !ipv4 && !ipv6 {
-		return []string{"udp"}
+
+	var udpAddrs []*net.UDPAddr
+	ifaceAddrs, err := net.InterfaceAddrs()
+	if err == nil {
+		ipv4Only := args.IPv4 && !args.IPv6
+		ipv6Only := !args.IPv4 && args.IPv6
+		for _, addr := range ifaceAddrs {
+			if ipNet, ok := addr.(*net.IPNet); ok {
+				if ipNet.IP.IsLoopback() {
+					continue
+				}
+				if ipNet.IP.To4() != nil && !ipv6Only {
+					addr := &net.UDPAddr{IP: ipNet.IP}
+					if canListenOnUDP(addr) {
+						udpAddrs = append(udpAddrs, addr)
+					}
+				} else if ipNet.IP.To16() != nil && !ipv4Only {
+					var zone string
+					if ipAddr, ok := addr.(*net.IPAddr); ok {
+						zone = ipAddr.Zone
+					}
+					addr := &net.UDPAddr{IP: ipNet.IP, Zone: zone}
+					if canListenOnUDP(addr) {
+						udpAddrs = append(udpAddrs, addr)
+					}
+				}
+			}
+		}
 	}
-	var networks []string
-	if ipv4 {
-		networks = append(networks, "udp4")
+
+	if len(udpAddrs) == 0 {
+		udpAddr, err := net.ResolveUDPAddr("udp", ":0")
+		if err != nil {
+			return nil, err
+		}
+		return []*net.UDPAddr{udpAddr}, nil
 	}
-	if ipv6 {
-		networks = append(networks, "udp6")
-	}
-	return networks
+
+	return udpAddrs, nil
 }
 
 func listenUdpOnFreePort(args *tsshdArgs) ([]*net.UDPConn, int, error) {
@@ -173,21 +200,24 @@ func listenUdpOnFreePort(args *tsshdArgs) ([]*net.UDPConn, int, error) {
 	if portRangeHigh < portRangeLow {
 		return nil, 0, fmt.Errorf("no port in [%d,%d]", portRangeLow, portRangeHigh)
 	}
-	networks := getUdpNetworks(args)
+	addrs, err := getUdpAddrs(args)
+	if err != nil {
+		return nil, 0, fmt.Errorf("get available udp address failed: %v", err)
+	}
 	var lastErr error
 	size := portRangeHigh - portRangeLow + 1
 	port := portRangeLow + math_rand.Intn(size)
 	for range size {
 		var connList []*net.UDPConn
-		for _, network := range networks {
-			conn, err := listenUdpOnPort(network, port)
+		for _, addr := range addrs {
+			conn, err := listenUdpOnPort(addr, port)
 			if err != nil {
 				lastErr = err
 				break
 			}
 			connList = append(connList, conn)
 		}
-		if len(connList) == len(networks) {
+		if len(connList) == len(addrs) {
 			return connList, port, nil
 		}
 		for _, conn := range connList {
@@ -204,15 +234,11 @@ func listenUdpOnFreePort(args *tsshdArgs) ([]*net.UDPConn, int, error) {
 	return nil, 0, fmt.Errorf("listen udp on [%d,%d] failed", portRangeLow, portRangeHigh)
 }
 
-func listenUdpOnPort(network string, port int) (*net.UDPConn, error) {
-	addr := fmt.Sprintf(":%d", port)
-	udpAddr, err := net.ResolveUDPAddr(network, addr)
+func listenUdpOnPort(udpAddr *net.UDPAddr, port int) (*net.UDPConn, error) {
+	udpAddr.Port = port
+	conn, err := net.ListenUDP("udp", udpAddr)
 	if err != nil {
-		return nil, fmt.Errorf("resolve [%s] addr [%s] failed: %v", network, addr, err)
-	}
-	conn, err := net.ListenUDP(network, udpAddr)
-	if err != nil {
-		return nil, fmt.Errorf("listen [%s] on [%s] failed: %v", network, addr, err)
+		return nil, fmt.Errorf("listen on [%s] failed: %v", udpAddr.String(), err)
 	}
 	return conn, nil
 }

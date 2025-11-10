@@ -81,15 +81,16 @@ type udpBuffer struct {
 }
 
 type serverProxy struct {
-	frontendList []*net.UDPConn
-	backendConn  *net.UDPConn
-	clientConn   atomic.Pointer[udpConn]
-	authedConn   *udpConn
-	cipherBlock  *cipher.Block
-	clientID     uint64
-	serverID     uint64
-	serialNumber uint64
-	bufChan      chan *udpBuffer
+	connectTimeout time.Duration
+	frontendList   []*net.UDPConn
+	backendConn    *net.UDPConn
+	clientConn     atomic.Pointer[udpConn]
+	authedConn     *udpConn
+	cipherBlock    *cipher.Block
+	clientID       uint64
+	serverID       uint64
+	serialNumber   uint64
+	bufChan        chan *udpBuffer
 }
 
 func (p *serverProxy) isClientConn(conn *udpConn) bool {
@@ -191,13 +192,22 @@ func (p *serverProxy) backendToFrontend() {
 }
 
 func (p *serverProxy) serveFrontendConn(conn *net.UDPConn) {
+	defer func() { _ = conn.Close() }()
+	beginTime := time.Now()
+	neverReceived := true
+
 	current := 0
 	buffers := [2][]byte{make([]byte, 0xffff), make([]byte, 0xffff)}
 	for {
+		_ = conn.SetReadDeadline(time.Now().Add(p.connectTimeout))
 		n, addr, err := conn.ReadFromUDP(buffers[current])
 		if err != nil || n <= 0 {
+			if neverReceived && time.Since(beginTime) > p.connectTimeout {
+				return
+			}
 			continue
 		}
+		neverReceived = false
 		p.bufChan <- &udpBuffer{
 			conn: &udpConn{
 				frontendConn: conn,
@@ -221,7 +231,7 @@ func (p *serverProxy) serveProxy() {
 	go p.backendToFrontend()
 }
 
-func startServerProxy(frontendList []*net.UDPConn, info *ServerInfo) ([]*net.UDPConn, error) {
+func startServerProxy(frontendList []*net.UDPConn, info *ServerInfo, connectTimeout time.Duration) ([]*net.UDPConn, error) {
 	localAddr := "127.0.0.1:0"
 	udpAddr, err := net.ResolveUDPAddr("udp", localAddr)
 	if err != nil {
@@ -263,12 +273,13 @@ func startServerProxy(frontendList []*net.UDPConn, info *ServerInfo) ([]*net.UDP
 	info.ServerID = binary.BigEndian.Uint64(serverID)
 
 	proxy := &serverProxy{
-		frontendList: frontendList,
-		backendConn:  backendConn,
-		cipherBlock:  &cipherBlock,
-		clientID:     info.ClientID,
-		serverID:     info.ServerID,
-		bufChan:      make(chan *udpBuffer), // unbuffered channel to avaid copying buffer
+		connectTimeout: connectTimeout,
+		frontendList:   frontendList,
+		backendConn:    backendConn,
+		cipherBlock:    &cipherBlock,
+		clientID:       info.ClientID,
+		serverID:       info.ServerID,
+		bufChan:        make(chan *udpBuffer), // unbuffered channel to avaid copying buffer
 	}
 	go proxy.serveProxy()
 
