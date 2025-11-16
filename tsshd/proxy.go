@@ -241,7 +241,7 @@ func startServerProxy(frontendList []*net.UDPConn, info *ServerInfo, connectTime
 	if err != nil {
 		return nil, fmt.Errorf("listen udp on [%s] failed: %v", localAddr, err)
 	}
-	svrAddr := fmt.Sprintf("127.0.0.1:%d", serverConn.LocalAddr().(*net.UDPAddr).Port)
+	svrAddr := serverConn.LocalAddr().String()
 	svrUdpAddr, err := net.ResolveUDPAddr("udp", svrAddr)
 	if err != nil {
 		return nil, fmt.Errorf("resolve udp addr [%s] failed: %v", svrAddr, err)
@@ -449,7 +449,7 @@ func startClientProxy(svrAddr string, info *ServerInfo) (string, *clientProxy, e
 	if err != nil {
 		return "", nil, fmt.Errorf("listen udp on [%s] failed: %v", localAddr, err)
 	}
-	proxyAddr := fmt.Sprintf("127.0.0.1:%d", frontendConn.LocalAddr().(*net.UDPAddr).Port)
+	proxyAddr := frontendConn.LocalAddr().String()
 	serverAddr, err := net.ResolveUDPAddr("udp", svrAddr)
 	if err != nil {
 		return "", nil, fmt.Errorf("resolve udp addr [%s] failed: %v", svrAddr, err)

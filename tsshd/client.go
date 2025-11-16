@@ -314,7 +314,7 @@ func (c *SshUdpClient) ForwardUDPv1(addr string, timeout time.Duration) (string,
 	if err != nil {
 		return "", fmt.Errorf("listen udp on [%s] failed: %v", localAddr, err)
 	}
-	localAddr = fmt.Sprintf("127.0.0.1:%d", localConn.LocalAddr().(*net.UDPAddr).Port)
+	localAddr = localConn.LocalAddr().String()
 
 	stream, err := c.newStream("UDPv1")
 	if err != nil {
@@ -393,6 +393,9 @@ func (c *SshUdpClient) handleBusEvent() {
 			c.warning("recv bus command failed: %v", err)
 			return
 		}
+		if c.aliveCallback != nil {
+			c.aliveCallback()
+		}
 		switch command {
 		case "exit":
 			c.handleExitEvent()
@@ -401,9 +404,6 @@ func (c *SshUdpClient) handleBusEvent() {
 		case "channel":
 			c.handleChannelEvent()
 		case "alive":
-			if c.aliveCallback != nil {
-				c.aliveCallback()
-			}
 		default:
 			c.warning("unknown command bus command: %s", command)
 		}
@@ -570,14 +570,24 @@ func (s *SshUdpSession) startSession(msg *startMessage) error {
 		return err
 	}
 	if s.stdin != nil {
-		go func() {
-			_, _ = io.Copy(s.stream, s.stdin)
-		}()
+		go func() { _, _ = io.Copy(s.stream, s.stdin) }()
 	}
 	if s.stdout != nil {
 		go func() {
 			defer func() { _ = s.stdout.Close() }()
-			_, _ = io.Copy(s.stdout, s.stream)
+			buffer := make([]byte, 32*1024)
+			for {
+				n, err := s.stream.Read(buffer)
+				if n > 0 {
+					if s.client.aliveCallback != nil {
+						s.client.aliveCallback()
+					}
+					_ = writeAll(s.stdout, buffer[:n])
+				}
+				if err != nil {
+					break
+				}
+			}
 		}()
 	}
 	return nil
@@ -768,6 +778,14 @@ type sshUdpConn struct {
 	closed atomic.Bool
 }
 
+func (c *sshUdpConn) Read(b []byte) (int, error) {
+	n, err := c.Conn.Read(b)
+	if n > 0 && c.client.aliveCallback != nil {
+		c.client.aliveCallback()
+	}
+	return n, err
+}
+
 func (c *sshUdpConn) Close() error {
 	if !c.closed.CompareAndSwap(false, true) {
 		return nil
@@ -815,6 +833,14 @@ type sshUdpChannel struct {
 	net.Conn
 	client *SshUdpClient
 	closed atomic.Bool
+}
+
+func (c *sshUdpChannel) Read(b []byte) (int, error) {
+	n, err := c.Conn.Read(b)
+	if n > 0 && c.client.aliveCallback != nil {
+		c.client.aliveCallback()
+	}
+	return n, err
 }
 
 func (c *sshUdpChannel) Close() error {

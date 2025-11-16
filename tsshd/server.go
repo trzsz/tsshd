@@ -148,7 +148,13 @@ func getUdpAddrs(args *tsshdArgs) ([]*net.UDPAddr, error) {
 			if strings.HasPrefix(strings.ToLower(ip), "::ffff:") {
 				ip = ip[7:]
 			}
-			udpAddr, err := net.ResolveUDPAddr("udp", fmt.Sprintf("%s:0", ip))
+			var addr string
+			if !strings.HasPrefix(ip, "[") && strings.ContainsRune(ip, ':') {
+				addr = fmt.Sprintf("[%s]:0", ip)
+			} else {
+				addr = fmt.Sprintf("%s:0", ip)
+			}
+			udpAddr, err := net.ResolveUDPAddr("udp", addr)
 			if err == nil && canListenOnUDP(udpAddr) {
 				return []*net.UDPAddr{udpAddr}, nil
 			}
@@ -156,28 +162,39 @@ func getUdpAddrs(args *tsshdArgs) ([]*net.UDPAddr, error) {
 	}
 
 	var udpAddrs []*net.UDPAddr
-	ifaceAddrs, err := net.InterfaceAddrs()
+	ipv4Only := args.IPv4 && !args.IPv6
+	ipv6Only := !args.IPv4 && args.IPv6
+	addListenableAddr := func(ip net.IP, zone string) {
+		if ip.To4() != nil { // ipv4
+			if ipv6Only {
+				return
+			}
+			udpAddr := &net.UDPAddr{IP: ip}
+			if canListenOnUDP(udpAddr) {
+				udpAddrs = append(udpAddrs, udpAddr)
+			}
+		} else if ip.To16() != nil { // ipv6
+			if ipv4Only {
+				return
+			}
+			udpAddr := &net.UDPAddr{IP: ip, Zone: zone}
+			if canListenOnUDP(udpAddr) {
+				udpAddrs = append(udpAddrs, udpAddr)
+			}
+		}
+	}
+
+	ifaces, err := net.Interfaces()
 	if err == nil {
-		ipv4Only := args.IPv4 && !args.IPv6
-		ipv6Only := !args.IPv4 && args.IPv6
-		for _, addr := range ifaceAddrs {
-			if ipNet, ok := addr.(*net.IPNet); ok {
-				if ipNet.IP.IsLoopback() {
-					continue
-				}
-				if ipNet.IP.To4() != nil && !ipv6Only {
-					addr := &net.UDPAddr{IP: ipNet.IP}
-					if canListenOnUDP(addr) {
-						udpAddrs = append(udpAddrs, addr)
-					}
-				} else if ipNet.IP.To16() != nil && !ipv4Only {
-					var zone string
-					if ipAddr, ok := addr.(*net.IPAddr); ok {
-						zone = ipAddr.Zone
-					}
-					addr := &net.UDPAddr{IP: ipNet.IP, Zone: zone}
-					if canListenOnUDP(addr) {
-						udpAddrs = append(udpAddrs, addr)
+		for _, iface := range ifaces {
+			addrs, err := iface.Addrs()
+			if err == nil {
+				for _, addr := range addrs {
+					switch v := addr.(type) {
+					case *net.IPNet:
+						addListenableAddr(v.IP, iface.Name)
+					case *net.IPAddr:
+						addListenableAddr(v.IP, iface.Name)
 					}
 				}
 			}
@@ -259,7 +276,7 @@ func listenKCP(conn *net.UDPConn, info *ServerInfo) (*kcp.Listener, error) {
 		return nil, fmt.Errorf("new aes block crypt failed: %v", err)
 	}
 
-	listener, err := kcp.ServeConn(block, 10, 3, conn)
+	listener, err := kcp.ServeConn(block, 1, 1, conn)
 	if err != nil {
 		return nil, fmt.Errorf("kcp serve conn failed: %v", err)
 	}

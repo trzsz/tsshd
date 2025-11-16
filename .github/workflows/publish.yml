@@ -19,6 +19,9 @@ jobs:
           distribution: goreleaser
           version: "~> v1"
           args: release --clean --skip=publish
+      - name: Show Checksum
+        run: |
+          sha256sum dist/*.tar.gz dist/*.zip dist/*.rpm dist/*_checksums.txt
       - name: Upload Release Assets
         uses: softprops/action-gh-release@v2
         with:

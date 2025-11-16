@@ -51,13 +51,53 @@ tssh 和 tsshd 的工作方式与 ssh 完全相同，没有计划支持本地回
 
 - `tssh` 会先作为一个 ssh 客户端正常登录到服务器上，然后在服务器上启动一个新的 `tsshd` 进程。
 
-- `tsshd` 进程会随机侦听一个 61001 到 61999 之间的 UDP 端口（可通过 `UdpPort` 配置自定义），并将其端口和密钥通过 ssh 通道发回给 `tssh` 进程。登录的 ssh 连接会被关闭，然后 `tssh` 进程通过 UDP 与 `tsshd` 进程通讯。
+- `tsshd` 进程会随机侦听一个 61001 到 61999 之间的 UDP 端口（可通过 `UdpPort` 配置自定义），并将其端口和几个密钥通过 ssh 通道发回给 `tssh` 进程。登录的 ssh 连接会被关闭，然后 `tssh` 进程通过 UDP 与 `tsshd` 进程通讯。
+
+## 重连架构
+
+```
+┌───────────────────────┐                ┌───────────────────────┐
+│                       │                │                       │
+│    tssh (process)     │                │    tsshd (process)    │
+│                       │                │                       │
+│ ┌───────────────────┐ │                │ ┌───────────────────┐ │
+│ │                   │ │                │ │                   │ │
+│ │  KCP/QUIC Client  │ │                │ │  KCP/QUIC Server  │ │
+│ │                   │ │                │ │                   │ │
+│ └───────┬───▲───────┘ │                │ └───────┬───▲───────┘ │
+│         │   │         │                │         │   │         │
+│         │   │         │                │         │   │         │
+│ ┌───────▼───┴───────┐ │                │ ┌───────▼───┴───────┐ │
+│ │                   ├─┼────────────────┼─►                   │ │
+│ │   Client  Proxy   │ │                │ │   Server  Proxy   │ │
+│ │                   ◄─┼────────────────┼─┤                   │ │
+│ └───────────────────┘ │                │ └───────────────────┘ │
+└───────────────────────┘                └───────────────────────┘
+```
+
+- 客户端 `KCP/QUIC Client` 和 `Client Proxy` 在同一台机同一个进程内，它们之间的连接不会断。
+
+- 服务端 `KCP/QUIC Server` 和 `Server Proxy` 在同一台机同一个进程内，它们之间的连接不会断。
+
+- 客户端较长时间没收到服务端的心跳包时，可能是因为网络变化导致原连接失效了，则由 `Client Proxy` 重新建一个到 `Server Proxy` 的连接，认证通过后就使用新连接进行通讯。在 `KCP/QUIC Client` 和 `KCP/QUIC Server` 看来，连接从来没有断开过。
+
+## 安全保障
+
+- 服务端 `KCP/QUIC Server` 只监听本机 127.0.0.1，并且只接受一个连接，在本进程的 `Server Proxy` 连上后，其他所有连接都会直接拒绝。
+
+- 客户端 `Client Proxy` 只监听本机 127.0.0.1，并且只接受一个连接，在本进程的 `KCP/QUIC Client` 连上后，其他所有连接都会直接拒绝。
+
+- 服务端 `Server Proxy` 只转发认证过的唯一的客户端 `Client Proxy` 的报文。客户端 `Client Proxy` 可以换 IP 地址和端口，但新的客户端 `Client Proxy` 认证后，服务端 `Server Proxy` 就只为新的客户端 `Client Proxy` 转发报文，忽略旧的客户端 `Client Proxy` 地址。
+
+- 客户端 `Client Proxy` 首次连接或换新 IP 端口重新连接到服务端 `Server Proxy` 时，需要先发送认证报文（ 使用 AES-GCM-256 算法加密，密钥是服务端随机生成的一次性密钥，登录时通过 ssh 通道发送给客户端 ）。服务端 `Server Proxy` 正常解密认证报文（未被篡改）后，校验客户端 ID 符合预期，校验序列号比之前收到过的所有认证报文中的序列号都要大，则将该客户端地址标为已认证地址，同时向客户端发送认证确认报文（ 使用 AES-GCM-256 算法加密 ）。客户端 `Client Proxy` 收到服务端 `Server Proxy` 的认证确认报文并正常解密（未被篡改）后，校验服务端 ID 和序列号，符合预期则开始使用新地址与服务端 `Server Proxy` 通讯，将来自本进程 `KCP/QUIC Client` 的报文转发给服务端 `Server Proxy`，服务端 `Server Proxy` 再转发给本进程的 `KCP/QUIC Server` 服务。
+
+- 客户端 `KCP/QUIC Client` 与服务端 `KCP/QUIC Server` 使用开源的 [KCP](https://github.com/xtaci/kcp-go) / [QUIC](https://github.com/quic-go/quic-go) 协议，全程使用加密传输（ 密钥是服务端随机生成的一次性密钥，登录时通过 ssh 通道发送给客户端 ）。
 
 ## 配置说明
 
 ```
 Host xxx
-    #!! UdpMode KCP
+    #!! UdpMode Yes
     #!! UdpPort 61001-61999
     #!! TsshdPath ~/go/bin/tsshd
     #!! UdpAliveTimeout 86400
@@ -67,7 +107,7 @@ Host xxx
     #!! ShowFullNotifications yes
 ```
 
-- `UdpMode`: `No` (默认为`No`: tssh 工作在 TCP 模式), `Yes` (默认协议: `KCP`), `QUIC` ([QUIC](https://github.com/quic-go/quic-go) 协议), `KCP` ([KCP](https://github.com/xtaci/kcp-go) 协议).
+- `UdpMode`: `No` (默认为`No`: tssh 工作在 TCP 模式), `Yes` (默认协议: `QUIC`), `QUIC` ([QUIC](https://github.com/quic-go/quic-go) 协议：速度更快), `KCP` ([KCP](https://github.com/xtaci/kcp-go) 协议：延迟更低).
 
 - `UdpPort`: 指定 tsshd 监听的 UDP 端口范围，默认值为 [61001, 61999]。
 

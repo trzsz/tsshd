@@ -323,12 +323,13 @@ func newKcpClient(addr string, info *ServerInfo) (udpClient, error) {
 	if err != nil {
 		return nil, fmt.Errorf("new aes block crypt failed: %v", err)
 	}
-	conn, err := kcp.DialWithOptions(addr, block, 10, 3)
+	conn, err := kcp.DialWithOptions(addr, block, 1, 1)
 	if err != nil {
 		return nil, fmt.Errorf("kcp dial [%s] failed: %v", addr, err)
 	}
 	conn.SetWindowSize(1024, 1024)
 	conn.SetNoDelay(1, 10, 2, 1)
+	conn.SetWriteDelay(false)
 	session, err := smux.Client(conn, &smuxConfig)
 	if err != nil {
 		return nil, fmt.Errorf("kcp smux client failed: %v", err)

@@ -75,6 +75,7 @@ func handleKcpConn(conn *kcp.UDPSession) {
 
 	conn.SetWindowSize(1024, 1024)
 	conn.SetNoDelay(1, 10, 2, 1)
+	conn.SetWriteDelay(false)
 
 	session, err := smux.Server(conn, &smuxConfig)
 	if err != nil {
