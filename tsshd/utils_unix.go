@@ -33,6 +33,7 @@ import (
 	"syscall"
 
 	"github.com/creack/pty"
+	"github.com/google/shlex"
 )
 
 type tsshdPty struct {
@@ -66,4 +67,8 @@ func getSysProcAttr() *syscall.SysProcAttr {
 	return &syscall.SysProcAttr{
 		Setsid: true,
 	}
+}
+
+func splitCommandLine(command string) ([]string, error) {
+	return shlex.Split(command)
 }

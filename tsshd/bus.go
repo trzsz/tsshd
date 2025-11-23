@@ -65,7 +65,7 @@ func sendBusMessage(command string, msg any) error {
 
 func trySendErrorMessage(format string, a ...any) {
 	_, _ = doWithTimeout(func() (int, error) {
-		_ = sendBusMessage("error", errorMessage{fmt.Sprintf(format, a...)})
+		_ = sendBusMessage("error", errorMessage{Msg: fmt.Sprintf(format, a...)})
 		return 0, nil
 	}, 1*time.Second)
 }
@@ -116,36 +116,45 @@ func handleBusEvent(stream net.Conn) {
 		case "close":
 			exitChan <- 0
 			return
-		case "alive":
+		case "alive": // work as ping in new version
 			now := time.Now()
 			lastAliveTime.Store(&now)
+			_ = sendBusCommand("alive")
+		case "alive2":
+			err = handleAliveEvent(stream)
 		default:
-			err = handleUnknownEvent(stream)
+			err = handleUnknownEvent(stream, command)
 		}
 		if err != nil {
-			trySendErrorMessage("handle bus command [%s] failed: %v", command, err)
+			trySendErrorMessage("handle bus command [%s] failed: %v. You may need to upgrade tsshd.", command, err)
 		}
 	}
 }
 
-func handleUnknownEvent(stream net.Conn) error {
+func handleAliveEvent(stream net.Conn) error {
+	now := time.Now()
+	lastAliveTime.Store(&now)
+
+	var msg aliveMessage
+	if err := recvMessage(stream, &msg); err != nil {
+		return fmt.Errorf("recv alive message failed: %v", err)
+	}
+
+	return sendBusMessage("alive2", msg)
+}
+
+func handleUnknownEvent(stream net.Conn, command string) error {
 	var msg struct{}
 	if err := recvMessage(stream, &msg); err != nil {
-		return fmt.Errorf("recv unknown message failed: %v", err)
+		return fmt.Errorf("recv message for unknown command [%s] failed: %v", command, err)
 	}
-	return fmt.Errorf("unknown command")
+	return fmt.Errorf("unknown command: %s", command)
 }
 
 func keepAlive(totalTimeout time.Duration, intervalTimeout time.Duration) {
 	if intervalTimeout <= 0 {
 		intervalTimeout = min(totalTimeout/10, 10*time.Second)
 	}
-	go func() {
-		for {
-			_ = sendBusCommand("alive")
-			time.Sleep(intervalTimeout)
-		}
-	}()
 	for {
 		if t := lastAliveTime.Load(); t != nil && time.Since(*t) > totalTimeout {
 			trySendErrorMessage("tsshd keep alive timeout")

@@ -34,6 +34,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -133,33 +134,36 @@ func (c *sessionContext) forwardIO(stream net.Conn) {
 	if c.stdin != nil {
 		go func() {
 			_, _ = io.Copy(c.stdin, stream)
+			_ = c.stdin.Close()
 		}()
 	}
 
 	if c.stdout != nil {
 		c.wg.Go(func() {
 			_, _ = io.Copy(stream, c.stdout)
+			_ = stream.Close()
 		})
 	}
 
 	if c.stderr != nil {
 		c.wg.Go(func() {
-			if stderr, ok := stderrMap[c.id]; ok {
+			if stderr := getStderrStream(c.id); stderr != nil {
 				_, _ = io.Copy(stderr.stream, c.stderr)
+				_ = stderr.stream.Close()
 			} else {
-				_, _ = io.Copy(stream, c.stderr)
+				_, _ = io.Copy(io.Discard, c.stderr)
 			}
 		})
 	}
 }
 
 func (c *sessionContext) Wait() {
+	c.wg.Wait()
 	if c.pty != nil {
 		_ = c.pty.Wait()
 	} else {
 		_ = c.cmd.Wait()
 	}
-	c.wg.Wait()
 }
 
 func (c *sessionContext) Close() {
@@ -188,12 +192,12 @@ func (c *sessionContext) Close() {
 			_ = c.cmd.Process.Kill()
 		}
 	}
-	sessionMutex.Lock()
-	defer sessionMutex.Unlock()
-	delete(sessionMap, c.id)
 }
 
 func (c *sessionContext) SetSize(cols, rows int, redraw bool) error {
+	if c.closed.Load() {
+		return nil
+	}
 	if c.pty == nil {
 		return fmt.Errorf("session %d %v is not pty", c.id, c.cmd.Args)
 	}
@@ -308,6 +312,10 @@ func getStderrStream(id uint64) *stderrStream {
 }
 
 func getSessionStartCmd(msg *startMessage) (*exec.Cmd, error) {
+	if msg.Subs != "" {
+		return getSubsystemCmd(msg.Subs)
+	}
+
 	var envs []string
 	for _, env := range os.Environ() {
 		pos := strings.IndexRune(env, '=')
@@ -376,6 +384,18 @@ func getSessionStartCmd(msg *startMessage) (*exec.Cmd, error) {
 	return cmd, nil
 }
 
+func getSubsystemCmd(name string) (*exec.Cmd, error) {
+	command := getSshdSubsystem(name)
+	if command == "" {
+		return nil, fmt.Errorf("subsystem [%s] does not exist in [%s]", name, sshdConfigPath)
+	}
+	args, err := splitCommandLine(command)
+	if err != nil {
+		return nil, fmt.Errorf("split subsystem [%s] [%s] failed: %v", name, command, err)
+	}
+	return exec.Command(args[0], args[1:]...), nil
+}
+
 func handleStderrEvent(stream net.Conn) {
 	var msg stderrMessage
 	if err := recvMessage(stream, &msg); err != nil {
@@ -417,7 +437,24 @@ func handleX11Request(msg *startMessage) {
 	if msg.X11 == nil {
 		return
 	}
-	listener, port, err := listenTcpOnFreePort("localhost", 6020, 6999)
+
+	if v := strings.ToLower(getSshdConfig("X11Forwarding")); v != "yes" {
+		trySendErrorMessage("X11Forwarding is not permitted on the server. Check [X11Forwarding] in [%s] on the server.", sshdConfigPath)
+		return
+	}
+	if v := strings.ToLower(getSshdConfig("DisableForwarding")); v == "yes" {
+		trySendErrorMessage("X11Forwarding is not permitted on the server. Check [DisableForwarding] in [%s] on the server.", sshdConfigPath)
+		return
+	}
+
+	displayOffset := 10
+	if offset := getSshdConfig("X11DisplayOffset"); offset != "" {
+		if off, err := strconv.ParseUint(offset, 10, 32); err == nil && off < (65535-6000-1000) {
+			displayOffset = int(off)
+		}
+	}
+
+	listener, port, err := listenTcpOnFreePort("localhost", 6000+displayOffset, min(6000+displayOffset+1000, 65535))
 	if err != nil {
 		trySendErrorMessage("X11 forwarding listen failed: %v", err)
 		return
@@ -479,6 +516,16 @@ func handleAgentRequest(msg *startMessage) {
 	if msg.Agent == nil {
 		return
 	}
+
+	if v := strings.ToLower(getSshdConfig("AllowAgentForwarding")); v == "no" {
+		trySendErrorMessage("AgentForwarding is not permitted on the server. Check [AllowAgentForwarding] in [%s] on the server.", sshdConfigPath)
+		return
+	}
+	if v := strings.ToLower(getSshdConfig("DisableForwarding")); v == "yes" {
+		trySendErrorMessage("AgentForwarding is not permitted on the server. Check [DisableForwarding] in [%s] on the server.", sshdConfigPath)
+		return
+	}
+
 	tempDir, err := os.MkdirTemp("", "tsshd-")
 	if err != nil {
 		trySendErrorMessage("agent forwarding mkdir temp failed: %v", err)

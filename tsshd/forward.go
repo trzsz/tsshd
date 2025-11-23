@@ -29,6 +29,7 @@ import (
 	"io"
 	"net"
 	"os"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -42,10 +43,31 @@ var acceptMutex sync.Mutex
 var acceptID atomic.Uint64
 var acceptMap = make(map[uint64]net.Conn)
 
+func sendProhibited(stream net.Conn, option string) {
+	sendErrorCode(stream, ErrProhibited, fmt.Sprintf("Check [%s] in [%s] on the server.", option, sshdConfigPath))
+}
+
 func handleDialEvent(stream net.Conn) {
 	var msg dialMessage
 	if err := recvMessage(stream, &msg); err != nil {
 		sendError(stream, fmt.Errorf("recv dial message failed: %v", err))
+		return
+	}
+
+	if v := strings.ToLower(getSshdConfig("AllowTcpForwarding")); v == "no" || v == "remote" {
+		sendProhibited(stream, "AllowTcpForwarding")
+		return
+	}
+
+	if msg.Network == "unix" {
+		if v := strings.ToLower(getSshdConfig("AllowStreamLocalForwarding")); v == "no" || v == "remote" {
+			sendProhibited(stream, "AllowStreamLocalForwarding")
+			return
+		}
+	}
+
+	if v := strings.ToLower(getSshdConfig("DisableForwarding")); v == "yes" {
+		sendProhibited(stream, "DisableForwarding")
 		return
 	}
 
@@ -57,7 +79,7 @@ func handleDialEvent(stream net.Conn) {
 		conn, err = net.Dial(msg.Network, msg.Addr)
 	}
 	if err != nil {
-		sendError(stream, fmt.Errorf("dial %s [%s] failed: %v", msg.Network, msg.Addr, err))
+		sendError(stream, err)
 		return
 	}
 
@@ -78,9 +100,26 @@ func handleListenEvent(stream net.Conn) {
 		return
 	}
 
+	if v := strings.ToLower(getSshdConfig("AllowTcpForwarding")); v == "no" || v == "local" {
+		sendProhibited(stream, "AllowTcpForwarding")
+		return
+	}
+
+	if msg.Network == "unix" {
+		if v := strings.ToLower(getSshdConfig("AllowStreamLocalForwarding")); v == "no" || v == "local" {
+			sendProhibited(stream, "AllowStreamLocalForwarding")
+			return
+		}
+	}
+
+	if v := strings.ToLower(getSshdConfig("DisableForwarding")); v == "yes" {
+		sendProhibited(stream, "DisableForwarding")
+		return
+	}
+
 	listener, err := net.Listen(msg.Network, msg.Addr)
 	if err != nil {
-		sendError(stream, fmt.Errorf("listen on %s [%s] failed: %v", msg.Network, msg.Addr, err))
+		sendError(stream, err)
 		return
 	}
 
@@ -160,8 +199,7 @@ func getAcceptConn(id uint64) net.Conn {
 
 func forwardConnection(stream net.Conn, conn net.Conn) {
 	var wg sync.WaitGroup
-	wg.Add(2)
-	go func() {
+	wg.Go(func() {
 		_, _ = io.Copy(conn, stream)
 		if cw, ok := conn.(closeWriter); ok {
 			_ = cw.CloseWrite()
@@ -170,9 +208,8 @@ func forwardConnection(stream net.Conn, conn net.Conn) {
 			time.Sleep(200 * time.Millisecond)
 			_ = conn.Close()
 		}
-		wg.Done()
-	}()
-	go func() {
+	})
+	wg.Go(func() {
 		_, _ = io.Copy(stream, conn)
 		if cw, ok := stream.(closeWriter); ok {
 			_ = cw.CloseWrite()
@@ -181,8 +218,7 @@ func forwardConnection(stream net.Conn, conn net.Conn) {
 			time.Sleep(200 * time.Millisecond)
 			_ = stream.Close()
 		}
-		wg.Done()
-	}()
+	})
 	wg.Wait()
 }
 

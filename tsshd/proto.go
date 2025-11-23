@@ -35,6 +35,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"strconv"
 	"time"
 
 	"github.com/quic-go/quic-go"
@@ -44,6 +45,33 @@ import (
 )
 
 const kNoErrorMsg = "_TSSHD_NO_ERROR_"
+
+type ErrCode int
+
+const (
+	ErrProhibited ErrCode = iota + 101
+)
+
+func (c ErrCode) String() string {
+	switch c {
+	case ErrProhibited:
+		return "ErrProhibited"
+	default:
+		return "UnknownError" + strconv.Itoa(int(c))
+	}
+}
+
+type Error struct {
+	Code ErrCode
+	Msg  string
+}
+
+func (e *Error) Error() string {
+	if e.Code == 0 {
+		return e.Msg
+	}
+	return fmt.Sprintf("%s: %s", e.Code.String(), e.Msg)
+}
 
 type ServerInfo struct {
 	Ver        string
@@ -60,7 +88,8 @@ type ServerInfo struct {
 }
 
 type errorMessage struct {
-	Msg string
+	Code ErrCode
+	Msg  string
 }
 
 type busMessage struct {
@@ -91,11 +120,16 @@ type startMessage struct {
 	Envs  map[string]string
 	X11   *x11RequestMessage
 	Agent *agentRequestMessage
+	Subs  string
 }
 
 type exitMessage struct {
 	ID       uint64
 	ExitCode int
+}
+
+type aliveMessage struct {
+	Time int64
 }
 
 type resizeMessage struct {
@@ -158,7 +192,7 @@ func sendCommand(stream net.Conn, command string) error {
 	buffer[0] = uint8(len(command))
 	copy(buffer[1:], []byte(command))
 	if err := writeAll(stream, buffer); err != nil {
-		return fmt.Errorf("send command write buffer failed: %v", err)
+		return fmt.Errorf("send command write buffer failed: %w", err)
 	}
 	return nil
 }
@@ -166,11 +200,11 @@ func sendCommand(stream net.Conn, command string) error {
 func recvCommand(stream net.Conn) (string, error) {
 	length := make([]byte, 1)
 	if _, err := stream.Read(length); err != nil {
-		return "", fmt.Errorf("recv command read length failed: %v", err)
+		return "", fmt.Errorf("recv command read length failed: %w", err)
 	}
 	command := make([]byte, length[0])
 	if _, err := io.ReadFull(stream, command); err != nil {
-		return "", fmt.Errorf("recv command read buffer failed: %v", err)
+		return "", fmt.Errorf("recv command read buffer failed: %w", err)
 	}
 	return string(command), nil
 }
@@ -178,13 +212,13 @@ func recvCommand(stream net.Conn) (string, error) {
 func sendMessage(stream net.Conn, msg any) error {
 	msgBuf, err := json.Marshal(msg)
 	if err != nil {
-		return fmt.Errorf("send message marshal failed: %v", err)
+		return fmt.Errorf("send message marshal failed: %w", err)
 	}
 	buffer := make([]byte, len(msgBuf)+4)
 	binary.BigEndian.PutUint32(buffer, uint32(len(msgBuf)))
 	copy(buffer[4:], msgBuf)
 	if err := writeAll(stream, buffer); err != nil {
-		return fmt.Errorf("send message write buffer failed: %v", err)
+		return fmt.Errorf("send message write buffer failed: %w", err)
 	}
 	return nil
 }
@@ -192,35 +226,41 @@ func sendMessage(stream net.Conn, msg any) error {
 func recvMessage(stream net.Conn, msg any) error {
 	lenBuf := make([]byte, 4)
 	if _, err := io.ReadFull(stream, lenBuf); err != nil {
-		return fmt.Errorf("recv message read length failed: %v", err)
+		return fmt.Errorf("recv message read length failed: %w", err)
 	}
 	msgBuf := make([]byte, binary.BigEndian.Uint32(lenBuf))
 	if _, err := io.ReadFull(stream, msgBuf); err != nil {
-		return fmt.Errorf("recv message read buffer failed: %v", err)
+		return fmt.Errorf("recv message read buffer failed: %w", err)
 	}
 	if err := json.Unmarshal(msgBuf, msg); err != nil {
-		return fmt.Errorf("recv message unmarshal failed: %v", err)
+		return fmt.Errorf("recv message unmarshal failed: %w", err)
 	}
 	return nil
 }
 
 func sendError(stream net.Conn, err error) {
-	if e := sendMessage(stream, errorMessage{err.Error()}); e != nil {
+	if e := sendMessage(stream, errorMessage{Msg: err.Error()}); e != nil {
 		trySendErrorMessage("send error [%v] failed: %v", err, e)
 	}
 }
 
+func sendErrorCode(stream net.Conn, code ErrCode, msg string) {
+	if e := sendMessage(stream, errorMessage{code, msg}); e != nil {
+		trySendErrorMessage("send error [%d][%v] failed: %v", code, msg, e)
+	}
+}
+
 func sendSuccess(stream net.Conn) error {
-	return sendMessage(stream, errorMessage{kNoErrorMsg})
+	return sendMessage(stream, errorMessage{Msg: kNoErrorMsg})
 }
 
 func recvError(stream net.Conn) error {
 	var errMsg errorMessage
 	if err := recvMessage(stream, &errMsg); err != nil {
-		return fmt.Errorf("recv error failed: %v", err)
+		return fmt.Errorf("recv error failed: %w", err)
 	}
 	if errMsg.Msg != kNoErrorMsg {
-		return fmt.Errorf("%s", errMsg.Msg)
+		return &Error{errMsg.Code, errMsg.Msg}
 	}
 	return nil
 }
@@ -237,7 +277,7 @@ func sendUDPv1Packet(stream net.Conn, port uint16, data []byte) error {
 	binary.BigEndian.PutUint16(buffer[2:], uint16(len(data)))
 	copy(buffer[4:], data)
 	if err := writeAll(stream, buffer); err != nil {
-		return fmt.Errorf("send UDPv1 packet write buffer failed: %v", err)
+		return fmt.Errorf("send UDPv1 packet write buffer failed: %w", err)
 	}
 	return nil
 }
@@ -245,11 +285,11 @@ func sendUDPv1Packet(stream net.Conn, port uint16, data []byte) error {
 func recvUDPv1Packet(stream net.Conn) (uint16, []byte, error) {
 	portBuf := make([]byte, 2)
 	if _, err := io.ReadFull(stream, portBuf); err != nil {
-		return 0, nil, fmt.Errorf("recv UDPv1 packet read port failed: %v", err)
+		return 0, nil, fmt.Errorf("recv UDPv1 packet read port failed: %w", err)
 	}
 	lenBuf := make([]byte, 2)
 	if _, err := io.ReadFull(stream, lenBuf); err != nil {
-		return 0, nil, fmt.Errorf("recv UDPv1 packet read length failed: %v", err)
+		return 0, nil, fmt.Errorf("recv UDPv1 packet read length failed: %w", err)
 	}
 	dataLen := binary.BigEndian.Uint16(lenBuf)
 	if dataLen == 0 {
@@ -257,7 +297,7 @@ func recvUDPv1Packet(stream net.Conn) (uint16, []byte, error) {
 	}
 	dataBuf := make([]byte, dataLen)
 	if _, err := io.ReadFull(stream, dataBuf); err != nil {
-		return 0, nil, fmt.Errorf("recv UDPv1 packet read buffer failed: %v", err)
+		return 0, nil, fmt.Errorf("recv UDPv1 packet read buffer failed: %w", err)
 	}
 	return binary.BigEndian.Uint16(portBuf), dataBuf, nil
 }
@@ -273,7 +313,7 @@ func (c *kcpClient) closeClient() error {
 func (c *kcpClient) newStream(connectTimeout time.Duration) (net.Conn, error) {
 	stream, err := c.session.OpenStream()
 	if err != nil {
-		return nil, fmt.Errorf("kcp smux open stream failed: %v", err)
+		return nil, fmt.Errorf("kcp smux open stream failed: %w", err)
 	}
 	return stream, nil
 }
@@ -291,7 +331,7 @@ func (c *quicClient) newStream(connectTimeout time.Duration) (net.Conn, error) {
 	defer cancel()
 	stream, err := c.conn.OpenStreamSync(ctx)
 	if err != nil {
-		return nil, fmt.Errorf("quic open stream sync failed: %v", err)
+		return nil, fmt.Errorf("quic open stream sync failed: %w", err)
 	}
 	return &quicStream{stream, c.conn}, err
 }
@@ -312,27 +352,27 @@ func newUdpClient(addr string, info *ServerInfo, connectTimeout time.Duration) (
 func newKcpClient(addr string, info *ServerInfo) (udpClient, error) {
 	pass, err := hex.DecodeString(info.Pass)
 	if err != nil {
-		return nil, fmt.Errorf("decode pass [%s] failed: %v", info.Pass, err)
+		return nil, fmt.Errorf("decode pass [%s] failed: %w", info.Pass, err)
 	}
 	salt, err := hex.DecodeString(info.Salt)
 	if err != nil {
-		return nil, fmt.Errorf("decode salt [%s] failed: %v", info.Pass, err)
+		return nil, fmt.Errorf("decode salt [%s] failed: %w", info.Pass, err)
 	}
 	key := pbkdf2.Key(pass, salt, 4096, 32, sha1.New)
 	block, err := kcp.NewAESBlockCrypt(key)
 	if err != nil {
-		return nil, fmt.Errorf("new aes block crypt failed: %v", err)
+		return nil, fmt.Errorf("new aes block crypt failed: %w", err)
 	}
 	conn, err := kcp.DialWithOptions(addr, block, 1, 1)
 	if err != nil {
-		return nil, fmt.Errorf("kcp dial [%s] failed: %v", addr, err)
+		return nil, fmt.Errorf("kcp dial [%s] failed: %w", addr, err)
 	}
 	conn.SetWindowSize(1024, 1024)
 	conn.SetNoDelay(1, 10, 2, 1)
 	conn.SetWriteDelay(false)
 	session, err := smux.Client(conn, &smuxConfig)
 	if err != nil {
-		return nil, fmt.Errorf("kcp smux client failed: %v", err)
+		return nil, fmt.Errorf("kcp smux client failed: %w", err)
 	}
 	return &kcpClient{session}, nil
 }
@@ -340,20 +380,20 @@ func newKcpClient(addr string, info *ServerInfo) (udpClient, error) {
 func newQuicClient(addr string, info *ServerInfo, connectTimeout time.Duration) (udpClient, error) {
 	serverCert, err := hex.DecodeString(info.ServerCert)
 	if err != nil {
-		return nil, fmt.Errorf("decode server cert [%s] failed: %v", info.ServerCert, err)
+		return nil, fmt.Errorf("decode server cert [%s] failed: %w", info.ServerCert, err)
 	}
 	clientCert, err := hex.DecodeString(info.ClientCert)
 	if err != nil {
-		return nil, fmt.Errorf("decode client cert [%s] failed: %v", info.ClientCert, err)
+		return nil, fmt.Errorf("decode client cert [%s] failed: %w", info.ClientCert, err)
 	}
 	clientKey, err := hex.DecodeString(info.ClientKey)
 	if err != nil {
-		return nil, fmt.Errorf("decode client key [%s] failed: %v", info.ClientKey, err)
+		return nil, fmt.Errorf("decode client key [%s] failed: %w", info.ClientKey, err)
 	}
 
 	clientTlsCert, err := tls.X509KeyPair(clientCert, clientKey)
 	if err != nil {
-		return nil, fmt.Errorf("x509 key pair failed: %v", err)
+		return nil, fmt.Errorf("x509 key pair failed: %w", err)
 	}
 	serverCertPool := x509.NewCertPool()
 	serverCertPool.AppendCertsFromPEM(serverCert)
@@ -366,7 +406,7 @@ func newQuicClient(addr string, info *ServerInfo, connectTimeout time.Duration) 
 	defer cancel()
 	conn, err := quic.DialAddr(ctx, addr, tlsConfig, &quicConfig)
 	if err != nil {
-		return nil, fmt.Errorf("quic dail [%s] failed: %v", addr, err)
+		return nil, fmt.Errorf("quic dail [%s] failed: %w", addr, err)
 	}
 	return &quicClient{conn}, nil
 }

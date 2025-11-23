@@ -79,3 +79,7 @@ func getSysProcAttr() *syscall.SysProcAttr {
 		CreationFlags: windows.CREATE_BREAKAWAY_FROM_JOB | windows.DETACHED_PROCESS,
 	}
 }
+
+func splitCommandLine(command string) ([]string, error) {
+	return windows.DecomposeCommandLine(command)
+}

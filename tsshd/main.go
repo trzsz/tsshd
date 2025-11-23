@@ -168,6 +168,10 @@ func TsshdMain() int {
 	// handle exit signals
 	handleExitSignals()
 
+	// init sshd_config
+	initSshdConfig()
+
+	// init tsshd server
 	kcpListener, quicListener, err := initServer(args)
 	if err != nil {
 		fmt.Println(err)
