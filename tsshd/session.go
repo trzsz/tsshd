@@ -203,6 +203,7 @@ func (c *sessionContext) SetSize(cols, rows int, redraw bool) error {
 	}
 	if redraw {
 		_ = c.pty.Resize(cols+1, rows)
+		time.Sleep(10 * time.Millisecond)
 	}
 	if err := c.pty.Resize(cols, rows); err != nil {
 		return fmt.Errorf("pty set size failed: %v", err)
