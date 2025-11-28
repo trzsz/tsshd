@@ -66,10 +66,11 @@ nfpms:
     homepage: https://trzsz.github.io/
     maintainer: Lonny Wong <lonnywong@qq.com>
     description: |-
-      The `tssh --udp` works like `mosh`, and the `tsshd` works like `mosh-server`.
+      tsshd is the trzsz-ssh(tssh) server that supports connection migration for roaming.
     license: MIT
     formats:
       - rpm
+      - deb
     bindir: /usr/bin
     rpm:
       group: Unspecified

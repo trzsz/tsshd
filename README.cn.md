@@ -192,6 +192,19 @@ Host xxx
 
   </details>
 
+- Windows 可用 scoop 安装
+
+  <details><summary><code>scoop install tsshd</code></summary>
+
+  ```sh
+  scoop bucket add extras
+  scoop install tsshd
+  ```
+
+  需要允许 `C:\Users\<user>\scoop\apps\tsshd\<version>\tsshd.exe` 通过防火墙，才能正常使用。
+
+  </details>
+
 - 用 Go 直接安装（ 要求 go 1.25 以上 ）
 
   <details><summary><code>go install github.com/trzsz/tsshd/cmd/tsshd@latest</code></summary>
@@ -217,7 +230,25 @@ Host xxx
 
   </details>
 
-- 可从 [GitHub Releases](https://github.com/trzsz/tsshd/releases) 中下载，国内可从 [Gitee 发行版](https://gitee.com/trzsz/tsshd/releases) 中下载，解压并加到 `PATH` 环境变量中。
+- 可从 [GitHub Releases](https://github.com/trzsz/tsshd/releases) 中下载，国内可从 [Gitee 发行版](https://gitee.com/trzsz/tsshd/releases) 中下载，然后本地安装。
+
+  <details><summary><code>下载并本地安装</code></summary>
+
+  ```sh
+  sudo apt install /tmp/tsshd_*.deb
+
+  sudo dpkg -i /tmp/tsshd_*.deb
+
+  sudo dnf install /tmp/tsshd_*.rpm
+
+  sudo yum install /tmp/tsshd_*.rpm
+
+  sudo rpm -i /tmp/tsshd_*.rpm
+
+  tar zxvf tsshd_*.tar.gz && sudo cp tsshd_*/tsshd /usr/bin/
+  ```
+
+  </details>
 
 ## 联系方式
 

@@ -193,6 +193,19 @@ Host xxx
 
   </details>
 
+- Install with scoop on Windows
+
+  <details><summary><code>scoop install tsshd</code></summary>
+
+  ```sh
+  scoop bucket add extras
+  scoop install tsshd
+  ```
+
+  Need to allow `C:\Users\<user>\scoop\apps\tsshd\<version>\tsshd.exe` through the firewall for it to work properly.
+
+  </details>
+
 - Install with Go ( Requires go 1.25 or later )
 
   <details><summary><code>go install github.com/trzsz/tsshd/cmd/tsshd@latest</code></summary>
@@ -218,7 +231,25 @@ Host xxx
 
   </details>
 
-- Download from the [GitHub Releases](https://github.com/trzsz/tsshd/releases), unzip and add to `PATH` environment.
+- Download from the [GitHub Releases](https://github.com/trzsz/tsshd/releases) and install locally
+
+  <details><summary><code>download and install locally</code></summary>
+
+  ```sh
+  sudo apt install /tmp/tsshd_*.deb
+
+  sudo dpkg -i /tmp/tsshd_*.deb
+
+  sudo dnf install /tmp/tsshd_*.rpm
+
+  sudo yum install /tmp/tsshd_*.rpm
+
+  sudo rpm -i /tmp/tsshd_*.rpm
+
+  tar zxvf tsshd_*.tar.gz && sudo cp tsshd_*/tsshd /usr/bin/
+  ```
+
+  </details>
 
 ### Contact
 
