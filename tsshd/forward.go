@@ -86,7 +86,7 @@ func handleDialEvent(stream net.Conn) {
 	defer func() { _ = conn.Close() }()
 
 	if err := sendSuccess(stream); err != nil { // ack ok
-		trySendErrorMessage("dial ack ok failed: %v", err)
+		warning("dial ack ok failed: %v", err)
 		return
 	}
 
@@ -132,7 +132,7 @@ func handleListenEvent(stream net.Conn) {
 	defer func() { _ = listener.Close() }()
 
 	if err := sendSuccess(stream); err != nil { // ack ok
-		trySendErrorMessage("listen ack ok failed: %v", err)
+		warning("listen ack ok failed: %v", err)
 		return
 	}
 
@@ -142,7 +142,7 @@ func handleListenEvent(stream net.Conn) {
 			break
 		}
 		if err != nil {
-			trySendErrorMessage("listener %s [%s] accept failed: %v", msg.Network, msg.Addr, err)
+			warning("listener %s [%s] accept failed: %v", msg.Network, msg.Addr, err)
 			continue
 		}
 		id := addAcceptConn(conn)
@@ -150,7 +150,7 @@ func handleListenEvent(stream net.Conn) {
 			if conn := getAcceptConn(id); conn != nil {
 				_ = conn.Close()
 			}
-			trySendErrorMessage("send accept message failed: %v", err)
+			warning("send accept message failed: %v", err)
 			return
 		}
 	}
@@ -172,7 +172,7 @@ func handleAcceptEvent(stream net.Conn) {
 	defer func() { _ = conn.Close() }()
 
 	if err := sendSuccess(stream); err != nil { // ack ok
-		trySendErrorMessage("accept ack ok failed: %v", err)
+		warning("accept ack ok failed: %v", err)
 		return
 	}
 
@@ -242,7 +242,7 @@ func handleUDPv1Event(stream net.Conn) {
 	_ = testConn.Close()
 
 	if err := sendSuccess(stream); err != nil { // ack ok
-		trySendErrorMessage("UDPv1 ack ok failed: %v", err)
+		warning("UDPv1 ack ok failed: %v", err)
 		return
 	}
 
@@ -276,14 +276,14 @@ func (m *udpv1ConnManager) frontendToBackend() {
 	for {
 		port, data, err := recvUDPv1Packet(m.stream)
 		if err != nil {
-			trySendErrorMessage("UDPv1 forward recv packet failed: %v", err)
+			warning("UDPv1 forward recv packet failed: %v", err)
 			return
 		}
 		now := time.Now()
 		m.aliveTime.Store(&now)
 		conn, err := m.getUdpConn(port)
 		if err != nil {
-			trySendErrorMessage("UDPv1 forward get udp conn failed: %v", err)
+			warning("UDPv1 forward get udp conn failed: %v", err)
 			continue
 		}
 		_, _ = conn.Write(data)
@@ -305,7 +305,7 @@ func (m *udpv1ConnManager) backendToFrontend(entry *udpv1ConnEntry) {
 			now := time.Now()
 			entry.aliveTime.Store(&now)
 			if err := sendUDPv1Packet(m.stream, entry.udpPort, buffer[:n]); err != nil {
-				trySendErrorMessage("UDPv1 forward send back to [%d] failed: %v", entry.udpPort, err)
+				warning("UDPv1 forward send back to [%d] failed: %v", entry.udpPort, err)
 			}
 		}
 	}

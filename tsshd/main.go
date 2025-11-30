@@ -29,10 +29,8 @@ import (
 	"io"
 	"os"
 	"os/exec"
-	"os/signal"
 	"strconv"
 	"strings"
-	"syscall"
 	"time"
 )
 
@@ -47,6 +45,7 @@ type tsshdArgs struct {
 	IPv4           bool
 	IPv6           bool
 	Proxy          bool
+	Debug          bool
 	Port           string
 	ConnectTimeout time.Duration
 }
@@ -56,7 +55,7 @@ func printVersion() {
 }
 
 func printHelp() {
-	fmt.Printf("usage: tsshd [-h] [-v] [--kcp] [--ipv4] [--ipv6] [--proxy] [--port low-high] [--connect-timeout t]\n\n" +
+	fmt.Printf("usage: tsshd [-h] [-v] [--kcp] [--ipv4] [--ipv6] [--proxy] [--debug] [--port low-high] [--connect-timeout t]\n\n" +
 		"tsshd: trzsz-ssh(tssh) server that supports connection migration for roaming.\n\n" +
 		"optional arguments:\n" +
 		"  -h, --help             show this help message and exit\n" +
@@ -65,6 +64,7 @@ func printHelp() {
 		"  --ipv4                 UDP only listens on IPv4, ignoring IPv6\n" +
 		"  --ipv6                 UDP only listens on IPv6, ignoring IPv4\n" +
 		"  --proxy                With UDP proxy for connection migration\n" +
+		"  --debug                Send debugging messages to the client\n" +
 		"  --port low-high        UDP port range that the tsshd listens on\n" +
 		"  --connect-timeout t    The timeout for tssh connecting to tsshd\n")
 }
@@ -87,6 +87,8 @@ func parseTsshdArgs() *tsshdArgs {
 			args.IPv6 = true
 		case "--proxy":
 			args.Proxy = true
+		case "--debug":
+			args.Debug = true
 		case "--port":
 			if i+1 < len(os.Args) && !strings.HasPrefix(os.Args[i+1], "-") {
 				args.Port = os.Args[i+1]
@@ -165,11 +167,22 @@ func TsshdMain() int {
 		args.ConnectTimeout = kDefaultConnectTimeout
 	}
 
+	// debug verbose mode
+	if args.Debug {
+		enableDebugLogging = true
+	}
+
 	// handle exit signals
 	handleExitSignals()
 
 	// init sshd_config
 	initSshdConfig()
+
+	// init log level
+	enableWarningLogging = true
+	if v := strings.ToLower(getSshdConfig("LogLevel")); v == "quiet" || v == "fatal" {
+		enableWarningLogging = false
+	}
 
 	// init tsshd server
 	kcpListener, quicListener, err := initServer(args)
@@ -199,19 +212,4 @@ func TsshdMain() int {
 	}()
 
 	return <-exitChan
-}
-
-func handleExitSignals() {
-	sigChan := make(chan os.Signal, 1)
-	signal.Notify(sigChan,
-		syscall.SIGTERM, // Default signal for the kill command
-		syscall.SIGINT,  // Ctrl+C signal
-		syscall.SIGHUP,  // Terminal closed (System reboot/shutdown)
-	)
-
-	go func() {
-		<-sigChan
-		trySendErrorMessage("tsshd has been terminated")
-		closeAllSessions()
-	}()
 }

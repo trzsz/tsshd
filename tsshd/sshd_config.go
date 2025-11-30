@@ -284,10 +284,8 @@ func matchList(value string, patterns []string) bool {
 			}
 			hasPositive = true
 			positiveMatch = true
-		} else {
-			if !neg {
-				hasPositive = true
-			}
+		} else if !neg {
+			hasPositive = true
 		}
 	}
 

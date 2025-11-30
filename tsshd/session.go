@@ -78,6 +78,7 @@ func (c *sessionContext) StartPty() error {
 	c.stdin = c.pty.stdin
 	c.stdout = c.pty.stdout
 	c.started = true
+	debug("session [%d] start pty success", c.id)
 	return nil
 }
 
@@ -96,6 +97,7 @@ func (c *sessionContext) StartCmd() error {
 		return fmt.Errorf("start cmd %v failed: %v", c.cmd.Args, err)
 	}
 	c.started = true
+	debug("session [%d] start cmd success", c.id)
 	return nil
 }
 
@@ -135,6 +137,7 @@ func (c *sessionContext) forwardIO(stream net.Conn) {
 		go func() {
 			_, _ = io.Copy(c.stdin, stream)
 			_ = c.stdin.Close()
+			debug("session [%d] stdin completed", c.id)
 		}()
 	}
 
@@ -142,6 +145,7 @@ func (c *sessionContext) forwardIO(stream net.Conn) {
 		c.wg.Go(func() {
 			_, _ = io.Copy(stream, c.stdout)
 			_ = stream.Close()
+			debug("session [%d] stdout completed", c.id)
 		})
 	}
 
@@ -153,43 +157,60 @@ func (c *sessionContext) forwardIO(stream net.Conn) {
 			} else {
 				_, _ = io.Copy(io.Discard, c.stderr)
 			}
+			debug("session [%d] stderr completed", c.id)
 		})
+	} else if stderr := getStderrStream(c.id); stderr != nil {
+		stderr.Close()
+		debug("session [%d] stderr closed", c.id)
 	}
 }
 
 func (c *sessionContext) Wait() {
-	c.wg.Wait()
+	// windows pty only close the stdout in pty.Wait
+	if runtime.GOOS == "windows" && c.pty != nil {
+		_ = c.pty.Wait()
+		c.wg.Wait()
+		debug("session [%d] wait completed", c.id)
+		return
+	}
+
+	c.wg.Wait() // wait for the output done first to prevent cmd.Wait close output too early
 	if c.pty != nil {
 		_ = c.pty.Wait()
 	} else {
 		_ = c.cmd.Wait()
 	}
+	debug("session [%d] wait completed", c.id)
 }
 
 func (c *sessionContext) Close() {
 	if !c.closed.CompareAndSwap(false, true) {
 		return
 	}
+
+	var code int
+	if c.pty != nil {
+		code = c.pty.GetExitCode()
+	} else {
+		code = c.cmd.ProcessState.ExitCode()
+	}
+	debug("session [%d] exiting with code: %d", c.id, code)
+
 	if err := sendBusMessage("exit", exitMessage{
 		ID:       c.id,
-		ExitCode: c.cmd.ProcessState.ExitCode(),
+		ExitCode: code,
 	}); err != nil {
-		trySendErrorMessage("send exit message failed: %v", err)
+		warning("send exit message failed: %v", err)
 	}
-	if c.stdin != nil {
-		_ = c.stdin.Close()
-	}
-	if c.stdout != nil {
-		_ = c.stdout.Close()
-	}
-	if c.stderr != nil {
-		_ = c.stderr.Close()
-	}
+	debug("session [%d] exit completed", c.id)
+
 	if c.started {
 		if c.pty != nil {
 			_ = c.pty.Close()
+			debug("session [%d] pty closed", c.id)
 		} else {
 			_ = c.cmd.Process.Kill()
+			debug("session [%d] cmd killed", c.id)
 		}
 	}
 }
@@ -203,7 +224,10 @@ func (c *sessionContext) SetSize(cols, rows int, redraw bool) error {
 	}
 	if redraw {
 		_ = c.pty.Resize(cols+1, rows)
-		time.Sleep(10 * time.Millisecond)
+		time.Sleep(10 * time.Millisecond) // fix redraw issue in `screen`
+		debug("session [%d] redraw: %d, %d", c.id, cols, rows)
+	} else {
+		debug("session [%d] resize: %d, %d", c.id, cols, rows)
 	}
 	if err := c.pty.Resize(cols, rows); err != nil {
 		return fmt.Errorf("pty set size failed: %v", err)
@@ -221,10 +245,6 @@ func handleSessionEvent(stream net.Conn) {
 	handleX11Request(&msg)
 
 	handleAgentRequest(&msg)
-
-	if errStream := getStderrStream(msg.ID); errStream != nil {
-		defer errStream.Close()
-	}
 
 	ctx, err := newSessionContext(&msg)
 	if err != nil {
@@ -244,7 +264,7 @@ func handleSessionEvent(stream net.Conn) {
 	}
 
 	if err := sendSuccess(stream); err != nil { // ack ok
-		trySendErrorMessage("session ack ok failed: %v", err)
+		warning("session ack ok failed: %v", err)
 		return
 	}
 
@@ -411,7 +431,7 @@ func handleStderrEvent(stream net.Conn) {
 	}
 
 	if err := sendSuccess(stream); err != nil { // ack ok
-		trySendErrorMessage("stderr ack ok failed: %v", err)
+		warning("stderr ack ok failed: %v", err)
 		return
 	}
 
@@ -440,11 +460,11 @@ func handleX11Request(msg *startMessage) {
 	}
 
 	if v := strings.ToLower(getSshdConfig("X11Forwarding")); v != "yes" {
-		trySendErrorMessage("X11Forwarding is not permitted on the server. Check [X11Forwarding] in [%s] on the server.", sshdConfigPath)
+		warning("X11Forwarding is not permitted on the server. Check [X11Forwarding] in [%s] on the server.", sshdConfigPath)
 		return
 	}
 	if v := strings.ToLower(getSshdConfig("DisableForwarding")); v == "yes" {
-		trySendErrorMessage("X11Forwarding is not permitted on the server. Check [DisableForwarding] in [%s] on the server.", sshdConfigPath)
+		warning("X11Forwarding is not permitted on the server. Check [DisableForwarding] in [%s] on the server.", sshdConfigPath)
 		return
 	}
 
@@ -457,7 +477,7 @@ func handleX11Request(msg *startMessage) {
 
 	listener, port, err := listenTcpOnFreePort("localhost", 6000+displayOffset, min(6000+displayOffset+1000, 65535))
 	if err != nil {
-		trySendErrorMessage("X11 forwarding listen failed: %v", err)
+		warning("X11 forwarding listen failed: %v", err)
 		return
 	}
 	onExitFuncs = append(onExitFuncs, func() {
@@ -519,17 +539,17 @@ func handleAgentRequest(msg *startMessage) {
 	}
 
 	if v := strings.ToLower(getSshdConfig("AllowAgentForwarding")); v == "no" {
-		trySendErrorMessage("AgentForwarding is not permitted on the server. Check [AllowAgentForwarding] in [%s] on the server.", sshdConfigPath)
+		warning("AgentForwarding is not permitted on the server. Check [AllowAgentForwarding] in [%s] on the server.", sshdConfigPath)
 		return
 	}
 	if v := strings.ToLower(getSshdConfig("DisableForwarding")); v == "yes" {
-		trySendErrorMessage("AgentForwarding is not permitted on the server. Check [DisableForwarding] in [%s] on the server.", sshdConfigPath)
+		warning("AgentForwarding is not permitted on the server. Check [DisableForwarding] in [%s] on the server.", sshdConfigPath)
 		return
 	}
 
 	tempDir, err := os.MkdirTemp("", "tsshd-")
 	if err != nil {
-		trySendErrorMessage("agent forwarding mkdir temp failed: %v", err)
+		warning("agent forwarding mkdir temp failed: %v", err)
 		return
 	}
 	onExitFuncs = append(onExitFuncs, func() {
@@ -538,11 +558,11 @@ func handleAgentRequest(msg *startMessage) {
 	agentPath := filepath.Join(tempDir, fmt.Sprintf("agent.%d", os.Getpid()))
 	listener, err := net.Listen("unix", agentPath)
 	if err != nil {
-		trySendErrorMessage("agent forwarding listen on [%s] failed: %v", agentPath, err)
+		warning("agent forwarding listen on [%s] failed: %v", agentPath, err)
 		return
 	}
 	if err := os.Chmod(agentPath, 0600); err != nil {
-		trySendErrorMessage("agent forwarding chmod [%s] failed: %v", agentPath, err)
+		warning("agent forwarding chmod [%s] failed: %v", agentPath, err)
 	}
 	onExitFuncs = append(onExitFuncs, func() {
 		_ = listener.Close()
@@ -556,13 +576,13 @@ func handleChannelAccept(listener net.Listener, channelType string) {
 	for {
 		conn, err := listener.Accept()
 		if err != nil {
-			trySendErrorMessage("channel accept failed: %v", err)
+			warning("channel accept failed: %v", err)
 			break
 		}
 		go func(conn net.Conn) {
 			id := addAcceptConn(conn)
 			if err := sendBusMessage("channel", &channelMessage{ChannelType: channelType, ID: id}); err != nil {
-				trySendErrorMessage("send channel message failed: %v", err)
+				warning("send channel message failed: %v", err)
 			}
 		}(conn)
 	}
@@ -576,6 +596,7 @@ func closeAllSessions() {
 	}
 	sessionMutex.Unlock()
 
+	debug("closing all the sessions")
 	for _, session := range sessions {
 		session.Close()
 	}

@@ -46,12 +46,15 @@ import (
 
 const kNoErrorMsg = "_TSSHD_NO_ERROR_"
 
+// ErrCode is an enumeration for tsshd public errors
 type ErrCode int
 
 const (
+	// ErrProhibited is an error indicating administratively prohibited
 	ErrProhibited ErrCode = iota + 101
 )
 
+// String converts the error code to human readable form
 func (c ErrCode) String() string {
 	switch c {
 	case ErrProhibited:
@@ -61,11 +64,13 @@ func (c ErrCode) String() string {
 	}
 }
 
+// Error is an tsshd error
 type Error struct {
 	Code ErrCode
 	Msg  string
 }
 
+// Error converts the tsshd error to human readable form
 func (e *Error) Error() string {
 	if e.Code == 0 {
 		return e.Msg
@@ -73,6 +78,7 @@ func (e *Error) Error() string {
 	return fmt.Sprintf("%s: %s", e.Code.String(), e.Msg)
 }
 
+// ServerInfo includes all information used for client login
 type ServerInfo struct {
 	Ver        string
 	Port       int
@@ -90,6 +96,10 @@ type ServerInfo struct {
 type errorMessage struct {
 	Code ErrCode
 	Msg  string
+}
+
+type debugMessage struct {
+	Msg string
 }
 
 type busMessage struct {
@@ -126,6 +136,10 @@ type startMessage struct {
 type exitMessage struct {
 	ID       uint64
 	ExitCode int
+}
+
+type quitMessage struct {
+	Msg string
 }
 
 type aliveMessage struct {
@@ -240,13 +254,13 @@ func recvMessage(stream net.Conn, msg any) error {
 
 func sendError(stream net.Conn, err error) {
 	if e := sendMessage(stream, errorMessage{Msg: err.Error()}); e != nil {
-		trySendErrorMessage("send error [%v] failed: %v", err, e)
+		warning("send error [%v] failed: %v", err, e)
 	}
 }
 
 func sendErrorCode(stream net.Conn, code ErrCode, msg string) {
 	if e := sendMessage(stream, errorMessage{code, msg}); e != nil {
-		trySendErrorMessage("send error [%d][%v] failed: %v", code, msg, e)
+		warning("send error [%d][%v] failed: %v", code, msg, e)
 	}
 }
 

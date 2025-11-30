@@ -59,7 +59,7 @@ func serveKCP(listener *kcp.Listener) {
 	for {
 		conn, err := listener.AcceptKCP()
 		if err != nil {
-			trySendErrorMessage("kcp accept failed: %v", err)
+			warning("kcp accept failed: %v", err)
 			return
 		}
 		go handleKcpConn(conn)
@@ -79,14 +79,14 @@ func handleKcpConn(conn *kcp.UDPSession) {
 
 	session, err := smux.Server(conn, &smuxConfig)
 	if err != nil {
-		trySendErrorMessage("kcp smux server failed: %v", err)
+		warning("kcp smux server failed: %v", err)
 		return
 	}
 
 	for {
 		stream, err := session.AcceptStream()
 		if err != nil {
-			trySendErrorMessage("kcp smux accept stream failed: %v", err)
+			warning("kcp smux accept stream failed: %v", err)
 			return
 		}
 		go handleStream(stream)
@@ -97,7 +97,7 @@ func serveQUIC(listener *quic.Listener) {
 	for {
 		conn, err := listener.Accept(context.Background())
 		if err != nil {
-			trySendErrorMessage("quic accept conn failed: %v", err)
+			warning("quic accept conn failed: %v", err)
 			return
 		}
 		go handleQuicConn(conn)
@@ -116,7 +116,7 @@ func handleQuicConn(conn *quic.Conn) {
 	for {
 		stream, err := conn.AcceptStream(context.Background())
 		if err != nil {
-			trySendErrorMessage("quic accept stream failed: %v", err)
+			warning("quic accept stream failed: %v", err)
 			return
 		}
 		go handleStream(&quicStream{stream, conn})
@@ -155,7 +155,7 @@ func handleStream(stream net.Conn) {
 	}
 
 	if err := sendSuccess(stream); err != nil { // say hello
-		trySendErrorMessage("tsshd say hello failed: %v", err)
+		warning("tsshd say hello failed: %v", err)
 		return
 	}
 

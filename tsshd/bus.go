@@ -27,8 +27,11 @@ package tsshd
 import (
 	"fmt"
 	"net"
+	"os"
+	"os/signal"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 )
 
@@ -63,13 +66,6 @@ func sendBusMessage(command string, msg any) error {
 	return sendMessage(*stream, msg)
 }
 
-func trySendErrorMessage(format string, a ...any) {
-	_, _ = doWithTimeout(func() (int, error) {
-		_ = sendBusMessage("error", errorMessage{Msg: fmt.Sprintf(format, a...)})
-		return 0, nil
-	}, 1*time.Second)
-}
-
 func handleBusEvent(stream net.Conn) {
 	var msg busMessage
 	if err := recvMessage(stream, &msg); err != nil {
@@ -88,7 +84,7 @@ func handleBusEvent(stream net.Conn) {
 
 	if err := sendSuccess(stream); err != nil { // ack ok
 		busMutex.Unlock()
-		trySendErrorMessage("bus ack ok failed: %v", err)
+		warning("bus ack ok failed: %v", err)
 		return
 	}
 
@@ -106,7 +102,7 @@ func handleBusEvent(stream net.Conn) {
 	for {
 		command, err := recvCommand(stream)
 		if err != nil {
-			trySendErrorMessage("recv bus command failed: %v", err)
+			warning("recv bus command failed: %v", err)
 			return
 		}
 
@@ -114,7 +110,12 @@ func handleBusEvent(stream net.Conn) {
 		case "resize":
 			err = handleResizeEvent(stream)
 		case "close":
-			exitChan <- 0
+			closeAllSessions()
+			debug("close and exit tsshd")
+			go func() {
+				time.Sleep(200 * time.Millisecond) // give udp some time
+				exitChan <- 0
+			}()
 			return
 		case "alive": // work as ping in new version
 			now := time.Now()
@@ -123,10 +124,12 @@ func handleBusEvent(stream net.Conn) {
 		case "alive2":
 			err = handleAliveEvent(stream)
 		default:
-			err = handleUnknownEvent(stream, command)
+			if err := handleUnknownEvent(stream, command); err != nil {
+				warning("handle bus command [%s] failed: %v. You may need to upgrade tsshd.", command, err)
+			}
 		}
 		if err != nil {
-			trySendErrorMessage("handle bus command [%s] failed: %v. You may need to upgrade tsshd.", command, err)
+			warning("handle bus command [%s] failed: %v", command, err)
 		}
 	}
 }
@@ -157,10 +160,28 @@ func keepAlive(totalTimeout time.Duration, intervalTimeout time.Duration) {
 	}
 	for {
 		if t := lastAliveTime.Load(); t != nil && time.Since(*t) > totalTimeout {
-			trySendErrorMessage("tsshd keep alive timeout")
+			warning("tsshd keep alive timeout")
 			exitChan <- 2
 			return
 		}
 		time.Sleep(intervalTimeout)
 	}
+}
+
+func handleExitSignals() {
+	sigChan := make(chan os.Signal, 1)
+	signal.Notify(sigChan,
+		syscall.SIGTERM, // Default signal for the kill command
+		syscall.SIGHUP,  // Terminal closed (System reboot/shutdown)
+		os.Interrupt,    // Ctrl+C signal
+	)
+	go func() {
+		sig := <-sigChan
+		_ = sendBusMessage("quit", quitMessage{fmt.Sprintf("receiving signal [%v] from the operating system", sig)})
+		go func() {
+			time.Sleep(1000 * time.Millisecond) // give udp some time
+			debug("quit by signal wait timeout")
+			exitChan <- 3
+		}()
+	}()
 }

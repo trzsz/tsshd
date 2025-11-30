@@ -29,30 +29,64 @@ import (
 	"io"
 	"os/exec"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"syscall"
 
 	"github.com/UserExistsError/conpty"
 	"golang.org/x/sys/windows"
 )
 
+type safeConPty struct {
+	*conpty.ConPty
+	closed atomic.Bool
+	mutex  sync.Mutex
+}
+
+func (p *safeConPty) Close() error {
+	p.mutex.Lock()
+	defer p.mutex.Unlock()
+	if !p.closed.CompareAndSwap(false, true) {
+		// crash if close multiple times
+		return nil
+	}
+	return p.ConPty.Close()
+}
+
+func (p *safeConPty) Resize(width, height int) error {
+	p.mutex.Lock()
+	defer p.mutex.Unlock()
+	if p.closed.Load() {
+		// crash if resize after close
+		return nil
+	}
+	return p.ConPty.Resize(width, height)
+}
+
 type tsshdPty struct {
-	cpty   *conpty.ConPty
+	spty   *safeConPty
 	stdin  io.WriteCloser
 	stdout io.ReadCloser
+	code   int
 }
 
 func (p *tsshdPty) Wait() error {
-	_, err := p.cpty.Wait(context.Background())
-	_ = p.stdout.Close()
+	code, err := p.spty.Wait(context.Background())
+	p.code = int(code)
+	_ = p.stdout.Close() // stdout needs to be closed so that the client knows there is no more data to read
 	return err
 }
 
 func (p *tsshdPty) Close() error {
-	return p.cpty.Close()
+	return p.spty.Close()
+}
+
+func (p *tsshdPty) GetExitCode() int {
+	return p.code
 }
 
 func (p *tsshdPty) Resize(cols, rows int) error {
-	return p.cpty.Resize(cols-1, rows)
+	return p.spty.Resize(cols-1, rows)
 }
 
 func newTsshdPty(cmd *exec.Cmd, cols, rows int) (*tsshdPty, error) {
@@ -67,7 +101,8 @@ func newTsshdPty(cmd *exec.Cmd, cols, rows int) (*tsshdPty, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &tsshdPty{cpty, cpty, cpty}, nil
+	spty := &safeConPty{ConPty: cpty}
+	return &tsshdPty{spty, spty, spty, -1}, nil
 }
 
 func getUserShell() (string, error) {

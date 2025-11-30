@@ -51,6 +51,10 @@ func (p *tsshdPty) Close() error {
 	return p.ptmx.Close()
 }
 
+func (p *tsshdPty) GetExitCode() int {
+	return p.cmd.ProcessState.ExitCode()
+}
+
 func (p *tsshdPty) Resize(cols, rows int) error {
 	return pty.Setsize(p.ptmx, &pty.Winsize{Cols: uint16(cols), Rows: uint16(rows)})
 }
