@@ -4,13 +4,13 @@ go 1.25
 
 require (
 	github.com/UserExistsError/conpty v0.1.4
-	github.com/alessio/shellescape v1.4.2
 	github.com/creack/pty v1.1.24
 	github.com/google/shlex v0.0.0-20191202100458-e7afc7fbc510
-	github.com/quic-go/quic-go v0.57.0
+	github.com/quic-go/quic-go v0.57.1
 	github.com/stretchr/testify v1.11.1
-	github.com/xtaci/kcp-go/v5 v5.6.40
-	github.com/xtaci/smux v1.5.43
+	github.com/trzsz/shellescape v1.6.0
+	github.com/xtaci/kcp-go/v5 v5.6.45
+	github.com/xtaci/smux v1.5.44
 	golang.org/x/crypto v0.45.0
 	golang.org/x/sys v0.38.0
 )
@@ -18,7 +18,7 @@ require (
 require (
 	github.com/davecgh/go-spew v1.1.1 // indirect
 	github.com/klauspost/cpuid/v2 v2.3.0 // indirect
-	github.com/klauspost/reedsolomon v1.12.5 // indirect
+	github.com/klauspost/reedsolomon v1.12.6 // indirect
 	github.com/kr/text v0.2.0 // indirect
 	github.com/pkg/errors v0.9.1 // indirect
 	github.com/pmezard/go-difflib v1.0.0 // indirect

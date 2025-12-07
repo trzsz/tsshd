@@ -154,6 +154,12 @@ func (p *serverProxy) frontendToBackend() {
 		if p.isAuthedConn(buf.conn) {
 			isAuthPacket, serialNumber := p.verifyAuthPacket(buf.data)
 			if !isAuthPacket { // auth success
+				if enableDebugLogging {
+					debug("new client address: %s", p.authedConn.clientAddr.String())
+				}
+				if p.clientConn.Load() != nil {
+					enablePendingInputDiscard() // discard pending user input from previous connections
+				}
 				p.clientConn.Store(p.authedConn)
 				p.authedConn = nil
 				_, _ = p.backendConn.Write(buf.data)
@@ -324,6 +330,8 @@ func (p *clientProxy) frontendToBackend() {
 		}
 		if conn := p.backendConn.Load(); conn != nil {
 			_, _ = conn.Write(buffer[:n])
+		} else {
+			time.Sleep(10 * time.Millisecond) // wait for reconnect
 		}
 	}
 }
@@ -339,6 +347,8 @@ func (p *clientProxy) backendToFrontend() {
 			if addr := p.clientAddr.Load(); addr != nil {
 				_, _ = p.frontendConn.WriteToUDP(buffer[:n], addr)
 			}
+		} else {
+			time.Sleep(10 * time.Millisecond) // wait for reconnect
 		}
 	}
 }
@@ -347,6 +357,11 @@ func (p *clientProxy) renewUdpPath(connectTimeout time.Duration) error {
 	p.renewMutex.Lock()
 	defer p.renewMutex.Unlock()
 	p.serialNumber++
+
+	if conn := p.backendConn.Load(); conn != nil {
+		_ = conn.Close()
+		p.backendConn.Store(nil)
+	}
 
 	newConn, err := net.DialUDP("udp", nil, p.serverAddr)
 	if err != nil {
@@ -383,9 +398,6 @@ func (p *clientProxy) renewUdpPath(connectTimeout time.Duration) error {
 			continue
 		}
 		if p.isAuthSuccessful(buffer[:n]) {
-			if conn := p.backendConn.Load(); conn != nil {
-				_ = conn.Close()
-			}
 			p.backendConn.Store(newConn)
 			return nil
 		}
@@ -423,9 +435,6 @@ func (p *clientProxy) isAuthSuccessful(buf []byte) bool {
 func (p *clientProxy) serveProxy() {
 	_ = p.frontendConn.SetReadBuffer(kProxyBufferSize)
 	_ = p.frontendConn.SetWriteBuffer(kProxyBufferSize)
-	for p.backendConn.Load() == nil {
-		time.Sleep(10 * time.Millisecond)
-	}
 	go p.frontendToBackend()
 	go p.backendToFrontend()
 }

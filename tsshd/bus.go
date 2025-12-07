@@ -123,6 +123,8 @@ func handleBusEvent(stream net.Conn) {
 			_ = sendBusCommand("alive")
 		case "alive2":
 			err = handleAliveEvent(stream)
+		case "setting":
+			err = handleSettingEvent(stream)
 		default:
 			if err := handleUnknownEvent(stream, command); err != nil {
 				warning("handle bus command [%s] failed: %v. You may need to upgrade tsshd.", command, err)
@@ -144,6 +146,17 @@ func handleAliveEvent(stream net.Conn) error {
 	}
 
 	return sendBusMessage("alive2", msg)
+}
+
+func handleSettingEvent(stream net.Conn) error {
+	var msg settingsMessage
+	if err := recvMessage(stream, &msg); err != nil {
+		return fmt.Errorf("recv settings message failed: %v", err)
+	}
+	if msg.KeepPendingInput != nil {
+		globalSetting.keepPendingInput.Store(*msg.KeepPendingInput)
+	}
+	return nil
 }
 
 func handleUnknownEvent(stream net.Conn, command string) error {

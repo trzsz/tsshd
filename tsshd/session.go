@@ -26,6 +26,7 @@ package tsshd
 
 import (
 	"bufio"
+	"bytes"
 	"fmt"
 	"io"
 	"net"
@@ -40,8 +41,46 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/alessio/shellescape"
+	"github.com/trzsz/shellescape"
 )
+
+var discardPendingInputFlag atomic.Bool
+var discardPendingInputMarker []byte
+var discardMarkerCurrentIndex uint32
+var discardMarkerIndexMutex sync.Mutex
+
+func enablePendingInputDiscard() {
+	if globalSetting.keepPendingInput.Load() {
+		return
+	}
+
+	idx := getNextDiscardMarkerIndex()
+	discardPendingInputMarker = []byte{0xFF, 0xC0, 0xC1, 0xFF,
+		byte(idx >> 24), byte(idx >> 16), byte(idx >> 8), byte(idx),
+	}
+	discardPendingInputFlag.Store(true)
+
+	go func() {
+		debug("discard marker: %X", discardPendingInputMarker)
+		_ = sendBusMessage("discard", discardMessage{DiscardMarker: discardPendingInputMarker})
+	}()
+}
+
+func getNextDiscardMarkerIndex() uint32 {
+	discardMarkerIndexMutex.Lock()
+	defer discardMarkerIndexMutex.Unlock()
+
+	discardMarkerCurrentIndex++
+	for i := 3; i >= 0; i-- {
+		shift := i * 8
+		b := (discardMarkerCurrentIndex >> shift) & 0xFF
+		if b == ';' || b == '\r' { // skip ; and \r for tmux
+			discardMarkerCurrentIndex = ((discardMarkerCurrentIndex >> shift) + 1) << shift
+			return discardMarkerCurrentIndex
+		}
+	}
+	return discardMarkerCurrentIndex
+}
 
 type sessionContext struct {
 	id      uint64
@@ -55,6 +94,9 @@ type sessionContext struct {
 	stderr  io.ReadCloser
 	started bool
 	closed  atomic.Bool
+
+	discardedBuffer []byte
+	inputDebugQuota atomic.Int32
 }
 
 type stderrStream struct {
@@ -132,10 +174,57 @@ func (c *sessionContext) showMotd(stream net.Conn) {
 	printMotd([]string{"/etc/motd"}) // always print traditional /etc/motd.
 }
 
+func (c *sessionContext) discardPendingInput(buf []byte) {
+	c.discardedBuffer = append(c.discardedBuffer, buf...)
+	pos := bytes.Index(c.discardedBuffer, discardPendingInputMarker)
+	if pos < 0 {
+		return
+	}
+
+	remainingBuffer := c.discardedBuffer[pos+len(discardPendingInputMarker):]
+	if len(remainingBuffer) > 0 {
+		_ = writeAll(c.stdin, remainingBuffer)
+	}
+
+	if pos > 0 {
+		if enableDebugLogging {
+			debug("discard input: %s", strconv.QuoteToASCII(string(c.discardedBuffer[:pos])))
+		}
+		_ = sendBusMessage("discard", discardMessage{DiscardedInput: c.discardedBuffer[:pos]})
+	} else if enableDebugLogging {
+		debug("no pending input to discard")
+	}
+	c.discardedBuffer = nil
+
+	if enableDebugLogging {
+		c.inputDebugQuota.Store(10)
+	}
+	discardPendingInputFlag.Store(false)
+	debug("new transport path is now active")
+}
+
 func (c *sessionContext) forwardIO(stream net.Conn) {
 	if c.stdin != nil {
 		go func() {
-			_, _ = io.Copy(c.stdin, stream)
+			buffer := make([]byte, 32*1024)
+			for {
+				n, err := stream.Read(buffer)
+				if n > 0 {
+					if discardPendingInputFlag.Load() {
+						c.discardPendingInput(buffer[:n])
+					} else {
+						if enableDebugLogging {
+							if quota := c.inputDebugQuota.Add(-1); quota >= 0 {
+								debug("forward input: %s", strconv.QuoteToASCII(string(buffer[:n])))
+							}
+						}
+						_ = writeAll(c.stdin, buffer[:n])
+					}
+				}
+				if err != nil {
+					break
+				}
+			}
 			_ = c.stdin.Close()
 			debug("session [%d] stdin completed", c.id)
 		}()
@@ -225,7 +314,6 @@ func (c *sessionContext) SetSize(cols, rows int, redraw bool) error {
 	if redraw {
 		_ = c.pty.Resize(cols+1, rows)
 		time.Sleep(10 * time.Millisecond) // fix redraw issue in `screen`
-		debug("session [%d] redraw: %d, %d", c.id, cols, rows)
 	} else {
 		debug("session [%d] resize: %d, %d", c.id, cols, rows)
 	}
@@ -494,6 +582,9 @@ func handleX11Request(msg *startMessage) {
 		}
 	}
 	go handleChannelAccept(listener, msg.X11.ChannelType)
+	if msg.Envs == nil {
+		msg.Envs = make(map[string]string)
+	}
 	msg.Envs["DISPLAY"] = fmt.Sprintf("localhost:%d.%d", displayNumber, msg.X11.ScreenNumber)
 }
 
@@ -569,6 +660,9 @@ func handleAgentRequest(msg *startMessage) {
 		_ = os.Remove(agentPath)
 	})
 	go handleChannelAccept(listener, msg.Agent.ChannelType)
+	if msg.Envs == nil {
+		msg.Envs = make(map[string]string)
+	}
 	msg.Envs["SSH_AUTH_SOCK"] = agentPath
 }
 

@@ -27,8 +27,15 @@ package tsshd
 import (
 	"context"
 	"fmt"
+	"sync/atomic"
 	"time"
 )
+
+type globalSettings struct {
+	keepPendingInput atomic.Bool
+}
+
+var globalSetting = &globalSettings{}
 
 var enableDebugLogging bool = false
 var enableWarningLogging bool = false
@@ -44,7 +51,7 @@ func debug(format string, a ...any) {
 	msg := fmt.Sprintf(format, a...)
 
 	if clientDebug != nil {
-		clientDebug("%s", msg)
+		go clientDebug("%s", msg)
 	}
 
 	_, _ = doWithTimeout(func() (int, error) {
@@ -61,7 +68,7 @@ func warning(format string, a ...any) {
 	msg := fmt.Sprintf(format, a...)
 
 	if clientWarning != nil {
-		clientWarning("%s", msg)
+		go clientWarning("%s", msg)
 		return
 	}
 

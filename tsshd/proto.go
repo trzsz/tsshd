@@ -80,106 +80,115 @@ func (e *Error) Error() string {
 
 // ServerInfo includes all information used for client login
 type ServerInfo struct {
-	Ver        string
-	Port       int
-	Mode       string
-	Pass       string
-	Salt       string
-	ServerCert string
-	ClientCert string
-	ClientKey  string
-	ProxyKey   string
-	ClientID   uint64
-	ServerID   uint64
+	Ver        string `json:",omitempty"`
+	Port       int    `json:",omitempty"`
+	Mode       string `json:",omitempty"`
+	Pass       string `json:",omitempty"`
+	Salt       string `json:",omitempty"`
+	ServerCert string `json:",omitempty"`
+	ClientCert string `json:",omitempty"`
+	ClientKey  string `json:",omitempty"`
+	ProxyKey   string `json:",omitempty"`
+	ClientID   uint64 `json:",omitempty"`
+	ServerID   uint64 `json:",omitempty"`
 }
 
 type errorMessage struct {
-	Code ErrCode
-	Msg  string
+	Code ErrCode `json:",omitempty"`
+	Msg  string  `json:",omitempty"`
 }
 
 type debugMessage struct {
-	Msg string
+	Msg string `json:",omitempty"`
 }
 
 type busMessage struct {
-	Timeout  time.Duration
-	Interval time.Duration
+	Timeout  time.Duration `json:",omitempty"`
+	Interval time.Duration `json:",omitempty"`
 }
 
 type x11RequestMessage struct {
-	ChannelType      string
-	SingleConnection bool
-	AuthProtocol     string
-	AuthCookie       string
-	ScreenNumber     uint32
+	ChannelType      string `json:",omitempty"`
+	SingleConnection bool   `json:",omitempty"`
+	AuthProtocol     string `json:",omitempty"`
+	AuthCookie       string `json:",omitempty"`
+	ScreenNumber     uint32 `json:",omitempty"`
 }
 
 type agentRequestMessage struct {
-	ChannelType string
+	ChannelType string `json:",omitempty"`
 }
 
 type startMessage struct {
-	ID    uint64
-	Pty   bool
-	Shell bool
-	Name  string
-	Args  []string
-	Cols  int
-	Rows  int
-	Envs  map[string]string
-	X11   *x11RequestMessage
-	Agent *agentRequestMessage
-	Subs  string
+	ID    uint64               `json:",omitempty"`
+	Pty   bool                 `json:",omitempty"`
+	Shell bool                 `json:",omitempty"`
+	Name  string               `json:",omitempty"`
+	Args  []string             `json:",omitempty"`
+	Cols  int                  `json:",omitempty"`
+	Rows  int                  `json:",omitempty"`
+	Envs  map[string]string    `json:",omitempty"`
+	X11   *x11RequestMessage   `json:",omitempty"`
+	Agent *agentRequestMessage `json:",omitempty"`
+	Subs  string               `json:",omitempty"`
 }
 
 type exitMessage struct {
-	ID       uint64
-	ExitCode int
+	ID       uint64 `json:",omitempty"`
+	ExitCode int    `json:",omitempty"`
 }
 
 type quitMessage struct {
-	Msg string
+	Msg string `json:",omitempty"`
 }
 
 type aliveMessage struct {
-	Time int64
+	Time int64 `json:",omitempty"`
 }
 
 type resizeMessage struct {
-	ID     uint64
-	Cols   int
-	Rows   int
-	Redraw bool
+	ID     uint64 `json:",omitempty"`
+	Cols   int    `json:",omitempty"`
+	Rows   int    `json:",omitempty"`
+	Redraw bool   `json:",omitempty"`
 }
 
 type stderrMessage struct {
-	ID uint64
+	ID uint64 `json:",omitempty"`
 }
 
 type channelMessage struct {
-	ChannelType string
-	ID          uint64
+	ChannelType string `json:",omitempty"`
+	ID          uint64 `json:",omitempty"`
 }
 
 type dialMessage struct {
-	Network string
-	Addr    string
-	Timeout time.Duration
+	Network string        `json:",omitempty"`
+	Addr    string        `json:",omitempty"`
+	Timeout time.Duration `json:",omitempty"`
 }
 
 type listenMessage struct {
-	Network string
-	Addr    string
+	Network string `json:",omitempty"`
+	Addr    string `json:",omitempty"`
 }
 
 type acceptMessage struct {
-	ID uint64
+	ID uint64 `json:",omitempty"`
 }
 
 type udpv1Message struct {
-	Addr    string
-	Timeout time.Duration
+	Addr    string        `json:",omitempty"`
+	Timeout time.Duration `json:",omitempty"`
+}
+
+type discardMessage struct {
+	DiscardMarker  []byte `json:",omitempty"`
+	DiscardedInput []byte `json:",omitempty"`
+}
+
+type settingsMessage struct {
+	KeepPendingInput *bool `json:",omitempty"`
 }
 
 func writeAll(dst io.Writer, data []byte) error {

@@ -167,11 +167,6 @@ func TsshdMain() int {
 		args.ConnectTimeout = kDefaultConnectTimeout
 	}
 
-	// debug verbose mode
-	if args.Debug {
-		enableDebugLogging = true
-	}
-
 	// handle exit signals
 	handleExitSignals()
 
@@ -180,8 +175,12 @@ func TsshdMain() int {
 
 	// init log level
 	enableWarningLogging = true
-	if v := strings.ToLower(getSshdConfig("LogLevel")); v == "quiet" || v == "fatal" {
-		enableWarningLogging = false
+	if args.Debug {
+		enableDebugLogging = true
+	} else {
+		if v := strings.ToLower(getSshdConfig("LogLevel")); v == "quiet" || v == "fatal" {
+			enableWarningLogging = false
+		}
 	}
 
 	// init tsshd server

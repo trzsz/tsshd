@@ -61,27 +61,27 @@ type udpClient interface {
 
 // SshUdpClient implements a UDP SSH client
 type SshUdpClient struct {
-	client         udpClient
-	proxy          *clientProxy
-	connectTimeout time.Duration
-	waitGroup      sync.WaitGroup
-	closed         atomic.Bool
-	busMutex       sync.Mutex
-	busStream      net.Conn
-	sessionMutex   sync.Mutex
-	sessionID      atomic.Uint64
-	sessionMap     map[uint64]*SshUdpSession
-	channelMutex   sync.Mutex
-	channelMap     map[string]chan ssh.NewChannel
-	aliveCallback  func(int64)
-	aliveNewVer    bool
-	serverName     string
-	quitCallback   func(string)
+	client          udpClient
+	proxy           *clientProxy
+	connectTimeout  time.Duration
+	waitGroup       sync.WaitGroup
+	closed          atomic.Bool
+	busMutex        sync.Mutex
+	busStream       net.Conn
+	sessionMutex    sync.Mutex
+	sessionID       atomic.Uint64
+	sessionMap      map[uint64]*SshUdpSession
+	channelMutex    sync.Mutex
+	channelMap      map[string]chan ssh.NewChannel
+	aliveCallback   func(int64)
+	aliveNewVer     bool
+	quitCallback    func(string)
+	discardCallback func([]byte, []byte)
 }
 
 // NewSshUdpClient creates a SshUdpClient
 func NewSshUdpClient(addr string, info *ServerInfo, connectTimeout, aliveTimeout, intervalTime time.Duration,
-	quitCallback func(string)) (*SshUdpClient, error) {
+	quitCallback func(string), discardCallback func([]byte, []byte)) (*SshUdpClient, error) {
 	var proxy *clientProxy
 	if info.ProxyKey != "" {
 		var err error
@@ -99,12 +99,13 @@ func NewSshUdpClient(addr string, info *ServerInfo, connectTimeout, aliveTimeout
 		return nil, err
 	}
 	udpClient := &SshUdpClient{
-		client:         client,
-		proxy:          proxy,
-		sessionMap:     make(map[uint64]*SshUdpSession),
-		channelMap:     make(map[string]chan ssh.NewChannel),
-		connectTimeout: connectTimeout,
-		quitCallback:   quitCallback,
+		client:          client,
+		proxy:           proxy,
+		sessionMap:      make(map[uint64]*SshUdpSession),
+		channelMap:      make(map[string]chan ssh.NewChannel),
+		connectTimeout:  connectTimeout,
+		quitCallback:    quitCallback,
+		discardCallback: discardCallback,
 	}
 
 	busStream, err := udpClient.newStream("bus")
@@ -140,17 +141,17 @@ func (c *SshUdpClient) Close() error {
 
 	_, _ = doWithTimeout(func() (int, error) {
 		if err := c.sendBusCommand("close"); err != nil {
-			debug("[client] [%s] send cmd [close] failed: %v", c.serverName, err)
+			debug("[client] send cmd [close] failed: %v", err)
 		} else {
-			debug("[client] [%s] send cmd [close] completed", c.serverName)
+			debug("[client] send cmd [close] completed")
 		}
 		// UDP connections do not support half-close (write-only close) for now,
 		// so we add extra wait time to allow all incoming data to be received.
 		time.Sleep(200 * time.Millisecond) // give udp some time
 		if err := c.busStream.Close(); err != nil {
-			debug("[client] [%s] close bus stream failed: %v", c.serverName, err)
+			debug("[client] close bus stream failed: %v", err)
 		} else {
-			debug("[client] [%s] close bus stream completed", c.serverName)
+			debug("[client] close bus stream completed")
 		}
 		return 0, nil
 	}, 300*time.Millisecond)
@@ -158,9 +159,9 @@ func (c *SshUdpClient) Close() error {
 	_, err := doWithTimeout(func() (int, error) {
 		err := c.client.closeClient()
 		if err != nil {
-			debug("[client] [%s] close client failed: %v", c.serverName, err)
+			debug("[client] close client failed: %v", err)
 		} else {
-			debug("[client] [%s] close client completed", c.serverName)
+			debug("[client] close client completed")
 		}
 		return 0, err
 	}, 200*time.Millisecond)
@@ -170,16 +171,19 @@ func (c *SshUdpClient) Close() error {
 
 // Reconnect creates a new UDP path to the server
 func (c *SshUdpClient) Reconnect(timeout time.Duration) error {
-	if c.proxy != nil {
-		if err := c.proxy.renewUdpPath(timeout); err != nil {
-			return err
-		}
-		if err := c.sendBusCommand("alive"); err != nil { // ping the server
-			return fmt.Errorf("ping server failed: %w", err)
-		}
-		return nil
+	if c.proxy == nil {
+		return fmt.Errorf("no proxy for connection migration")
 	}
-	return fmt.Errorf("no proxy for connection migration")
+
+	if err := c.proxy.renewUdpPath(timeout); err != nil {
+		return err
+	}
+
+	if err := c.sendBusCommand("alive"); err != nil { // ping the server
+		return fmt.Errorf("ping server failed: %w", err)
+	}
+
+	return nil
 }
 
 func (c *SshUdpClient) newStream(cmd string) (net.Conn, error) {
@@ -305,14 +309,13 @@ func (c *SshUdpClient) IsClosed() bool {
 	return c.closed.Load()
 }
 
-// SetDebugFunc set the debugging function
-func (c *SshUdpClient) SetDebugFunc(svrName string, debugFunc func(string, ...any)) {
-	c.serverName = svrName
+// SetDebugFunc sets the debugging function
+func (c *SshUdpClient) SetDebugFunc(debugFunc func(string, ...any)) {
 	clientDebug = debugFunc
 	enableDebugLogging = true
 }
 
-// SetWarningFunc set the warning function
+// SetWarningFunc sets the warning function
 func (c *SshUdpClient) SetWarningFunc(warningFunc func(string, ...any)) {
 	clientWarning = warningFunc
 	enableWarningLogging = true
@@ -380,6 +383,11 @@ func (c *SshUdpClient) ForwardUDPv1(addr string, timeout time.Duration) (string,
 	return localAddr, nil
 }
 
+// SetKeepPendingInput sets whether to keep the pending input during reconnection.
+func (c *SshUdpClient) SetKeepPendingInput(keep bool) error {
+	return c.sendBusMessage("setting", settingsMessage{KeepPendingInput: &keep})
+}
+
 func (c *SshUdpClient) sendBusCommand(command string) error {
 	c.busMutex.Lock()
 	defer c.busMutex.Unlock()
@@ -417,10 +425,12 @@ func (c *SshUdpClient) handleBusEvent() {
 			c.handleChannelEvent()
 		case "alive":
 			if c.aliveCallback != nil {
-				c.aliveCallback(0)
+				go c.aliveCallback(0)
 			}
 		case "alive2":
 			c.handleAliveEvent()
+		case "discard":
+			c.handleDiscardEvent()
 		default:
 			if err := handleUnknownEvent(c.busStream, command); err != nil {
 				warning("handle bus command [%s] failed: %v. You may need to upgrade tssh.", command, err)
@@ -435,11 +445,11 @@ func (c *SshUdpClient) handleQuitEvent() {
 		warning("recv quit message failed: %v", err)
 		return
 	}
-	debug("[client] [%s] quit due to %s", c.serverName, quitMsg.Msg)
+	debug("[client] quit due to %s", quitMsg.Msg)
 	if c.quitCallback != nil {
-		go c.quitCallback(fmt.Sprintf("[%s] %s", c.serverName, quitMsg.Msg))
+		go c.quitCallback(quitMsg.Msg)
 	} else {
-		warning("[udp] quit due to [%s] %s", c.serverName, quitMsg.Msg)
+		warning("quit due to %s", quitMsg.Msg)
 	}
 }
 
@@ -449,7 +459,7 @@ func (c *SshUdpClient) handleExitEvent() {
 		warning("recv exit message failed: %v", err)
 		return
 	}
-	debug("[client] [%s] session [%d] exiting with code: %d", c.serverName, exitMsg.ID, exitMsg.ExitCode)
+	debug("[client] session [%d] exiting with code: %d", exitMsg.ID, exitMsg.ExitCode)
 
 	c.sessionMutex.Lock()
 	defer c.sessionMutex.Unlock()
@@ -471,7 +481,7 @@ func (c *SshUdpClient) handleDebugEvent() {
 		warning("recv debug message failed: %v", err)
 		return
 	}
-	debug("[server] [%s] %s", c.serverName, dbgMsg.Msg)
+	debug("[server] %s", dbgMsg.Msg)
 }
 
 func (c *SshUdpClient) handleErrorEvent() {
@@ -480,7 +490,7 @@ func (c *SshUdpClient) handleErrorEvent() {
 		warning("recv error message failed: %v", err)
 		return
 	}
-	warning("[udp] %s", errMsg.Msg)
+	warning("%s", errMsg.Msg)
 }
 
 func (c *SshUdpClient) handleChannelEvent() {
@@ -510,9 +520,20 @@ func (c *SshUdpClient) handleAliveEvent() {
 		return
 	}
 	if c.aliveCallback != nil {
-		c.aliveCallback(aliveMsg.Time)
+		go c.aliveCallback(aliveMsg.Time)
 	}
 	c.aliveNewVer = true
+}
+
+func (c *SshUdpClient) handleDiscardEvent() {
+	var discardMsg discardMessage
+	if err := recvMessage(c.busStream, &discardMsg); err != nil {
+		warning("recv discard message failed: %v", err)
+		return
+	}
+	if c.discardCallback != nil {
+		go c.discardCallback(discardMsg.DiscardMarker, discardMsg.DiscardedInput)
+	}
 }
 
 // SshUdpSession represents a connection to a remote command or shell
@@ -549,7 +570,7 @@ func (s *SshUdpSession) Close() error {
 
 	_, err := doWithTimeout(func() (int, error) {
 		err := s.stream.Close()
-		debug("[client] [%s] close session completed", s.client.serverName)
+		debug("[client] close session completed")
 		return 0, err
 	}, 100*time.Millisecond)
 	return err
@@ -625,14 +646,14 @@ func (s *SshUdpSession) startSession(msg *startMessage) error {
 		go func() {
 			_, _ = io.Copy(s.stream, s.stdin)
 			_ = s.stream.Close()
-			debug("[client] [%s] session [%d] stdin completed", s.client.serverName, s.id)
+			debug("[client] session [%d] stdin completed", s.id)
 		}()
 	}
 	if s.stdout != nil {
 		s.wg.Go(func() {
 			_, _ = io.Copy(s.stdout, s.stream)
 			_ = s.stdout.Close()
-			debug("[client] [%s] session [%d] stdout completed", s.client.serverName, s.id)
+			debug("[client] session [%d] stdout completed", s.id)
 		})
 	}
 	return nil
@@ -706,7 +727,7 @@ func (s *SshUdpSession) StderrPipe() (io.Reader, error) {
 	s.wg.Go(func() {
 		_, _ = io.Copy(s.stderr, stream)
 		_ = s.stderr.Close()
-		debug("[client] [%s] session [%d] stderr completed", s.client.serverName, s.id)
+		debug("[client] session [%d] stderr completed", s.id)
 	})
 	return reader, nil
 }
