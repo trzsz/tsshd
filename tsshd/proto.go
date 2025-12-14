@@ -91,6 +91,7 @@ type ServerInfo struct {
 	ProxyKey   string `json:",omitempty"`
 	ClientID   uint64 `json:",omitempty"`
 	ServerID   uint64 `json:",omitempty"`
+	ProxyMode  string `json:",omitempty"`
 }
 
 type errorMessage struct {
@@ -99,12 +100,14 @@ type errorMessage struct {
 }
 
 type debugMessage struct {
-	Msg string `json:",omitempty"`
+	Msg  string `json:",omitempty"`
+	Time int64  `json:",omitempty"`
 }
 
 type busMessage struct {
-	Timeout  time.Duration `json:",omitempty"`
-	Interval time.Duration `json:",omitempty"`
+	Timeout          time.Duration `json:",omitempty"`
+	Interval         time.Duration `json:",omitempty"`
+	HeartbeatTimeout time.Duration `json:",omitempty"`
 }
 
 type x11RequestMessage struct {
@@ -363,9 +366,9 @@ func newUdpClient(addr string, info *ServerInfo, connectTimeout time.Duration) (
 	switch info.Mode {
 	case "":
 		return nil, fmt.Errorf("%s", "Please upgrade tsshd")
-	case kModeKCP:
+	case kUdpModeKCP:
 		return newKcpClient(addr, info)
-	case kModeQUIC:
+	case kUdpModeQUIC:
 		return newQuicClient(addr, info, connectTimeout)
 	default:
 		return nil, fmt.Errorf("unknown tsshd mode: %s", info.Mode)

@@ -36,34 +36,42 @@ import (
 )
 
 var serving atomic.Bool
-
+var busStream net.Conn
 var busMutex sync.Mutex
-
-var busStream atomic.Pointer[net.Conn]
-
-var lastAliveTime atomic.Pointer[time.Time]
+var inputChecker *timeoutChecker
 
 func sendBusCommand(command string) error {
 	busMutex.Lock()
 	defer busMutex.Unlock()
-	stream := busStream.Load()
-	if stream == nil {
+	if busStream == nil {
 		return fmt.Errorf("bus stream is nil")
 	}
-	return sendCommand(*stream, command)
+	return sendCommand(busStream, command)
 }
 
 func sendBusMessage(command string, msg any) error {
 	busMutex.Lock()
 	defer busMutex.Unlock()
-	stream := busStream.Load()
-	if stream == nil {
+	if busStream == nil {
 		return fmt.Errorf("bus stream is nil")
 	}
-	if err := sendCommand(*stream, command); err != nil {
+	if err := sendCommand(busStream, command); err != nil {
 		return err
 	}
-	return sendMessage(*stream, msg)
+	return sendMessage(busStream, msg)
+}
+
+func initBusStream(stream net.Conn) error {
+	busMutex.Lock()
+	defer busMutex.Unlock()
+
+	// only one bus
+	if busStream != nil {
+		return fmt.Errorf("bus has been initialized")
+	}
+
+	busStream = stream
+	return nil
 }
 
 func handleBusEvent(stream net.Conn) {
@@ -73,30 +81,30 @@ func handleBusEvent(stream net.Conn) {
 		return
 	}
 
-	busMutex.Lock()
-
-	// only one bus
-	if !busStream.CompareAndSwap(nil, &stream) {
-		busMutex.Unlock()
-		sendError(stream, fmt.Errorf("bus has been initialized"))
+	err := initBusStream(stream)
+	if err != nil {
+		sendError(stream, err)
 		return
 	}
 
+	inputChecker = newTimeoutChecker(msg.HeartbeatTimeout, func(timeout bool) {
+		if timeout {
+			debug("output forwarding blocked due to no client input for [%v]", msg.HeartbeatTimeout)
+		} else {
+			debug("output forwarding resumed after receiving client input")
+		}
+	})
+
 	if err := sendSuccess(stream); err != nil { // ack ok
-		busMutex.Unlock()
 		warning("bus ack ok failed: %v", err)
 		return
 	}
-
-	busMutex.Unlock()
 
 	serving.Store(true)
 
 	if msg.Timeout <= 0 {
 		msg.Timeout = 365 * 24 * time.Hour
 	}
-	now := time.Now()
-	lastAliveTime.Store(&now)
 	go keepAlive(msg.Timeout, msg.Interval)
 
 	for {
@@ -105,6 +113,8 @@ func handleBusEvent(stream net.Conn) {
 			warning("recv bus command failed: %v", err)
 			return
 		}
+
+		inputChecker.updateTime(time.Now().UnixMilli())
 
 		switch command {
 		case "resize":
@@ -118,8 +128,6 @@ func handleBusEvent(stream net.Conn) {
 			}()
 			return
 		case "alive": // work as ping in new version
-			now := time.Now()
-			lastAliveTime.Store(&now)
 			_ = sendBusCommand("alive")
 		case "alive2":
 			err = handleAliveEvent(stream)
@@ -137,9 +145,6 @@ func handleBusEvent(stream net.Conn) {
 }
 
 func handleAliveEvent(stream net.Conn) error {
-	now := time.Now()
-	lastAliveTime.Store(&now)
-
 	var msg aliveMessage
 	if err := recvMessage(stream, &msg); err != nil {
 		return fmt.Errorf("recv alive message failed: %v", err)
@@ -171,8 +176,9 @@ func keepAlive(totalTimeout time.Duration, intervalTimeout time.Duration) {
 	if intervalTimeout <= 0 {
 		intervalTimeout = min(totalTimeout/10, 10*time.Second)
 	}
+	timeoutMilli := int64(totalTimeout / time.Millisecond)
 	for {
-		if t := lastAliveTime.Load(); t != nil && time.Since(*t) > totalTimeout {
+		if time.Now().UnixMilli()-inputChecker.getAliveTime() > timeoutMilli {
 			warning("tsshd keep alive timeout")
 			exitChan <- 2
 			return

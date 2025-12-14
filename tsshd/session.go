@@ -96,7 +96,6 @@ type sessionContext struct {
 	closed  atomic.Bool
 
 	discardedBuffer []byte
-	inputDebugQuota atomic.Int32
 }
 
 type stderrStream struct {
@@ -174,16 +173,18 @@ func (c *sessionContext) showMotd(stream net.Conn) {
 	printMotd([]string{"/etc/motd"}) // always print traditional /etc/motd.
 }
 
-func (c *sessionContext) discardPendingInput(buf []byte) {
+func (c *sessionContext) discardPendingInput(buf []byte) error {
 	c.discardedBuffer = append(c.discardedBuffer, buf...)
 	pos := bytes.Index(c.discardedBuffer, discardPendingInputMarker)
 	if pos < 0 {
-		return
+		return nil
 	}
 
 	remainingBuffer := c.discardedBuffer[pos+len(discardPendingInputMarker):]
 	if len(remainingBuffer) > 0 {
-		_ = writeAll(c.stdin, remainingBuffer)
+		if err := writeAll(c.stdin, remainingBuffer); err != nil {
+			return err
+		}
 	}
 
 	if pos > 0 {
@@ -196,57 +197,72 @@ func (c *sessionContext) discardPendingInput(buf []byte) {
 	}
 	c.discardedBuffer = nil
 
-	if enableDebugLogging {
-		c.inputDebugQuota.Store(10)
-	}
 	discardPendingInputFlag.Store(false)
 	debug("new transport path is now active")
+	return nil
+}
+
+func (c *sessionContext) forwardInput(stream net.Conn) {
+	defer func() { _ = c.stdin.Close() }()
+	buffer := make([]byte, 32*1024)
+	for {
+		n, err := stream.Read(buffer)
+		inputChecker.updateTime(time.Now().UnixMilli())
+		if n > 0 {
+			if discardPendingInputFlag.Load() {
+				if err := c.discardPendingInput(buffer[:n]); err != nil {
+					break
+				}
+			} else {
+				if err := writeAll(c.stdin, buffer[:n]); err != nil {
+					break
+				}
+			}
+		}
+		if err != nil {
+			break
+		}
+	}
+	debug("session [%d] stdin completed", c.id)
+}
+
+func (c *sessionContext) forwardOutput(name string, reader io.Reader, writer io.WriteCloser) {
+	defer func() { _ = writer.Close() }()
+	buffer := make([]byte, 32*1024)
+	for {
+		n, err := reader.Read(buffer)
+		if n > 0 {
+			for inputChecker.isTimeout() {
+				time.Sleep(10 * time.Millisecond)
+			}
+			if err := writeAll(writer, buffer[:n]); err != nil {
+				break
+			}
+		}
+		if err != nil {
+			break
+		}
+	}
+	debug("session [%d] %s completed", c.id, name)
 }
 
 func (c *sessionContext) forwardIO(stream net.Conn) {
 	if c.stdin != nil {
-		go func() {
-			buffer := make([]byte, 32*1024)
-			for {
-				n, err := stream.Read(buffer)
-				if n > 0 {
-					if discardPendingInputFlag.Load() {
-						c.discardPendingInput(buffer[:n])
-					} else {
-						if enableDebugLogging {
-							if quota := c.inputDebugQuota.Add(-1); quota >= 0 {
-								debug("forward input: %s", strconv.QuoteToASCII(string(buffer[:n])))
-							}
-						}
-						_ = writeAll(c.stdin, buffer[:n])
-					}
-				}
-				if err != nil {
-					break
-				}
-			}
-			_ = c.stdin.Close()
-			debug("session [%d] stdin completed", c.id)
-		}()
+		go c.forwardInput(stream)
 	}
 
 	if c.stdout != nil {
-		c.wg.Go(func() {
-			_, _ = io.Copy(stream, c.stdout)
-			_ = stream.Close()
-			debug("session [%d] stdout completed", c.id)
-		})
+		c.wg.Go(func() { c.forwardOutput("stdout", c.stdout, stream) })
 	}
 
 	if c.stderr != nil {
 		c.wg.Go(func() {
 			if stderr := getStderrStream(c.id); stderr != nil {
-				_, _ = io.Copy(stderr.stream, c.stderr)
-				_ = stderr.stream.Close()
+				c.forwardOutput("stderr", c.stderr, stderr.stream)
 			} else {
 				_, _ = io.Copy(io.Discard, c.stderr)
+				debug("session [%d] stderr completed", c.id)
 			}
-			debug("session [%d] stderr completed", c.id)
 		})
 	} else if stderr := getStderrStream(c.id); stderr != nil {
 		stderr.Close()
@@ -314,6 +330,7 @@ func (c *sessionContext) SetSize(cols, rows int, redraw bool) error {
 	if redraw {
 		_ = c.pty.Resize(cols+1, rows)
 		time.Sleep(10 * time.Millisecond) // fix redraw issue in `screen`
+		debug("session [%d] redraw: %d, %d", c.id, cols, rows)
 	} else {
 		debug("session [%d] resize: %d, %d", c.id, cols, rows)
 	}

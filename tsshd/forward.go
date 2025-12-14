@@ -199,27 +199,59 @@ func getAcceptConn(id uint64) net.Conn {
 
 func forwardConnection(stream net.Conn, conn net.Conn) {
 	var wg sync.WaitGroup
-	wg.Go(func() {
-		_, _ = io.Copy(conn, stream)
-		if cw, ok := conn.(closeWriter); ok {
-			_ = cw.CloseWrite()
-		} else {
-			// close the entire stream since there is no half-close
-			time.Sleep(200 * time.Millisecond)
-			_ = conn.Close()
-		}
-	})
-	wg.Go(func() {
-		_, _ = io.Copy(stream, conn)
-		if cw, ok := stream.(closeWriter); ok {
-			_ = cw.CloseWrite()
-		} else {
-			// close the entire stream since there is no half-close
-			time.Sleep(200 * time.Millisecond)
-			_ = stream.Close()
-		}
-	})
+	wg.Go(func() { forwardConnInput(stream, conn) })
+	wg.Go(func() { forwardConnOutput(stream, conn) })
 	wg.Wait()
+}
+
+func forwardConnInput(stream net.Conn, conn net.Conn) {
+	buffer := make([]byte, 32*1024)
+	for {
+		n, err := stream.Read(buffer)
+		inputChecker.updateTime(time.Now().UnixMilli())
+		if n > 0 {
+			if err := writeAll(conn, buffer[:n]); err != nil {
+				break
+			}
+		}
+		if err != nil {
+			break
+		}
+	}
+
+	if cw, ok := conn.(closeWriter); ok {
+		_ = cw.CloseWrite()
+	} else {
+		// close the entire stream since there is no half-close
+		time.Sleep(200 * time.Millisecond)
+		_ = conn.Close()
+	}
+}
+
+func forwardConnOutput(stream net.Conn, conn net.Conn) {
+	buffer := make([]byte, 32*1024)
+	for {
+		n, err := conn.Read(buffer)
+		if n > 0 {
+			for inputChecker.isTimeout() {
+				time.Sleep(10 * time.Millisecond)
+			}
+			if err := writeAll(stream, buffer[:n]); err != nil {
+				break
+			}
+		}
+		if err != nil {
+			break
+		}
+	}
+
+	if cw, ok := stream.(closeWriter); ok {
+		_ = cw.CloseWrite()
+	} else {
+		// close the entire stream since there is no half-close
+		time.Sleep(200 * time.Millisecond)
+		_ = stream.Close()
+	}
 }
 
 func handleUDPv1Event(stream net.Conn) {
@@ -260,7 +292,7 @@ type udpv1ConnEntry struct {
 	udpPort   uint16
 	udpConn   *net.UDPConn
 	closeChan chan struct{}
-	aliveTime atomic.Pointer[time.Time]
+	aliveTime atomic.Int64
 }
 
 type udpv1ConnManager struct {
@@ -269,7 +301,8 @@ type udpv1ConnManager struct {
 	udpAddr   *net.UDPAddr
 	timeout   time.Duration
 	connMap   map[uint16]*udpv1ConnEntry
-	aliveTime atomic.Pointer[time.Time]
+	aliveTime atomic.Int64
+	pktCache  packetCache
 }
 
 func (m *udpv1ConnManager) frontendToBackend() {
@@ -279,8 +312,9 @@ func (m *udpv1ConnManager) frontendToBackend() {
 			warning("UDPv1 forward recv packet failed: %v", err)
 			return
 		}
-		now := time.Now()
-		m.aliveTime.Store(&now)
+		now := time.Now().UnixMilli()
+		m.aliveTime.Store(now)
+		inputChecker.updateTime(now)
 		conn, err := m.getUdpConn(port)
 		if err != nil {
 			warning("UDPv1 forward get udp conn failed: %v", err)
@@ -302,8 +336,20 @@ func (m *udpv1ConnManager) backendToFrontend(entry *udpv1ConnEntry) {
 			if err != nil || n <= 0 {
 				continue
 			}
-			now := time.Now()
-			entry.aliveTime.Store(&now)
+			entry.aliveTime.Store(time.Now().UnixMilli())
+			if inputChecker.isTimeout() {
+				m.pktCache.addPacket(buffer[:n])
+				continue
+			}
+			if m.pktCache.size > 0 {
+				totalSize, totalCount, flushSize, flushCount := m.pktCache.flushCache(func(buf []byte) error {
+					return sendUDPv1Packet(m.stream, entry.udpPort, buf)
+				})
+				if enableDebugLogging {
+					debug("total packet cache count [%d] cache size [%d]", totalCount, totalSize)
+					debug("flush packet cache count [%d] cache size [%d]", flushCount, flushSize)
+				}
+			}
 			if err := sendUDPv1Packet(m.stream, entry.udpPort, buffer[:n]); err != nil {
 				warning("UDPv1 forward send back to [%d] failed: %v", entry.udpPort, err)
 			}
@@ -330,8 +376,7 @@ func (m *udpv1ConnManager) getUdpConn(port uint16) (*net.UDPConn, error) {
 		udpConn:   conn,
 		closeChan: make(chan struct{}),
 	}
-	now := time.Now()
-	entry.aliveTime.Store(&now)
+	entry.aliveTime.Store(time.Now().UnixMilli())
 	m.connMap[port] = entry
 
 	go m.backendToFrontend(entry)
@@ -339,13 +384,13 @@ func (m *udpv1ConnManager) getUdpConn(port uint16) (*net.UDPConn, error) {
 }
 
 func (m *udpv1ConnManager) cleanupInactiveConn() {
-	now := time.Now()
-	m.aliveTime.Store(&now)
+	m.aliveTime.Store(time.Now().UnixMilli())
+	timeoutMilli := int64(m.timeout / time.Millisecond)
 	for {
 		time.Sleep(m.timeout)
 		m.mutex.Lock()
 		for port, entry := range m.connMap {
-			if m.aliveTime.Load().Sub(*entry.aliveTime.Load()) > m.timeout {
+			if m.aliveTime.Load()-entry.aliveTime.Load() > timeoutMilli {
 				close(entry.closeChan)
 				_ = entry.udpConn.Close()
 				delete(m.connMap, port)

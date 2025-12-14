@@ -42,6 +42,7 @@ type tsshdArgs struct {
 	Help           bool
 	Version        bool
 	KCP            bool
+	TCP            bool
 	IPv4           bool
 	IPv6           bool
 	Proxy          bool
@@ -55,12 +56,13 @@ func printVersion() {
 }
 
 func printHelp() {
-	fmt.Printf("usage: tsshd [-h] [-v] [--kcp] [--ipv4] [--ipv6] [--proxy] [--debug] [--port low-high] [--connect-timeout t]\n\n" +
+	fmt.Printf("usage: tsshd [-h] [-v] [--kcp] [--tcp] [--ipv4] [--ipv6] [--proxy] [--debug] [--port low-high] [--connect-timeout t]\n\n" +
 		"tsshd: trzsz-ssh(tssh) server that supports connection migration for roaming.\n\n" +
 		"optional arguments:\n" +
 		"  -h, --help             show this help message and exit\n" +
 		"  -v, --version          show program's version number and exit\n" +
 		"  --kcp                  KCP protocol (default is QUIC protocol)\n" +
+		"  --tcp                  Use UDP-over-TCP to bypass UDP blocking\n" +
 		"  --ipv4                 UDP only listens on IPv4, ignoring IPv6\n" +
 		"  --ipv6                 UDP only listens on IPv6, ignoring IPv4\n" +
 		"  --proxy                With UDP proxy for connection migration\n" +
@@ -81,6 +83,8 @@ func parseTsshdArgs() *tsshdArgs {
 			return args
 		case "--kcp":
 			args.KCP = true
+		case "--tcp":
+			args.TCP = true
 		case "--ipv4":
 			args.IPv4 = true
 		case "--ipv6":

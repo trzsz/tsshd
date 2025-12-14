@@ -33,6 +33,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"sync"
 	"sync/atomic"
@@ -70,65 +71,203 @@ func aesDecrypt(cipherBlock *cipher.Block, buf []byte) []byte {
 	return plainText
 }
 
-type udpConn struct {
+func sendUdpPacket(conn net.Conn, data []byte) error {
+	buf := make([]byte, 2)
+	binary.BigEndian.PutUint16(buf, uint16(len(data)))
+	if _, err := conn.Write(buf); err != nil {
+		return err
+	}
+	if _, err := conn.Write(data); err != nil {
+		return err
+	}
+	return nil
+}
+
+func recvUdpPacket(conn net.Conn, data []byte) (int, error) {
+	buf := make([]byte, 2)
+	if _, err := io.ReadFull(conn, buf); err != nil {
+		return 0, err
+	}
+	n := int(binary.BigEndian.Uint16(buf))
+	if n <= 0 || n > len(data) {
+		return 0, fmt.Errorf("invalid udp length: %d", n)
+	}
+	if _, err := io.ReadFull(conn, data[:n]); err != nil {
+		return 0, err
+	}
+	return n, nil
+}
+
+type packetCache struct {
+	buffer     [100][]byte
+	mutex      sync.Mutex
+	head       int
+	tail       int
+	size       int
+	totalSize  int
+	totalCount int
+}
+
+func (p *packetCache) addPacket(buf []byte) {
+	p.mutex.Lock()
+	defer p.mutex.Unlock()
+
+	data := make([]byte, len(buf))
+	copy(data, buf)
+
+	p.buffer[p.tail] = data
+	p.tail = (p.tail + 1) % len(p.buffer)
+
+	if p.size < len(p.buffer) {
+		p.size++
+	} else {
+		p.head = (p.head + 1) % len(p.buffer)
+	}
+
+	if enableDebugLogging {
+		p.totalSize += len(buf)
+		p.totalCount++
+	}
+}
+
+func (p *packetCache) flushCache(writeFn func([]byte) error) (int, int, int, int) {
+	p.mutex.Lock()
+	defer p.mutex.Unlock()
+
+	var totalSize, totalCount, flushSize, flushCount int
+
+	for i := 0; i < p.size; i++ {
+		index := (p.head + i) % len(p.buffer)
+		if p.buffer[index] == nil {
+			continue
+		}
+		if enableDebugLogging {
+			flushSize += len(p.buffer[index])
+			flushCount++
+		}
+		_ = writeFn(p.buffer[index])
+		p.buffer[index] = nil
+	}
+
+	p.head, p.size = p.tail, 0
+
+	if enableDebugLogging {
+		totalSize, totalCount = p.totalSize, p.totalCount
+		p.totalSize, p.totalCount = 0, 0
+	}
+
+	return totalSize, totalCount, flushSize, flushCount
+}
+
+type clientConnection interface {
+	Addr() string
+	Close()
+	Write([]byte) error
+	Equal(clientConnection) bool
+}
+
+type tcpClientConn struct {
+	conn net.Conn
+}
+
+func (t *tcpClientConn) Addr() string {
+	if t == nil {
+		return ""
+	}
+	return t.conn.RemoteAddr().String()
+}
+
+func (t *tcpClientConn) Close() {
+	if t == nil {
+		return
+	}
+	_ = t.conn.Close()
+}
+
+func (t *tcpClientConn) Write(buf []byte) error {
+	if t == nil {
+		return fmt.Errorf("tcpClientConn is nil")
+	}
+	return sendUdpPacket(t.conn, buf)
+}
+
+func (t *tcpClientConn) Equal(clientConnection) bool {
+	return false
+}
+
+type udpClientConn struct {
 	frontendConn *net.UDPConn
 	clientAddr   *net.UDPAddr
 }
 
+func (u *udpClientConn) Addr() string {
+	if u == nil {
+		return ""
+	}
+	return u.clientAddr.String()
+}
+
+func (u *udpClientConn) Close() {
+}
+
+func (u *udpClientConn) Write(buf []byte) error {
+	if u == nil {
+		return fmt.Errorf("udpClientConn is nil")
+	}
+	_, err := u.frontendConn.WriteToUDP(buf, u.clientAddr)
+	return err
+}
+
+func (u *udpClientConn) Equal(c clientConnection) bool {
+	if u == nil {
+		return false
+	}
+
+	if c, ok := c.(*udpClientConn); ok {
+		if u.frontendConn != c.frontendConn {
+			return false
+		}
+		if u.clientAddr.Port != c.clientAddr.Port {
+			return false
+		}
+		return u.clientAddr.IP.Equal(c.clientAddr.IP)
+	}
+
+	return false
+}
+
+type clientConnHolder struct {
+	clientConnection
+}
+
 type udpBuffer struct {
-	conn *udpConn
+	conn *udpClientConn
 	data []byte
 }
 
 type serverProxy struct {
-	connectTimeout time.Duration
-	frontendList   []*net.UDPConn
-	backendConn    *net.UDPConn
-	clientConn     atomic.Pointer[udpConn]
-	authedConn     *udpConn
-	cipherBlock    *cipher.Block
-	clientID       uint64
-	serverID       uint64
-	serialNumber   uint64
-	bufChan        chan *udpBuffer
+	args         *tsshdArgs
+	frontendList []io.Closer
+	backendConn  *net.UDPConn
+	clientConn   atomic.Pointer[clientConnHolder]
+	authedConn   clientConnection
+	cipherBlock  *cipher.Block
+	clientID     uint64
+	serverID     uint64
+	serialNumber atomic.Uint64
+	bufChan      chan *udpBuffer
+	pktCache     packetCache
 }
 
-func (p *serverProxy) isClientConn(conn *udpConn) bool {
-	clientConn := p.clientConn.Load()
-	if clientConn == nil {
-		return false
-	}
-	if clientConn.frontendConn != conn.frontendConn {
-		return false
-	}
-	if clientConn.clientAddr.Port != conn.clientAddr.Port {
-		return false
-	}
-	return clientConn.clientAddr.IP.Equal(conn.clientAddr.IP)
-}
-
-func (p *serverProxy) isAuthedConn(conn *udpConn) bool {
-	if p.authedConn == nil {
-		return false
-	}
-	if p.authedConn.frontendConn != conn.frontendConn {
-		return false
-	}
-	if p.authedConn.clientAddr.Port != conn.clientAddr.Port {
-		return false
-	}
-	return p.authedConn.clientAddr.IP.Equal(conn.clientAddr.IP)
-}
-
-func (p *serverProxy) sendAuthPacket(conn *udpConn) {
+func (p *serverProxy) sendAuthPacket(conn clientConnection) error {
 	data := make([]byte, 16)
 	binary.BigEndian.PutUint64(data[0:8], p.serverID)
-	binary.BigEndian.PutUint64(data[8:16], p.serialNumber)
+	binary.BigEndian.PutUint64(data[8:16], p.serialNumber.Load())
 	buf := aesEncrypt(p.cipherBlock, data)
 	if buf == nil {
-		return
+		return fmt.Errorf("aes encrypt failed")
 	}
-	_, _ = conn.frontendConn.WriteToUDP(buf, conn.clientAddr)
+	return conn.Write(buf)
 }
 
 func (p *serverProxy) verifyAuthPacket(buf []byte) (bool, uint64) {
@@ -144,60 +283,71 @@ func (p *serverProxy) verifyAuthPacket(buf []byte) (bool, uint64) {
 	return true, serialNumber
 }
 
-func (p *serverProxy) frontendToBackend() {
+func (p *serverProxy) setClientConn(newClientConn *clientConnHolder) {
+	oldClientConn := p.clientConn.Swap(newClientConn)
+
+	if enableDebugLogging {
+		debug("new client address [%d]: %s", p.serialNumber.Load(), newClientConn.Addr())
+	}
+
+	if inputChecker != nil {
+		inputChecker.updateTime(time.Now().UnixMilli())
+	}
+
+	if oldClientConn != nil {
+		oldClientConn.Close()
+		enablePendingInputDiscard() // discard pending user input from previous connections
+	}
+
+	totalSize, totalCount, flushSize, flushCount := p.pktCache.flushCache(newClientConn.Write)
+	if enableDebugLogging {
+		debug("total packet cache count [%d] cache size [%d]", totalCount, totalSize)
+		debug("flush packet cache count [%d] cache size [%d]", flushCount, flushSize)
+	}
+}
+
+func (p *serverProxy) udpFrontendToBackend() {
 	for buf := range p.bufChan {
-		if p.isClientConn(buf.conn) {
-			_, _ = p.backendConn.Write(buf.data)
+		if c := p.clientConn.Load(); c != nil && c.Equal(buf.conn) {
+			if _, err := p.backendConn.Write(buf.data); err != nil {
+				warning("write to backend failed: %v", err)
+			}
 			continue
 		}
 
-		if p.isAuthedConn(buf.conn) {
+		if p.authedConn != nil && p.authedConn.Equal(buf.conn) {
 			isAuthPacket, serialNumber := p.verifyAuthPacket(buf.data)
 			if !isAuthPacket { // auth success
-				if enableDebugLogging {
-					debug("new client address: %s", p.authedConn.clientAddr.String())
-				}
-				if p.clientConn.Load() != nil {
-					enablePendingInputDiscard() // discard pending user input from previous connections
-				}
-				p.clientConn.Store(p.authedConn)
+				p.setClientConn(&clientConnHolder{p.authedConn})
 				p.authedConn = nil
-				_, _ = p.backendConn.Write(buf.data)
+				if _, err := p.backendConn.Write(buf.data); err != nil {
+					warning("write to backend failed: %v", err)
+				}
 				continue
 			}
-			if serialNumber > p.serialNumber {
-				p.serialNumber = serialNumber
+			if serialNumber > p.serialNumber.Load() {
+				p.serialNumber.Store(serialNumber)
 			}
-			if serialNumber == p.serialNumber {
-				p.sendAuthPacket(buf.conn)
+			if serialNumber == p.serialNumber.Load() {
+				_ = p.sendAuthPacket(buf.conn)
 			}
 			continue
 		}
 
 		isAuthPacket, serialNumber := p.verifyAuthPacket(buf.data)
-		if isAuthPacket && serialNumber > p.serialNumber {
+		if isAuthPacket && serialNumber > p.serialNumber.Load() {
+			if enableDebugLogging {
+				debug("new authed address [%d]: %s", serialNumber, buf.conn.Addr())
+			}
 			p.authedConn = buf.conn
-			p.serialNumber = serialNumber
-			p.sendAuthPacket(buf.conn)
+			p.serialNumber.Store(serialNumber)
+			_ = p.sendAuthPacket(buf.conn)
 			continue
 		}
 	}
 }
 
-func (p *serverProxy) backendToFrontend() {
-	buffer := make([]byte, 0xffff)
-	for {
-		n, _, err := p.backendConn.ReadFromUDP(buffer)
-		if err != nil || n <= 0 {
-			continue
-		}
-		if conn := p.clientConn.Load(); conn != nil {
-			_, _ = conn.frontendConn.WriteToUDP(buffer[:n], conn.clientAddr)
-		}
-	}
-}
-
-func (p *serverProxy) serveFrontendConn(conn *net.UDPConn) {
+func (p *serverProxy) udpServeFrontendConn(conn *net.UDPConn) {
 	defer func() { _ = conn.Close() }()
 	beginTime := time.Now()
 	neverReceived := true
@@ -205,17 +355,22 @@ func (p *serverProxy) serveFrontendConn(conn *net.UDPConn) {
 	current := 0
 	buffers := [2][]byte{make([]byte, 0xffff), make([]byte, 0xffff)}
 	for {
-		_ = conn.SetReadDeadline(time.Now().Add(p.connectTimeout))
+		_ = conn.SetReadDeadline(time.Now().Add(p.args.ConnectTimeout))
 		n, addr, err := conn.ReadFromUDP(buffers[current])
 		if err != nil || n <= 0 {
-			if neverReceived && time.Since(beginTime) > p.connectTimeout {
+			if neverReceived && time.Since(beginTime) > p.args.ConnectTimeout-10*time.Millisecond {
 				return
 			}
+			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+				continue
+			}
+			warning("frontend read udp failed: %v", err)
+			time.Sleep(10 * time.Millisecond)
 			continue
 		}
 		neverReceived = false
 		p.bufChan <- &udpBuffer{
-			conn: &udpConn{
+			conn: &udpClientConn{
 				frontendConn: conn,
 				clientAddr:   addr,
 			},
@@ -225,19 +380,127 @@ func (p *serverProxy) serveFrontendConn(conn *net.UDPConn) {
 	}
 }
 
-func (p *serverProxy) serveProxy() {
-	for _, conn := range p.frontendList {
-		_ = conn.SetReadBuffer(kProxyBufferSize)
-		_ = conn.SetWriteBuffer(kProxyBufferSize)
-		go p.serveFrontendConn(conn)
+func (p *serverProxy) tcpFrontendToBackend(conn net.Conn) {
+	defer func() { _ = conn.Close() }()
+
+	if err := conn.SetReadDeadline(time.Now().Add(p.args.ConnectTimeout)); err != nil {
+		return
 	}
+	buffer := make([]byte, 0xffff)
+	n, err := recvUdpPacket(conn, buffer)
+	if err != nil {
+		return
+	}
+
+	isAuthPacket, newSerialNumber := p.verifyAuthPacket(buffer[:n])
+	if !isAuthPacket {
+		return
+	}
+	debug("new authed address [%d]: %s", newSerialNumber, conn.RemoteAddr().String())
+
+	oldSerialNumber := p.serialNumber.Load()
+	if newSerialNumber <= oldSerialNumber {
+		return
+	}
+	if !p.serialNumber.CompareAndSwap(oldSerialNumber, newSerialNumber) {
+		return
+	}
+
+	// auth success
+	clientConn := &tcpClientConn{conn}
+	if err := p.sendAuthPacket(clientConn); err != nil {
+		return
+	}
+
+	p.setClientConn(&clientConnHolder{clientConn})
+
+	_ = conn.SetReadDeadline(time.Time{})
+	for {
+		n, err := recvUdpPacket(conn, buffer)
+		if err != nil { // server ignore TCP frontend error
+			return
+		}
+		if _, err := p.backendConn.Write(buffer[:n]); err != nil {
+			warning("write to backend failed: %v", err)
+		}
+	}
+}
+
+func (p *serverProxy) tcpServeFrontendListener(listener *net.TCPListener) {
+	defer func() { _ = listener.Close() }()
+	beginTime := time.Now()
+	neverAccepted := true
+
+	for {
+		_ = listener.SetDeadline(time.Now().Add(p.args.ConnectTimeout))
+		conn, err := listener.AcceptTCP()
+		if err != nil {
+			if neverAccepted && time.Since(beginTime) > p.args.ConnectTimeout-10*time.Millisecond {
+				return
+			}
+			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+				continue
+			}
+			warning("frontend accept tcp failed: %v", err)
+			time.Sleep(10 * time.Millisecond)
+			continue
+		}
+		neverAccepted = false
+		go p.tcpFrontendToBackend(conn)
+	}
+}
+
+func (p *serverProxy) backendToFrontend() {
+	buffer := make([]byte, 0xffff)
+	for {
+		n, _, err := p.backendConn.ReadFromUDP(buffer)
+		if err != nil || n <= 0 {
+			warning("backend read udp failed: %v", err)
+			time.Sleep(10 * time.Millisecond)
+			continue
+		}
+		if inputChecker != nil && inputChecker.isTimeout() {
+			p.pktCache.addPacket(buffer[:n])
+			continue
+		}
+		if conn := p.clientConn.Load(); conn != nil {
+			if p.pktCache.size > 0 {
+				totalSize, totalCount, flushSize, flushCount := p.pktCache.flushCache(conn.Write)
+				if enableDebugLogging {
+					debug("total packet cache count [%d] cache size [%d]", totalCount, totalSize)
+					debug("flush packet cache count [%d] cache size [%d]", flushCount, flushSize)
+				}
+			}
+			_ = conn.Write(buffer[:n])
+		}
+	}
+}
+
+func (p *serverProxy) serveProxy() {
+	if p.args.TCP {
+		for _, c := range p.frontendList {
+			if listener, ok := c.(*net.TCPListener); ok {
+				go p.tcpServeFrontendListener(listener)
+			}
+		}
+	} else {
+		p.bufChan = make(chan *udpBuffer) // unbuffered channel to avaid copying buffer
+		for _, c := range p.frontendList {
+			if conn, ok := c.(*net.UDPConn); ok {
+				_ = conn.SetReadBuffer(kProxyBufferSize)
+				_ = conn.SetWriteBuffer(kProxyBufferSize)
+				go p.udpServeFrontendConn(conn)
+			}
+		}
+		go p.udpFrontendToBackend()
+	}
+
 	_ = p.backendConn.SetReadBuffer(kProxyBufferSize)
 	_ = p.backendConn.SetWriteBuffer(kProxyBufferSize)
-	go p.frontendToBackend()
 	go p.backendToFrontend()
 }
 
-func startServerProxy(frontendList []*net.UDPConn, info *ServerInfo, connectTimeout time.Duration) ([]*net.UDPConn, error) {
+func startServerProxy(args *tsshdArgs, info *ServerInfo, frontendList []io.Closer) ([]io.Closer, error) {
 	localAddr := "127.0.0.1:0"
 	udpAddr, err := net.ResolveUDPAddr("udp", localAddr)
 	if err != nil {
@@ -274,34 +537,84 @@ func startServerProxy(frontendList []*net.UDPConn, info *ServerInfo, connectTime
 		return nil, fmt.Errorf("rand server id failed: %v", err)
 	}
 
+	if args.TCP {
+		info.ProxyMode = kProxyModeTCP
+	}
 	info.ProxyKey = fmt.Sprintf("%x", proxyKey)
 	info.ClientID = binary.BigEndian.Uint64(clientID)
 	info.ServerID = binary.BigEndian.Uint64(serverID)
 
 	proxy := &serverProxy{
-		connectTimeout: connectTimeout,
-		frontendList:   frontendList,
-		backendConn:    backendConn,
-		cipherBlock:    &cipherBlock,
-		clientID:       info.ClientID,
-		serverID:       info.ServerID,
-		bufChan:        make(chan *udpBuffer), // unbuffered channel to avaid copying buffer
+		args:         args,
+		frontendList: frontendList,
+		backendConn:  backendConn,
+		cipherBlock:  &cipherBlock,
+		clientID:     info.ClientID,
+		serverID:     info.ServerID,
 	}
 	go proxy.serveProxy()
 
-	return []*net.UDPConn{serverConn}, nil
+	return []io.Closer{serverConn}, nil
+}
+
+type serverConnection interface {
+	Close()
+	Read([]byte) (int, error)
+	Write([]byte) error
+}
+
+type tcpServerConn struct {
+	conn net.Conn
+}
+
+func (t *tcpServerConn) Close() {
+	_ = t.conn.Close()
+}
+
+func (t *tcpServerConn) Read(buf []byte) (int, error) {
+	return recvUdpPacket(t.conn, buf)
+}
+
+func (t *tcpServerConn) Write(buf []byte) error {
+	return sendUdpPacket(t.conn, buf)
+}
+
+type udpServerConn struct {
+	conn *net.UDPConn
+}
+
+func (u *udpServerConn) Close() {
+	_ = u.conn.Close()
+}
+
+func (u *udpServerConn) Read(buf []byte) (int, error) {
+	n, _, err := u.conn.ReadFromUDP(buf)
+	return n, err
+}
+
+func (u *udpServerConn) Write(buf []byte) error {
+	_, err := u.conn.Write(buf)
+	return err
+}
+
+type serverConnHolder struct {
+	serverConnection
 }
 
 type clientProxy struct {
+	client       *SshUdpClient
 	frontendConn *net.UDPConn
-	backendConn  atomic.Pointer[net.UDPConn]
-	serverAddr   *net.UDPAddr
+	backendConn  atomic.Pointer[serverConnHolder]
+	proxyMode    string
+	serverNet    string
+	serverAddr   string
 	clientAddr   atomic.Pointer[net.UDPAddr]
 	cipherBlock  *cipher.Block
 	clientID     uint64
 	serverID     uint64
 	renewMutex   sync.Mutex
 	serialNumber uint64
+	pktCache     packetCache
 }
 
 func (p *clientProxy) isClientAddr(addr *net.UDPAddr) bool {
@@ -320,6 +633,8 @@ func (p *clientProxy) frontendToBackend() {
 	for {
 		n, addr, err := p.frontendConn.ReadFromUDP(buffer)
 		if err != nil || n <= 0 {
+			p.client.warning("frontend read udp failed: %v", err)
+			time.Sleep(10 * time.Millisecond)
 			continue
 		}
 		if p.clientAddr.Load() == nil {
@@ -329,9 +644,9 @@ func (p *clientProxy) frontendToBackend() {
 			continue
 		}
 		if conn := p.backendConn.Load(); conn != nil {
-			_, _ = conn.Write(buffer[:n])
+			_ = conn.Write(buffer[:n])
 		} else {
-			time.Sleep(10 * time.Millisecond) // wait for reconnect
+			p.pktCache.addPacket(buffer[:n])
 		}
 	}
 }
@@ -340,12 +655,15 @@ func (p *clientProxy) backendToFrontend() {
 	buffer := make([]byte, 0xffff)
 	for {
 		if conn := p.backendConn.Load(); conn != nil {
-			n, _, err := conn.ReadFromUDP(buffer)
-			if err != nil || n <= 0 {
+			n, err := conn.Read(buffer)
+			if err != nil || n <= 0 { // client ignore backend error
+				time.Sleep(10 * time.Millisecond)
 				continue
 			}
 			if addr := p.clientAddr.Load(); addr != nil {
-				_, _ = p.frontendConn.WriteToUDP(buffer[:n], addr)
+				if _, err := p.frontendConn.WriteToUDP(buffer[:n], addr); err != nil {
+					p.client.warning("write to frontend failed: %v", err)
+				}
 			}
 		} else {
 			time.Sleep(10 * time.Millisecond) // wait for reconnect
@@ -353,36 +671,95 @@ func (p *clientProxy) backendToFrontend() {
 	}
 }
 
-func (p *clientProxy) renewUdpPath(connectTimeout time.Duration) error {
+func (p *clientProxy) renewTransportPath(connectTimeout time.Duration) error {
 	p.renewMutex.Lock()
 	defer p.renewMutex.Unlock()
 	p.serialNumber++
 
 	if conn := p.backendConn.Load(); conn != nil {
-		_ = conn.Close()
+		conn.Close()
 		p.backendConn.Store(nil)
 	}
 
-	newConn, err := net.DialUDP("udp", nil, p.serverAddr)
-	if err != nil {
-		return fmt.Errorf("dial udp [%s] failed: %v", p.serverAddr.String(), err)
+	var err error
+	if p.proxyMode == kProxyModeTCP {
+		err = p.renewTcpPath(connectTimeout)
+	} else {
+		err = p.renewUdpPath(connectTimeout)
 	}
-	_ = newConn.SetReadBuffer(kProxyBufferSize)
-	_ = newConn.SetWriteBuffer(kProxyBufferSize)
+	if err != nil {
+		return err
+	}
+
+	totalSize, totalCount, flushSize, flushCount := p.pktCache.flushCache(p.backendConn.Load().Write)
+	if enableDebugLogging {
+		p.client.debug("total packet cache count [%d] cache size [%d]", totalCount, totalSize)
+		p.client.debug("flush packet cache count [%d] cache size [%d]", flushCount, flushSize)
+	}
+	return nil
+}
+
+func (p *clientProxy) renewTcpPath(connectTimeout time.Duration) error {
+	conn, err := net.DialTimeout(p.serverNet, p.serverAddr, connectTimeout)
+	if err != nil {
+		return fmt.Errorf("dial [%s] [%s] failed: %v", p.serverNet, p.serverAddr, err)
+	}
+
+	svrConn := serverConnHolder{&tcpServerConn{conn}}
+
+	if err := p.sendAuthPacket(svrConn); err != nil {
+		_ = conn.Close()
+		return err
+	}
+
+	if err := conn.SetReadDeadline(time.Now().Add(connectTimeout)); err != nil {
+		return fmt.Errorf("set read deadline failed: %v", err)
+	}
+
+	buffer := make([]byte, 256)
+	n, err := recvUdpPacket(conn, buffer)
+	if err != nil {
+		_ = conn.Close()
+		return fmt.Errorf("recv auth packet failed: %v", err)
+	}
+
+	if !p.isAuthSuccessful(buffer[:n]) {
+		_ = conn.Close()
+		return fmt.Errorf("proxy auth failed")
+	}
+	p.client.debug("serial number [%d] auth success", p.serialNumber)
+
+	_ = conn.SetReadDeadline(time.Time{})
+	p.backendConn.Store(&svrConn)
+	return nil
+}
+
+func (p *clientProxy) renewUdpPath(connectTimeout time.Duration) error {
+	serverAddr, err := net.ResolveUDPAddr(p.serverNet, p.serverAddr)
+	if err != nil {
+		return fmt.Errorf("resolve addr [%s] [%s] failed: %v", p.serverNet, p.serverAddr, err)
+	}
+	conn, err := net.DialUDP("udp", nil, serverAddr)
+	if err != nil {
+		return fmt.Errorf("dial [%s] [%s] failed: %v", p.serverNet, p.serverAddr, err)
+	}
+	_ = conn.SetReadBuffer(kProxyBufferSize)
+	_ = conn.SetWriteBuffer(kProxyBufferSize)
+	svrConn := serverConnHolder{&udpServerConn{conn}}
 
 	ctx, cancel := context.WithTimeout(context.Background(), connectTimeout)
 	defer cancel()
 	go func() {
-		p.sendAuthPacket(newConn)
+		_ = p.sendAuthPacket(svrConn)
 		for {
 			select {
 			case <-ctx.Done():
 				if err := ctx.Err(); err != nil && errors.Is(err, context.DeadlineExceeded) {
-					_ = newConn.Close()
+					_ = conn.Close()
 				}
 				return
 			case <-time.After(100 * time.Millisecond):
-				p.sendAuthPacket(newConn)
+				_ = p.sendAuthPacket(svrConn)
 			}
 		}
 	}()
@@ -390,29 +767,31 @@ func (p *clientProxy) renewUdpPath(connectTimeout time.Duration) error {
 	buffer := make([]byte, 256)
 	for {
 		if err := ctx.Err(); err != nil {
-			_ = newConn.Close()
-			return fmt.Errorf("renew udp path to [%s] failed: %v", p.serverAddr.String(), err)
+			_ = conn.Close()
+			return fmt.Errorf("renew path to [%s] [%s] failed: %v", p.serverNet, serverAddr.String(), err)
 		}
-		n, _, err := newConn.ReadFromUDP(buffer)
+		n, _, err := conn.ReadFromUDP(buffer)
 		if err != nil || n <= 0 {
-			continue
+			_ = conn.Close()
+			return fmt.Errorf("read auth packet failed: %v", err)
 		}
 		if p.isAuthSuccessful(buffer[:n]) {
-			p.backendConn.Store(newConn)
+			p.client.debug("serial number [%d] auth success", p.serialNumber)
+			p.backendConn.Store(&svrConn)
 			return nil
 		}
 	}
 }
 
-func (p *clientProxy) sendAuthPacket(conn *net.UDPConn) {
+func (p *clientProxy) sendAuthPacket(conn serverConnection) error {
 	data := make([]byte, 16)
 	binary.BigEndian.PutUint64(data[0:8], p.clientID)
 	binary.BigEndian.PutUint64(data[8:16], p.serialNumber)
 	buf := aesEncrypt(p.cipherBlock, data)
 	if buf == nil {
-		return
+		return fmt.Errorf("aes encrypt failed")
 	}
-	_, _ = conn.Write(buf)
+	return conn.Write(buf)
 }
 
 func (p *clientProxy) isAuthSuccessful(buf []byte) bool {
@@ -439,7 +818,7 @@ func (p *clientProxy) serveProxy() {
 	go p.backendToFrontend()
 }
 
-func startClientProxy(svrAddr string, info *ServerInfo) (string, *clientProxy, error) {
+func startClientProxy(client *SshUdpClient, serverNet, serverAddr string, info *ServerInfo) (string, *clientProxy, error) {
 	proxyKey, err := hex.DecodeString(info.ProxyKey)
 	if err != nil {
 		return "", nil, fmt.Errorf("decode proxy key [%s] failed: %v", info.ProxyKey, err)
@@ -459,13 +838,12 @@ func startClientProxy(svrAddr string, info *ServerInfo) (string, *clientProxy, e
 		return "", nil, fmt.Errorf("listen udp on [%s] failed: %v", localAddr, err)
 	}
 	proxyAddr := frontendConn.LocalAddr().String()
-	serverAddr, err := net.ResolveUDPAddr("udp", svrAddr)
-	if err != nil {
-		return "", nil, fmt.Errorf("resolve udp addr [%s] failed: %v", svrAddr, err)
-	}
 
 	proxy := &clientProxy{
+		client:       client,
 		frontendConn: frontendConn,
+		proxyMode:    info.ProxyMode,
+		serverNet:    serverNet,
 		serverAddr:   serverAddr,
 		cipherBlock:  &cipherBlock,
 		clientID:     info.ClientID,

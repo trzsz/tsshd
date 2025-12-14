@@ -27,6 +27,7 @@ package tsshd
 import (
 	"context"
 	"fmt"
+	"sync"
 	"sync/atomic"
 	"time"
 )
@@ -40,8 +41,14 @@ var globalSetting = &globalSettings{}
 var enableDebugLogging bool = false
 var enableWarningLogging bool = false
 
-var clientDebug func(string, ...any)
-var clientWarning func(string, ...any)
+var clientDebug func(int64, string)
+var clientWarningFunc func(string)
+
+var debugMsgChan chan *debugMessage
+var initDebugSenderOnce sync.Once
+
+var warningMsgChan chan string
+var initWarningSenderOnce sync.Once
 
 func debug(format string, a ...any) {
 	if !enableDebugLogging {
@@ -51,13 +58,28 @@ func debug(format string, a ...any) {
 	msg := fmt.Sprintf(format, a...)
 
 	if clientDebug != nil {
-		go clientDebug("%s", msg)
+		// should not reach here
+		clientDebug(time.Now().UnixMilli(), fmt.Sprintf("[fix_me] %s", msg))
+		return
 	}
 
-	_, _ = doWithTimeout(func() (int, error) {
-		_ = sendBusMessage("debug", debugMessage{Msg: msg})
-		return 0, nil
-	}, 100*time.Millisecond)
+	initDebugSenderOnce.Do(func() {
+		debugMsgChan = make(chan *debugMessage, 100)
+		go func() {
+			for busStream == nil {
+				time.Sleep(10 * time.Millisecond)
+			}
+			for msg := range debugMsgChan {
+				_ = sendBusMessage("debug", msg)
+			}
+		}()
+	})
+
+	dbgMsg := &debugMessage{Msg: msg, Time: time.Now().UnixMilli()}
+	select {
+	case debugMsgChan <- dbgMsg:
+	default:
+	}
 }
 
 func warning(format string, a ...any) {
@@ -67,12 +89,28 @@ func warning(format string, a ...any) {
 
 	msg := fmt.Sprintf(format, a...)
 
-	if clientWarning != nil {
-		go clientWarning("%s", msg)
+	if clientWarningFunc != nil {
+		// should not reach here
+		clientWarningFunc(fmt.Sprintf("[fix_me] %s", msg))
 		return
 	}
 
-	go func() { _ = sendBusMessage("error", errorMessage{Msg: msg}) }()
+	initWarningSenderOnce.Do(func() {
+		warningMsgChan = make(chan string, 10)
+		go func() {
+			for busStream == nil {
+				time.Sleep(10 * time.Millisecond)
+			}
+			for msg := range warningMsgChan {
+				_ = sendBusMessage("error", errorMessage{Msg: msg})
+			}
+		}()
+	})
+
+	select {
+	case warningMsgChan <- msg:
+	default:
+	}
 }
 
 func doWithTimeout[T any](task func() (T, error), timeout time.Duration) (T, error) {
@@ -96,5 +134,59 @@ func doWithTimeout[T any](task func() (T, error), timeout time.Duration) (T, err
 		return ret, fmt.Errorf("timeout exceeded %v", timeout)
 	case res := <-done:
 		return res.ret, res.err
+	}
+}
+
+type timeoutChecker struct {
+	timeoutMilli    int64
+	timeoutCallback func(bool)
+	timeoutFlag     atomic.Bool
+	lastAliveTime   atomic.Int64
+}
+
+func newTimeoutChecker(timeout time.Duration, callback func(bool)) *timeoutChecker {
+	tc := &timeoutChecker{timeoutMilli: int64(timeout / time.Millisecond), timeoutCallback: callback}
+	tc.lastAliveTime.Store(time.Now().UnixMilli())
+	if tc.timeoutMilli > 0 {
+		go tc.checkTimeout()
+	}
+	return tc
+}
+
+func (tc *timeoutChecker) isTimeout() bool {
+	return tc.timeoutFlag.Load()
+}
+
+func (tc *timeoutChecker) getAliveTime() int64 {
+	return tc.lastAliveTime.Load()
+}
+
+func (tc *timeoutChecker) updateTime(ms int64) {
+	tc.lastAliveTime.Store(ms)
+	if tc.timeoutFlag.Load() {
+		tc.timeoutFlag.Store(false)
+		tc.timeoutCallback(tc.timeoutFlag.Load())
+	}
+}
+
+func (tc *timeoutChecker) checkTimeout() {
+	for {
+		sleepTime := tc.lastAliveTime.Load() + tc.timeoutMilli - time.Now().UnixMilli()
+		if sleepTime > 0 {
+			time.Sleep(time.Duration(sleepTime) * time.Millisecond)
+			continue
+		}
+		// timeout
+		if !tc.timeoutFlag.Load() {
+			tc.timeoutFlag.Store(true)
+			tc.timeoutCallback(tc.timeoutFlag.Load())
+			time.Sleep(10 * time.Millisecond)
+			if tc.timeoutFlag.Load() && tc.lastAliveTime.Load()+tc.timeoutMilli > time.Now().UnixMilli() {
+				tc.timeoutFlag.Store(false)
+				tc.timeoutCallback(tc.timeoutFlag.Load())
+				continue
+			}
+		}
+		time.Sleep(time.Duration(tc.timeoutMilli) * time.Millisecond)
 	}
 }
