@@ -54,38 +54,38 @@ type x11Request struct {
 type agentRequest struct {
 }
 
-type udpClient interface {
-	closeClient() error
-	newStream(connectTimeout time.Duration) (net.Conn, error)
-}
-
 // SshUdpClient implements a UDP SSH client
 type SshUdpClient struct {
-	client          udpClient
-	proxy           *clientProxy
+	proxyClient     *SshUdpClient
+	protoClient     protocolClient
+	networkProxy    *clientProxy
+	intervalTime    time.Duration
 	connectTimeout  time.Duration
 	waitGroup       sync.WaitGroup
 	closed          atomic.Bool
 	busMutex        sync.Mutex
-	busStream       net.Conn
+	busStream       Stream
+	busClosed       chan struct{}
 	sessionMutex    sync.Mutex
 	sessionID       atomic.Uint64
 	sessionMap      map[uint64]*SshUdpSession
 	channelMutex    sync.Mutex
 	channelMap      map[string]chan ssh.NewChannel
-	aliveCallback   func(int64)
-	aliveNewVer     bool
 	quitCallback    func(string)
 	discardCallback func([]byte, []byte)
 	enableDebugging bool
 	clientDebugFunc func(int64, string)
 	enableWarning   bool
 	clientWarningFn func(string)
-	outputChecker   *timeoutChecker
+	activeChecker   *timeoutChecker
+	activeAckChan   chan int64
+	reconnectMutex  sync.Mutex
+	reconnectError  atomic.Pointer[error]
 }
 
 // UdpClientOptions contains all configuration parameters required to create and initialize a new SshUdpClient
 type UdpClientOptions struct {
+	ProxyClient      *SshUdpClient
 	EnableDebugging  bool
 	EnableWarning    bool
 	IPv4             bool
@@ -107,9 +107,15 @@ func NewSshUdpClient(opts *UdpClientOptions) (*SshUdpClient, error) {
 	enableDebugLogging, clientDebug = opts.EnableDebugging, opts.DebugFunc
 	enableWarningLogging, clientWarningFunc = opts.EnableWarning, opts.WarningFunc
 
+	if opts.ServerInfo.ServerVer == "" {
+		return nil, fmt.Errorf("please upgrade tsshd to continue")
+	}
+
 	udpClient := &SshUdpClient{
+		proxyClient:     opts.ProxyClient,
 		sessionMap:      make(map[uint64]*SshUdpSession),
 		channelMap:      make(map[string]chan ssh.NewChannel),
+		intervalTime:    opts.IntervalTime,
 		connectTimeout:  opts.ConnectTimeout,
 		quitCallback:    opts.QuitCallback,
 		discardCallback: opts.DiscardCallback,
@@ -119,54 +125,46 @@ func NewSshUdpClient(opts *UdpClientOptions) (*SshUdpClient, error) {
 		clientWarningFn: opts.WarningFunc,
 	}
 
-	network := "udp"
-	if opts.ServerInfo.ProxyMode == kProxyModeTCP {
-		network = "tcp"
-	}
-	if opts.IPv4 && !opts.IPv6 {
-		network += "4"
-	} else if opts.IPv6 && !opts.IPv4 {
-		network += "6"
-	}
-
 	var err error
 	var tsshdAddr string
-	if opts.ServerInfo.ProxyKey != "" {
-		tsshdAddr, udpClient.proxy, err = startClientProxy(udpClient, network, opts.TsshdAddr, opts.ServerInfo)
-		if err != nil {
-			return nil, err
-		}
-		if err := udpClient.proxy.renewTransportPath(opts.ConnectTimeout); err != nil {
-			return nil, err
-		}
-	} else {
-		addr, err := net.ResolveUDPAddr(network, opts.TsshdAddr)
-		if err != nil {
-			return nil, fmt.Errorf("resolve [%s] addr [%s] failed: %v", network, opts.TsshdAddr, err)
-		}
-		tsshdAddr = addr.String()
+	tsshdAddr, udpClient.networkProxy, err = startClientProxy(udpClient, opts)
+	if err != nil {
+		return nil, err
+	}
+	if err := udpClient.networkProxy.renewTransportPath(opts.ProxyClient, opts.ConnectTimeout); err != nil {
+		return nil, err
 	}
 
-	udpClient.client, err = newUdpClient(tsshdAddr, opts.ServerInfo, opts.ConnectTimeout)
+	udpClient.protoClient, err = newProtoClient(tsshdAddr, opts.ServerInfo, opts.ConnectTimeout)
 	if err != nil {
 		return nil, err
 	}
 
-	udpClient.outputChecker = newTimeoutChecker(opts.HeartbeatTimeout, func(timeout bool) {
-		if timeout {
-			udpClient.debug("input forwarding blocked due to no server output for [%v]", opts.HeartbeatTimeout)
-		} else {
-			udpClient.debug("input forwarding resumed after receiving server output")
+	udpClient.activeChecker = newTimeoutChecker(opts.HeartbeatTimeout)
+	if enableDebugLogging {
+		udpClient.activeChecker.onTimeout(func() {
+			udpClient.debug("transport offline, last activity at %v", time.UnixMilli(udpClient.activeChecker.getAliveTime()).Format("15:04:05.000"))
+		})
+		udpClient.activeChecker.onReconnected(func() {
+			udpClient.debug("transport resumed, last activity at %v", time.UnixMilli(udpClient.activeChecker.getAliveTime()).Format("15:04:05.000"))
+		})
+	}
+	udpClient.activeChecker.onReconnected(func() {
+		totalSize, totalCount := udpClient.networkProxy.pktCache.clearCache()
+		if enableDebugLogging {
+			udpClient.debug("drop packet cache count [%d] cache size [%d]", totalCount, totalSize)
 		}
 	})
+	udpClient.activeChecker.onTimeout(udpClient.tryToReconnect)
 
 	busStream, err := udpClient.newStream("bus")
 	if err != nil {
 		return nil, err
 	}
 	if err := sendMessage(busStream, busMessage{
-		Timeout:          opts.AliveTimeout,
-		Interval:         opts.IntervalTime,
+		ClientVer:        kTsshdVersion,
+		AliveTimeout:     opts.AliveTimeout,
+		IntervalTime:     opts.IntervalTime,
 		HeartbeatTimeout: opts.HeartbeatTimeout}); err != nil {
 		_ = busStream.Close()
 		return nil, fmt.Errorf("send bus message failed: %w", err)
@@ -176,8 +174,11 @@ func NewSshUdpClient(opts *UdpClientOptions) (*SshUdpClient, error) {
 		return nil, err
 	}
 
-	udpClient.busStream = busStream
+	udpClient.busStream, udpClient.busClosed = busStream, make(chan struct{})
 	go udpClient.handleBusEvent()
+
+	udpClient.activeAckChan = make(chan int64, 1)
+	go udpClient.keepAlive(opts.IntervalTime)
 
 	return udpClient, nil
 }
@@ -218,19 +219,20 @@ func (c *SshUdpClient) Close() error {
 		} else {
 			c.debug("send cmd [close] completed")
 		}
-		// UDP connections do not support half-close (write-only close) for now,
-		// so we add extra wait time to allow all incoming data to be received.
-		time.Sleep(200 * time.Millisecond) // give udp some time
-		if err := c.busStream.Close(); err != nil {
-			c.debug("close bus stream failed: %v", err)
-		} else {
+		_ = c.busStream.CloseWrite()
+
+		select {
+		case <-c.busClosed:
 			c.debug("close bus stream completed")
+		case <-time.After(280 * time.Millisecond):
+			c.debug("close bus stream timeout")
 		}
+		_ = c.busStream.Close()
 		return 0, nil
 	}, 300*time.Millisecond)
 
 	_, err := doWithTimeout(func() (int, error) {
-		err := c.client.closeClient()
+		err := c.protoClient.closeClient()
 		if err != nil {
 			c.debug("close client failed: %v", err)
 		} else {
@@ -239,48 +241,26 @@ func (c *SshUdpClient) Close() error {
 		return 0, err
 	}, 200*time.Millisecond)
 
+	c.networkProxy.Close()
+	c.activeChecker.Close()
+
 	return err
 }
 
-// Reconnect creates a new UDP path to the server
-func (c *SshUdpClient) Reconnect(timeout time.Duration) error {
-	if c.proxy == nil {
-		return fmt.Errorf("no proxy for connection migration")
+func (c *SshUdpClient) newStream(cmd string) (Stream, error) {
+	stream, err := c.protoClient.newStream(c.connectTimeout)
+	if err != nil {
+		return nil, fmt.Errorf("new stream [%s] failed: %w", cmd, err)
 	}
-
-	if err := c.proxy.renewTransportPath(timeout); err != nil {
-		return err
-	}
-
-	c.outputChecker.updateTime(time.Now().UnixMilli())
-
-	if err := c.sendBusCommand("alive"); err != nil { // ping the server
-		return fmt.Errorf("ping server failed: %w", err)
-	}
-
-	return nil
-}
-
-func (c *SshUdpClient) newStream(cmd string) (net.Conn, error) {
-	stream, err := doWithTimeout(func() (net.Conn, error) {
-		stream, err := c.client.newStream(c.connectTimeout)
-		if err != nil {
-			return nil, fmt.Errorf("new stream [%s] failed: %w", cmd, err)
-		}
-		if err = sendCommand(stream, cmd); err != nil {
-			return stream, fmt.Errorf("send command [%s] failed: %w", cmd, err)
-		}
-		if err = recvError(stream); err != nil {
-			return stream, fmt.Errorf("new stream [%s] error: %w", cmd, err)
-		}
-		return stream, nil
-	}, c.connectTimeout)
-
-	if err != nil && stream != nil {
+	if err := sendCommand(stream, cmd); err != nil {
 		_ = stream.Close()
+		return nil, fmt.Errorf("send command [%s] failed: %w", cmd, err)
 	}
-
-	return stream, err
+	if err := recvError(stream); err != nil {
+		_ = stream.Close()
+		return nil, fmt.Errorf("new stream [%s] error: %w", cmd, err)
+	}
+	return stream, nil
 }
 
 // NewSession opens a new Session for this client
@@ -300,13 +280,13 @@ func (c *SshUdpClient) NewSession() (*SshUdpSession, error) {
 }
 
 // DialTimeout initiates a connection to the addr from the remote host
-func (c *SshUdpClient) DialTimeout(network, addr string, timeout time.Duration) (net.Conn, error) {
+func (c *SshUdpClient) DialTimeout(network, addr string, timeout time.Duration) (Stream, error) {
 	stream, err := c.newStream("dial")
 	if err != nil {
 		return nil, err
 	}
 	msg := dialMessage{
-		Network: network,
+		Net:     network,
 		Addr:    addr,
 		Timeout: timeout,
 	}
@@ -314,12 +294,46 @@ func (c *SshUdpClient) DialTimeout(network, addr string, timeout time.Duration) 
 		_ = stream.Close()
 		return nil, fmt.Errorf("send dial message failed: %w", err)
 	}
-	if err := recvError(stream); err != nil {
+	var resp dialResponse
+	if err := recvResponse(stream, &resp); err != nil {
 		_ = stream.Close()
 		return nil, err
 	}
 	c.waitGroup.Add(1)
-	return &sshUdpConn{Conn: stream, client: c}, nil
+	return &sshUdpConn{Stream: stream, rAddr: resp.RemoteAddr, client: c}, nil
+}
+
+// DialUDP initiates a logical UDP connection to the addr from the remote host
+func (c *SshUdpClient) DialUDP(network, addr string) (PacketConn, error) {
+	stream, err := c.newStream("dial-udp")
+	if err != nil {
+		return nil, err
+	}
+
+	msg := dialUdpMessage{
+		Net:  network,
+		Addr: addr,
+	}
+	if err := sendMessage(stream, &msg); err != nil {
+		_ = stream.Close()
+		return nil, fmt.Errorf("send dial udp message failed: %w", err)
+	}
+	var resp dialUdpResponse
+	if err := recvResponse(stream, &resp); err != nil {
+		_ = stream.Close()
+		return nil, err
+	}
+
+	conn := newPacketConn(stream, resp.ID, c.protoClient.getUdpForwarder(), c.networkProxy.serverChecker)
+
+	var ok udpReadyMessage
+	if err := sendMessage(stream, &ok); err != nil {
+		_ = conn.Close()
+		return nil, fmt.Errorf("send udp ready message failed: %w", err)
+	}
+
+	c.waitGroup.Add(1)
+	return &sshUdpPacketConn{conn, c}, nil
 }
 
 // Listen requests the remote peer open a listening socket on addr
@@ -329,8 +343,8 @@ func (c *SshUdpClient) Listen(network, addr string) (net.Listener, error) {
 		return nil, err
 	}
 	msg := listenMessage{
-		Network: network,
-		Addr:    addr,
+		Net:  network,
+		Addr: addr,
 	}
 	if err := sendMessage(stream, &msg); err != nil {
 		_ = stream.Close()
@@ -367,16 +381,9 @@ func (c *SshUdpClient) SendRequest(name string, wantReply bool, payload []byte) 
 	return false, nil, fmt.Errorf("ssh udp client SendRequest is not supported yet")
 }
 
-// KeepAlive send heartbeat packets to the server
-func (c *SshUdpClient) KeepAlive(aliveTime int64, aliveCallback func(int64)) error {
-	if c.IsClosed() {
-		return nil
-	}
-	if !c.aliveNewVer {
-		_ = c.sendBusCommand("alive")
-	}
-	c.aliveCallback = aliveCallback
-	return c.sendBusMessage("alive2", aliveMessage{aliveTime})
+// SetKeepPendingInput sets whether to keep the pending input during reconnection.
+func (c *SshUdpClient) SetKeepPendingInput(keep bool) error {
+	return c.sendBusMessage("setting", settingsMessage{KeepPendingInput: &keep})
 }
 
 // IsClosed returns whether the client has closed
@@ -384,80 +391,93 @@ func (c *SshUdpClient) IsClosed() bool {
 	return c.closed.Load()
 }
 
-// ForwardUDPv1 forwards UDP packets for proxy jump
-func (c *SshUdpClient) ForwardUDPv1(addr string, timeout time.Duration) (string, error) {
-	localAddr := "127.0.0.1:0"
-	udpAddr, err := net.ResolveUDPAddr("udp", localAddr)
-	if err != nil {
-		return "", fmt.Errorf("resolve udp addr [%s] failed: %w", localAddr, err)
-	}
-	localConn, err := net.ListenUDP("udp", udpAddr)
-	if err != nil {
-		return "", fmt.Errorf("listen udp on [%s] failed: %w", localAddr, err)
-	}
-	localAddr = localConn.LocalAddr().String()
+// GetLastActiveTime returns the last confirmed two-way activity time in milliseconds
+func (c *SshUdpClient) GetLastActiveTime() int64 {
+	return c.activeChecker.getAliveTime()
+}
 
-	stream, err := c.newStream("UDPv1")
-	if err != nil {
-		_ = localConn.Close()
-		return "", err
-	}
-	if err := sendMessage(stream, &udpv1Message{addr, timeout}); err != nil {
-		_ = stream.Close()
-		_ = localConn.Close()
-		return "", fmt.Errorf("send UDPv1 message failed: %w", err)
-	}
-	if err := recvError(stream); err != nil {
-		_ = stream.Close()
-		_ = localConn.Close()
-		return "", err
-	}
-
-	_ = localConn.SetReadBuffer(kProxyBufferSize)
-	_ = localConn.SetWriteBuffer(kProxyBufferSize)
-	go func() {
-		buffer := make([]byte, 0xffff)
-		for !c.IsClosed() {
-			n, addr, err := localConn.ReadFromUDP(buffer)
-			if err != nil || n <= 0 {
-				continue
-			}
-			for c.outputChecker.isTimeout() {
-				time.Sleep(10 * time.Millisecond)
-			}
-			if err := sendUDPv1Packet(stream, uint16(addr.Port), buffer[:n]); err != nil && !c.IsClosed() {
-				c.warning("UDPv1 forward send failed: %v", err)
-			}
+// GetLastReconnectError returns the last error encountered during reconnection attempts
+func (c *SshUdpClient) GetLastReconnectError() error {
+	client := c
+	err := client.reconnectError.Load()
+	for client.proxyClient != nil {
+		client = client.proxyClient
+		if e := client.reconnectError.Load(); e != nil {
+			err = e
 		}
-	}()
+	}
+	if err != nil {
+		return *err
+	}
+	return nil
+}
 
-	go func() {
-		localUdpAddr := udpAddr
-		for !c.IsClosed() {
-			port, data, err := recvUDPv1Packet(stream)
-			c.outputChecker.updateTime(time.Now().UnixMilli())
-			if err != nil {
-				if !c.IsClosed() {
-					c.warning("UDPv1 forward recv failed: %v", err)
-				}
+func (c *SshUdpClient) tryToReconnect() {
+	c.reconnectMutex.Lock()
+	defer c.reconnectMutex.Unlock()
+
+	if c.proxyClient != nil {
+		// prioritize allowing the proxy to reconnect first
+		time.Sleep(c.proxyClient.intervalTime)
+
+		// wait for the proxy to reconnect first
+		if c.proxyClient.activeChecker.isTimeout() {
+			if c.proxyClient.activeChecker.waitUntilReconnected() != nil {
+				c.debug("proxy server timeout and closed")
 				return
 			}
-			localUdpAddr.Port = int(port)
-			_, _ = localConn.WriteToUDP(data, localUdpAddr)
 		}
-	}()
 
-	return localAddr, nil
+		// wait for auto-recovery after proxy reconnection
+		time.Sleep(c.intervalTime)
+	}
+
+	for c.activeChecker.isTimeout() {
+		c.debug("attempting new transport path")
+		if err := c.networkProxy.renewTransportPath(c.proxyClient, c.connectTimeout); err != nil {
+			c.debug("reconnect failed: %v", err)
+			c.reconnectError.Store(&err)
+			time.Sleep(c.intervalTime) // don't reconnect too frequently
+			continue
+		}
+
+		c.debug("new transport path established")
+		c.reconnectError.Store(nil)
+
+		// blocks until the server becomes active or a timeout occurs
+		for !c.networkProxy.serverChecker.isTimeout() {
+			time.Sleep(c.intervalTime)
+			if !c.activeChecker.isTimeout() {
+				return
+			}
+		}
+	}
 }
 
-// GetLastOutputTime returns the last server output time in milliseconds
-func (c *SshUdpClient) GetLastOutputTime() int64 {
-	return c.outputChecker.getAliveTime()
-}
+func (c *SshUdpClient) keepAlive(intervalTime time.Duration) {
+	ticker := time.NewTicker(intervalTime)
+	defer ticker.Stop()
 
-// SetKeepPendingInput sets whether to keep the pending input during reconnection.
-func (c *SshUdpClient) SetKeepPendingInput(keep bool) error {
-	return c.sendBusMessage("setting", settingsMessage{KeepPendingInput: &keep})
+	for range ticker.C {
+		if c.IsClosed() {
+			return
+		}
+
+		aliveTime := time.Now().UnixMilli()
+		if enableDebugLogging && c.activeChecker.isTimeout() {
+			c.debug("sending new keep alive [%d]", aliveTime)
+		}
+		if err := c.sendBusMessage("alive2", aliveMessage{aliveTime}); err != nil {
+			if !c.IsClosed() {
+				c.warning("send keep alive [%d] failed: %v", aliveTime, err)
+			}
+		} else if enableDebugLogging && c.activeChecker.isTimeout() {
+			c.debug("keep alive [%d] sent success", aliveTime)
+		}
+
+		ackTime := <-c.activeAckChan
+		c.activeChecker.updateTime(ackTime)
+	}
 }
 
 func (c *SshUdpClient) sendBusCommand(command string) error {
@@ -482,9 +502,9 @@ func (c *SshUdpClient) handleBusEvent() {
 			if !c.IsClosed() {
 				c.warning("recv bus command failed: %v", err)
 			}
+			close(c.busClosed)
 			return
 		}
-		c.outputChecker.updateTime(time.Now().UnixMilli())
 		switch command {
 		case "quit":
 			c.handleQuitEvent()
@@ -496,12 +516,10 @@ func (c *SshUdpClient) handleBusEvent() {
 			c.handleErrorEvent()
 		case "channel":
 			c.handleChannelEvent()
-		case "alive":
-			if c.aliveCallback != nil {
-				go c.aliveCallback(0)
-			}
+		case "alive1":
+			c.handleAlive1Event()
 		case "alive2":
-			c.handleAliveEvent()
+			c.handleAlive2Event()
 		case "discard":
 			c.handleDiscardEvent()
 		default:
@@ -592,16 +610,28 @@ func (c *SshUdpClient) handleChannelEvent() {
 	}
 }
 
-func (c *SshUdpClient) handleAliveEvent() {
+func (c *SshUdpClient) handleAlive1Event() {
 	var aliveMsg aliveMessage
 	if err := recvMessage(c.busStream, &aliveMsg); err != nil {
 		c.warning("recv alive message failed: %v", err)
 		return
 	}
-	if c.aliveCallback != nil {
-		go c.aliveCallback(aliveMsg.Time)
+
+	if err := c.sendBusMessage("alive1", aliveMsg); err != nil {
+		if !c.IsClosed() {
+			c.warning("send alive message failed: %v", err)
+		}
 	}
-	c.aliveNewVer = true
+}
+
+func (c *SshUdpClient) handleAlive2Event() {
+	var aliveMsg aliveMessage
+	if err := recvMessage(c.busStream, &aliveMsg); err != nil {
+		c.warning("recv alive message failed: %v", err)
+		return
+	}
+
+	c.activeAckChan <- aliveMsg.Time
 }
 
 func (c *SshUdpClient) handleDiscardEvent() {
@@ -620,16 +650,16 @@ type SshUdpSession struct {
 	id      uint64
 	wg      sync.WaitGroup
 	client  *SshUdpClient
-	stream  net.Conn
+	stream  Stream
 	pty     bool
 	height  int
 	width   int
 	envs    map[string]string
 	started bool
 	closed  atomic.Bool
-	stdin   io.Reader
-	stdout  io.WriteCloser
-	stderr  io.WriteCloser
+	stdin   *io.PipeReader
+	stdout  *io.PipeWriter
+	stderr  *io.PipeWriter
 	code    int
 	x11     *x11Request
 	agent   *agentRequest
@@ -649,7 +679,7 @@ func (s *SshUdpSession) Close() error {
 
 	_, err := doWithTimeout(func() (int, error) {
 		err := s.stream.Close()
-		s.client.debug("close session completed")
+		s.client.debug("close session stream completed")
 		return 0, err
 	}, 100*time.Millisecond)
 	return err
@@ -731,13 +761,22 @@ func (s *SshUdpSession) startSession(msg *startMessage) error {
 }
 
 func (s *SshUdpSession) forwardInput() {
-	defer func() { _ = s.stream.Close() }()
+	defer func() {
+		_ = s.stdin.Close()
+		if err := s.stream.CloseWrite(); err != nil {
+			// KCP streams do not support half-close. Close the entire stream to exit properly.
+			_ = s.stream.Close()
+		}
+	}()
 	buffer := make([]byte, 32*1024)
 	for {
 		n, err := s.stdin.Read(buffer)
 		if n > 0 {
-			for s.client.outputChecker.isTimeout() {
-				time.Sleep(10 * time.Millisecond)
+			if s.client.networkProxy.serverChecker.isTimeout() {
+				if s.client.networkProxy.serverChecker.waitUntilReconnected() != nil {
+					s.client.debug("session [%d] server timeout and closed", s.id)
+					break
+				}
 			}
 			if err := writeAll(s.stream, buffer[:n]); err != nil {
 				break
@@ -750,12 +789,14 @@ func (s *SshUdpSession) forwardInput() {
 	s.client.debug("session [%d] stdin completed", s.id)
 }
 
-func (s *SshUdpSession) forwardOutput(name string, reader io.Reader, writer io.WriteCloser) {
-	defer func() { _ = writer.Close() }()
+func (s *SshUdpSession) forwardOutput(name string, reader Stream, writer *io.PipeWriter) {
+	defer func() {
+		_ = writer.Close()
+		_ = reader.CloseRead()
+	}()
 	buffer := make([]byte, 32*1024)
 	for {
 		n, err := reader.Read(buffer)
-		s.client.outputChecker.updateTime(time.Now().UnixMilli())
 		if n > 0 {
 			if err := writeAll(writer, buffer[:n]); err != nil {
 				break
@@ -951,7 +992,7 @@ func (s *SshUdpSession) GetExitCode() int {
 
 type sshUdpListener struct {
 	client *SshUdpClient
-	stream net.Conn
+	stream Stream
 	closed atomic.Bool
 }
 
@@ -960,7 +1001,6 @@ func (l *sshUdpListener) Accept() (net.Conn, error) {
 	if err := recvMessage(l.stream, &msg); err != nil {
 		return nil, fmt.Errorf("recv accept message failed: %w", err)
 	}
-	l.client.outputChecker.updateTime(time.Now().UnixMilli())
 	stream, err := l.client.newStream("accept")
 	if err != nil {
 		return nil, err
@@ -974,15 +1014,16 @@ func (l *sshUdpListener) Accept() (net.Conn, error) {
 		return nil, err
 	}
 	l.client.waitGroup.Add(1)
-	return &sshUdpConn{Conn: stream, client: l.client}, nil
+	return &sshUdpConn{Stream: stream, client: l.client}, nil
 }
 
 func (l *sshUdpListener) Close() error {
 	if !l.closed.CompareAndSwap(false, true) {
 		return nil
 	}
+	err := l.stream.Close()
 	l.client.waitGroup.Done()
-	return l.stream.Close()
+	return err
 }
 
 func (l *sshUdpListener) Addr() net.Addr {
@@ -990,30 +1031,35 @@ func (l *sshUdpListener) Addr() net.Addr {
 }
 
 type sshUdpConn struct {
-	net.Conn
+	Stream
+	rAddr  *net.TCPAddr
 	client *SshUdpClient
 	closed atomic.Bool
 }
 
-func (c *sshUdpConn) Read(buf []byte) (int, error) {
-	n, err := c.Conn.Read(buf)
-	c.client.outputChecker.updateTime(time.Now().UnixMilli())
-	return n, err
-}
-
 func (c *sshUdpConn) Write(buf []byte) (int, error) {
-	for c.client.outputChecker.isTimeout() {
-		time.Sleep(10 * time.Millisecond)
+	if c.client.networkProxy.serverChecker.isTimeout() {
+		if err := c.client.networkProxy.serverChecker.waitUntilReconnected(); err != nil {
+			return 0, fmt.Errorf("server timeout and closed: %v", err)
+		}
 	}
-	return c.Conn.Write(buf)
+	return c.Stream.Write(buf)
 }
 
 func (c *sshUdpConn) Close() error {
 	if !c.closed.CompareAndSwap(false, true) {
 		return nil
 	}
+	err := c.Stream.Close()
 	c.client.waitGroup.Done()
-	return c.Conn.Close()
+	return err
+}
+
+func (c *sshUdpConn) RemoteAddr() net.Addr {
+	if c.rAddr != nil {
+		return c.rAddr
+	}
+	return c.Stream.RemoteAddr()
 }
 
 type sshUdpNewChannel struct {
@@ -1036,7 +1082,7 @@ func (c *sshUdpNewChannel) Accept() (ssh.Channel, <-chan *ssh.Request, error) {
 		return nil, nil, err
 	}
 	c.client.waitGroup.Add(1)
-	return &sshUdpChannel{Conn: stream, client: c.client}, nil, nil
+	return &sshUdpChannel{Stream: stream, client: c.client}, nil, nil
 }
 
 func (c *sshUdpNewChannel) Reject(reason ssh.RejectionReason, message string) error {
@@ -1052,40 +1098,27 @@ func (c *sshUdpNewChannel) ExtraData() []byte {
 }
 
 type sshUdpChannel struct {
-	net.Conn
+	Stream
 	client *SshUdpClient
 	closed atomic.Bool
 }
 
-func (c *sshUdpChannel) Read(buf []byte) (int, error) {
-	n, err := c.Conn.Read(buf)
-	c.client.outputChecker.updateTime(time.Now().UnixMilli())
-	return n, err
-}
-
 func (c *sshUdpChannel) Write(buf []byte) (int, error) {
-	for c.client.outputChecker.isTimeout() {
-		time.Sleep(10 * time.Millisecond)
+	if c.client.networkProxy.serverChecker.isTimeout() {
+		if err := c.client.networkProxy.serverChecker.waitUntilReconnected(); err != nil {
+			return 0, fmt.Errorf("server timeout and closed: %v", err)
+		}
 	}
-	return c.Conn.Write(buf)
+	return c.Stream.Write(buf)
 }
 
 func (c *sshUdpChannel) Close() error {
 	if !c.closed.CompareAndSwap(false, true) {
 		return nil
 	}
+	err := c.Stream.Close()
 	c.client.waitGroup.Done()
-	return c.Conn.Close()
-}
-
-func (c *sshUdpChannel) CloseWrite() error {
-	if cw, ok := c.Conn.(closeWriter); ok {
-		return cw.CloseWrite()
-	} else {
-		// close the entire stream since there is no half-close
-		time.Sleep(200 * time.Millisecond)
-		return c.Close()
-	}
+	return err
 }
 
 func (c *sshUdpChannel) SendRequest(name string, wantReply bool, payload []byte) (bool, error) {
@@ -1095,4 +1128,15 @@ func (c *sshUdpChannel) SendRequest(name string, wantReply bool, payload []byte)
 func (c *sshUdpChannel) Stderr() io.ReadWriter {
 	c.client.warning("ssh udp channel Stderr is not supported yet")
 	return nil
+}
+
+type sshUdpPacketConn struct {
+	*packetConn
+	client *SshUdpClient
+}
+
+func (c *sshUdpPacketConn) Close() error {
+	err := c.packetConn.Close()
+	c.client.waitGroup.Done()
+	return err
 }

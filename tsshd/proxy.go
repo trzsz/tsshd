@@ -31,7 +31,6 @@ import (
 	crypto_rand "crypto/rand"
 	"encoding/binary"
 	"encoding/hex"
-	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -39,6 +38,8 @@ import (
 	"sync/atomic"
 	"time"
 )
+
+var globalServerProxy *serverProxy
 
 const kProxyBufferSize = 1024 * 1024
 
@@ -72,15 +73,10 @@ func aesDecrypt(cipherBlock *cipher.Block, buf []byte) []byte {
 }
 
 func sendUdpPacket(conn net.Conn, data []byte) error {
-	buf := make([]byte, 2)
+	buf := make([]byte, 2+len(data))
 	binary.BigEndian.PutUint16(buf, uint16(len(data)))
-	if _, err := conn.Write(buf); err != nil {
-		return err
-	}
-	if _, err := conn.Write(data); err != nil {
-		return err
-	}
-	return nil
+	copy(buf[2:], data)
+	return writeAll(conn, buf)
 }
 
 func recvUdpPacket(conn net.Conn, data []byte) (int, error) {
@@ -89,7 +85,7 @@ func recvUdpPacket(conn net.Conn, data []byte) (int, error) {
 		return 0, err
 	}
 	n := int(binary.BigEndian.Uint16(buf))
-	if n <= 0 || n > len(data) {
+	if n < 0 || n > len(data) {
 		return 0, fmt.Errorf("invalid udp length: %d", n)
 	}
 	if _, err := io.ReadFull(conn, data[:n]); err != nil {
@@ -130,11 +126,9 @@ func (p *packetCache) addPacket(buf []byte) {
 	}
 }
 
-func (p *packetCache) flushCache(writeFn func([]byte) error) (int, int, int, int) {
+func (p *packetCache) sendCache(writeFn func([]byte) error) (flushSize, flushCount int) {
 	p.mutex.Lock()
 	defer p.mutex.Unlock()
-
-	var totalSize, totalCount, flushSize, flushCount int
 
 	for i := 0; i < p.size; i++ {
 		index := (p.head + i) % len(p.buffer)
@@ -146,6 +140,17 @@ func (p *packetCache) flushCache(writeFn func([]byte) error) (int, int, int, int
 			flushCount++
 		}
 		_ = writeFn(p.buffer[index])
+	}
+
+	return flushSize, flushCount
+}
+
+func (p *packetCache) clearCache() (totalSize, totalCount int) {
+	p.mutex.Lock()
+	defer p.mutex.Unlock()
+
+	for i := 0; i < p.size; i++ {
+		index := (p.head + i) % len(p.buffer)
 		p.buffer[index] = nil
 	}
 
@@ -155,8 +160,7 @@ func (p *packetCache) flushCache(writeFn func([]byte) error) (int, int, int, int
 		totalSize, totalCount = p.totalSize, p.totalCount
 		p.totalSize, p.totalCount = 0, 0
 	}
-
-	return totalSize, totalCount, flushSize, flushCount
+	return
 }
 
 type clientConnection interface {
@@ -224,13 +228,10 @@ func (u *udpClientConn) Equal(c clientConnection) bool {
 	}
 
 	if c, ok := c.(*udpClientConn); ok {
-		if u.frontendConn != c.frontendConn {
-			return false
-		}
-		if u.clientAddr.Port != c.clientAddr.Port {
-			return false
-		}
-		return u.clientAddr.IP.Equal(c.clientAddr.IP)
+		return u.frontendConn == c.frontendConn &&
+			u.clientAddr.Port == c.clientAddr.Port &&
+			u.clientAddr.Zone == c.clientAddr.Zone &&
+			u.clientAddr.IP.Equal(c.clientAddr.IP)
 	}
 
 	return false
@@ -246,17 +247,19 @@ type udpBuffer struct {
 }
 
 type serverProxy struct {
-	args         *tsshdArgs
-	frontendList []io.Closer
-	backendConn  *net.UDPConn
-	clientConn   atomic.Pointer[clientConnHolder]
-	authedConn   clientConnection
-	cipherBlock  *cipher.Block
-	clientID     uint64
-	serverID     uint64
-	serialNumber atomic.Uint64
-	bufChan      chan *udpBuffer
-	pktCache     packetCache
+	args          *tsshdArgs
+	frontendList  []io.Closer
+	backendConn   *net.UDPConn
+	clientConn    atomic.Pointer[clientConnHolder]
+	authedConn    clientConnection
+	cipherBlock   *cipher.Block
+	clientID      uint64
+	serverID      uint64
+	serialNumber  atomic.Uint64
+	bufChan       chan *udpBuffer
+	pktCache      packetCache
+	clientChecker *timeoutChecker
+	sendCacheFlag atomic.Bool
 }
 
 func (p *serverProxy) sendAuthPacket(conn clientConnection) error {
@@ -290,25 +293,23 @@ func (p *serverProxy) setClientConn(newClientConn *clientConnHolder) {
 		debug("new client address [%d]: %s", p.serialNumber.Load(), newClientConn.Addr())
 	}
 
-	if inputChecker != nil {
-		inputChecker.updateTime(time.Now().UnixMilli())
-	}
+	p.clientChecker.updateNow()
 
 	if oldClientConn != nil {
 		oldClientConn.Close()
 		enablePendingInputDiscard() // discard pending user input from previous connections
 	}
 
-	totalSize, totalCount, flushSize, flushCount := p.pktCache.flushCache(newClientConn.Write)
+	flushSize, flushCount := p.pktCache.sendCache(newClientConn.Write)
 	if enableDebugLogging {
-		debug("total packet cache count [%d] cache size [%d]", totalCount, totalSize)
-		debug("flush packet cache count [%d] cache size [%d]", flushCount, flushSize)
+		debug("send packet cache count [%d] cache size [%d]", flushCount, flushSize)
 	}
 }
 
 func (p *serverProxy) udpFrontendToBackend() {
 	for buf := range p.bufChan {
-		if c := p.clientConn.Load(); c != nil && c.Equal(buf.conn) {
+		if conn := p.clientConn.Load(); conn != nil && conn.Equal(buf.conn) {
+			p.onClientActive(conn.Write)
 			if _, err := p.backendConn.Write(buf.data); err != nil {
 				warning("write to backend failed: %v", err)
 			}
@@ -325,10 +326,8 @@ func (p *serverProxy) udpFrontendToBackend() {
 				}
 				continue
 			}
-			if serialNumber > p.serialNumber.Load() {
+			if serialNumber >= p.serialNumber.Load() {
 				p.serialNumber.Store(serialNumber)
-			}
-			if serialNumber == p.serialNumber.Load() {
 				_ = p.sendAuthPacket(buf.conn)
 			}
 			continue
@@ -357,7 +356,7 @@ func (p *serverProxy) udpServeFrontendConn(conn *net.UDPConn) {
 	for {
 		_ = conn.SetReadDeadline(time.Now().Add(p.args.ConnectTimeout))
 		n, addr, err := conn.ReadFromUDP(buffers[current])
-		if err != nil || n <= 0 {
+		if err != nil {
 			if neverReceived && time.Since(beginTime) > p.args.ConnectTimeout-10*time.Millisecond {
 				return
 			}
@@ -372,11 +371,27 @@ func (p *serverProxy) udpServeFrontendConn(conn *net.UDPConn) {
 		p.bufChan <- &udpBuffer{
 			conn: &udpClientConn{
 				frontendConn: conn,
-				clientAddr:   addr,
+				clientAddr: &net.UDPAddr{
+					IP:   append([]byte(nil), addr.IP...),
+					Port: addr.Port,
+					Zone: addr.Zone,
+				},
 			},
 			data: buffers[current][:n],
 		}
 		current = 1 - current
+	}
+}
+
+func (p *serverProxy) onClientActive(writeFn func([]byte) error) {
+	p.clientChecker.updateNow()
+
+	if p.sendCacheFlag.Load() {
+		p.sendCacheFlag.Store(false)
+		flushSize, flushCount := p.pktCache.sendCache(writeFn)
+		if enableDebugLogging {
+			debug("send packet cache count [%d] cache size [%d]", flushCount, flushSize)
+		}
 	}
 }
 
@@ -420,6 +435,9 @@ func (p *serverProxy) tcpFrontendToBackend(conn net.Conn) {
 		if err != nil { // server ignore TCP frontend error
 			return
 		}
+
+		p.onClientActive(clientConn.Write)
+
 		if _, err := p.backendConn.Write(buffer[:n]); err != nil {
 			warning("write to backend failed: %v", err)
 		}
@@ -453,24 +471,19 @@ func (p *serverProxy) tcpServeFrontendListener(listener *net.TCPListener) {
 func (p *serverProxy) backendToFrontend() {
 	buffer := make([]byte, 0xffff)
 	for {
-		n, _, err := p.backendConn.ReadFromUDP(buffer)
-		if err != nil || n <= 0 {
+		n, err := p.backendConn.Read(buffer)
+		if err != nil {
 			warning("backend read udp failed: %v", err)
 			time.Sleep(10 * time.Millisecond)
 			continue
 		}
-		if inputChecker != nil && inputChecker.isTimeout() {
+
+		if p.clientChecker.isTimeout() {
 			p.pktCache.addPacket(buffer[:n])
 			continue
 		}
+
 		if conn := p.clientConn.Load(); conn != nil {
-			if p.pktCache.size > 0 {
-				totalSize, totalCount, flushSize, flushCount := p.pktCache.flushCache(conn.Write)
-				if enableDebugLogging {
-					debug("total packet cache count [%d] cache size [%d]", totalCount, totalSize)
-					debug("flush packet cache count [%d] cache size [%d]", flushCount, flushSize)
-				}
-			}
 			_ = conn.Write(buffer[:n])
 		}
 	}
@@ -500,7 +513,7 @@ func (p *serverProxy) serveProxy() {
 	go p.backendToFrontend()
 }
 
-func startServerProxy(args *tsshdArgs, info *ServerInfo, frontendList []io.Closer) ([]io.Closer, error) {
+func startServerProxy(args *tsshdArgs, info *ServerInfo, frontendList []io.Closer) (*net.UDPConn, error) {
 	localAddr := "127.0.0.1:0"
 	udpAddr, err := net.ResolveUDPAddr("udp", localAddr)
 	if err != nil {
@@ -544,52 +557,69 @@ func startServerProxy(args *tsshdArgs, info *ServerInfo, frontendList []io.Close
 	info.ClientID = binary.BigEndian.Uint64(clientID)
 	info.ServerID = binary.BigEndian.Uint64(serverID)
 
-	proxy := &serverProxy{
-		args:         args,
-		frontendList: frontendList,
-		backendConn:  backendConn,
-		cipherBlock:  &cipherBlock,
-		clientID:     info.ClientID,
-		serverID:     info.ServerID,
+	globalServerProxy = &serverProxy{
+		args:          args,
+		frontendList:  frontendList,
+		backendConn:   backendConn,
+		cipherBlock:   &cipherBlock,
+		clientID:      info.ClientID,
+		serverID:      info.ServerID,
+		clientChecker: newTimeoutChecker(args.ConnectTimeout),
 	}
-	go proxy.serveProxy()
 
-	return []io.Closer{serverConn}, nil
-}
+	if enableDebugLogging {
+		globalServerProxy.clientChecker.onTimeout(func() {
+			debug("blocked due to no client input for [%dms]", globalServerProxy.clientChecker.timeoutMilli.Load())
+		})
+		globalServerProxy.clientChecker.onReconnected(func() {
+			debug("resumed after receiving client input")
+		})
+	}
 
-type serverConnection interface {
-	Close()
-	Read([]byte) (int, error)
-	Write([]byte) error
+	globalServerProxy.clientChecker.onTimeout(func() {
+		globalServerProxy.sendCacheFlag.Store(true)
+	})
+
+	go globalServerProxy.serveProxy()
+
+	return serverConn, nil
 }
 
 type tcpServerConn struct {
 	conn net.Conn
 }
 
-func (t *tcpServerConn) Close() {
-	_ = t.conn.Close()
-}
-
-func (t *tcpServerConn) Read(buf []byte) (int, error) {
-	return recvUdpPacket(t.conn, buf)
+func (t *tcpServerConn) Close() error {
+	return t.conn.Close()
 }
 
 func (t *tcpServerConn) Write(buf []byte) error {
 	return sendUdpPacket(t.conn, buf)
 }
 
+func (t *tcpServerConn) Read(buf []byte) (int, error) {
+	return recvUdpPacket(t.conn, buf)
+}
+
+func (t *tcpServerConn) Consume(consumeFn func([]byte) error) error {
+	buffer := make([]byte, 0xffff)
+	for {
+		n, err := t.Read(buffer)
+		if err != nil {
+			return err
+		}
+		if err := consumeFn(buffer[:n]); err != nil {
+			return err
+		}
+	}
+}
+
 type udpServerConn struct {
 	conn *net.UDPConn
 }
 
-func (u *udpServerConn) Close() {
-	_ = u.conn.Close()
-}
-
-func (u *udpServerConn) Read(buf []byte) (int, error) {
-	n, _, err := u.conn.ReadFromUDP(buf)
-	return n, err
+func (u *udpServerConn) Close() error {
+	return u.conn.Close()
 }
 
 func (u *udpServerConn) Write(buf []byte) error {
@@ -597,112 +627,143 @@ func (u *udpServerConn) Write(buf []byte) error {
 	return err
 }
 
+func (u *udpServerConn) Read(buf []byte) (int, error) {
+	return u.conn.Read(buf)
+}
+
+func (u *udpServerConn) Consume(consumeFn func([]byte) error) error {
+	buffer := make([]byte, 0xffff)
+	for {
+		n, err := u.Read(buffer)
+		if err != nil {
+			return err
+		}
+		if err := consumeFn(buffer[:n]); err != nil {
+			return err
+		}
+	}
+}
+
 type serverConnHolder struct {
-	serverConnection
+	PacketConn
 }
 
 type clientProxy struct {
-	client       *SshUdpClient
-	frontendConn *net.UDPConn
-	backendConn  atomic.Pointer[serverConnHolder]
-	proxyMode    string
-	serverNet    string
-	serverAddr   string
-	clientAddr   atomic.Pointer[net.UDPAddr]
-	cipherBlock  *cipher.Block
-	clientID     uint64
-	serverID     uint64
-	renewMutex   sync.Mutex
-	serialNumber uint64
-	pktCache     packetCache
-}
-
-func (p *clientProxy) isClientAddr(addr *net.UDPAddr) bool {
-	clientAddr := p.clientAddr.Load()
-	if clientAddr == nil {
-		return false
-	}
-	if clientAddr.Port != addr.Port {
-		return false
-	}
-	return clientAddr.IP.Equal(addr.IP)
+	client        *SshUdpClient
+	frontendConn  *net.UDPConn
+	backendConn   atomic.Pointer[serverConnHolder]
+	proxyMode     string
+	serverNet     string
+	serverAddr    string
+	cipherBlock   *cipher.Block
+	clientID      uint64
+	serverID      uint64
+	renewMutex    sync.Mutex
+	serialNumber  uint64
+	pktCache      packetCache
+	serverChecker *timeoutChecker
+	closed        atomic.Bool
 }
 
 func (p *clientProxy) frontendToBackend() {
+	var clientAddr *net.UDPAddr
 	buffer := make([]byte, 0xffff)
-	for {
+	for !p.closed.Load() {
 		n, addr, err := p.frontendConn.ReadFromUDP(buffer)
-		if err != nil || n <= 0 {
+		if err != nil {
+			if isClosedError(err) {
+				break
+			}
 			p.client.warning("frontend read udp failed: %v", err)
 			time.Sleep(10 * time.Millisecond)
 			continue
 		}
-		if p.clientAddr.Load() == nil {
-			p.clientAddr.Store(addr)
+
+		if clientAddr == nil {
+			clientAddr = &net.UDPAddr{
+				IP:   append([]byte(nil), addr.IP...),
+				Port: addr.Port,
+				Zone: addr.Zone,
+			}
+			go p.backendToFrontend(clientAddr)
 		}
-		if !p.isClientAddr(addr) {
+
+		if clientAddr.Port != addr.Port || !clientAddr.IP.Equal(addr.IP) || clientAddr.Zone != addr.Zone {
 			continue
 		}
+
+		if p.serverChecker.isTimeout() {
+			p.pktCache.addPacket(buffer[:n])
+			continue
+		}
+
 		if conn := p.backendConn.Load(); conn != nil {
 			_ = conn.Write(buffer[:n])
-		} else {
-			p.pktCache.addPacket(buffer[:n])
 		}
 	}
 }
 
-func (p *clientProxy) backendToFrontend() {
-	buffer := make([]byte, 0xffff)
-	for {
+func (p *clientProxy) backendToFrontend(clientAddr *net.UDPAddr) {
+	for !p.closed.Load() {
 		if conn := p.backendConn.Load(); conn != nil {
-			n, err := conn.Read(buffer)
-			if err != nil || n <= 0 { // client ignore backend error
+			if err := conn.Consume(func(buf []byte) error {
+				p.serverChecker.updateNow()
+				if _, err := p.frontendConn.WriteToUDP(buf, clientAddr); err != nil {
+					p.client.warning("write to frontend failed: %v", err)
+				}
+				return nil
+			}); err != nil { // client ignore backend error
 				time.Sleep(10 * time.Millisecond)
 				continue
 			}
-			if addr := p.clientAddr.Load(); addr != nil {
-				if _, err := p.frontendConn.WriteToUDP(buffer[:n], addr); err != nil {
-					p.client.warning("write to frontend failed: %v", err)
-				}
-			}
 		} else {
-			time.Sleep(10 * time.Millisecond) // wait for reconnect
+			time.Sleep(5 * time.Millisecond) // wait for reconnect
 		}
 	}
 }
 
-func (p *clientProxy) renewTransportPath(connectTimeout time.Duration) error {
+func (p *clientProxy) renewTransportPath(proxyClient *SshUdpClient, connectTimeout time.Duration) error {
 	p.renewMutex.Lock()
 	defer p.renewMutex.Unlock()
 	p.serialNumber++
 
 	if conn := p.backendConn.Load(); conn != nil {
-		conn.Close()
+		_ = conn.Close()
 		p.backendConn.Store(nil)
 	}
 
 	var err error
 	if p.proxyMode == kProxyModeTCP {
-		err = p.renewTcpPath(connectTimeout)
+		err = p.renewTcpPath(proxyClient, connectTimeout)
 	} else {
-		err = p.renewUdpPath(connectTimeout)
+		err = p.renewUdpPath(proxyClient, connectTimeout)
 	}
 	if err != nil {
 		return err
 	}
 
-	totalSize, totalCount, flushSize, flushCount := p.pktCache.flushCache(p.backendConn.Load().Write)
+	p.serverChecker.updateNow()
+
+	flushSize, flushCount := p.pktCache.sendCache(p.backendConn.Load().Write)
 	if enableDebugLogging {
-		p.client.debug("total packet cache count [%d] cache size [%d]", totalCount, totalSize)
-		p.client.debug("flush packet cache count [%d] cache size [%d]", flushCount, flushSize)
+		p.client.debug("send packet cache count [%d] cache size [%d]", flushCount, flushSize)
 	}
 	return nil
 }
 
-func (p *clientProxy) renewTcpPath(connectTimeout time.Duration) error {
-	conn, err := net.DialTimeout(p.serverNet, p.serverAddr, connectTimeout)
-	if err != nil {
-		return fmt.Errorf("dial [%s] [%s] failed: %v", p.serverNet, p.serverAddr, err)
+func (p *clientProxy) renewTcpPath(proxyClient *SshUdpClient, connectTimeout time.Duration) error {
+	var err error
+	var conn net.Conn
+	if proxyClient != nil {
+		conn, err = proxyClient.DialTimeout(p.serverNet, p.serverAddr, connectTimeout)
+		if err != nil {
+			return fmt.Errorf("proxy dial [%s] [%s] failed: %v", p.serverNet, p.serverAddr, err)
+		}
+	} else {
+		conn, err = net.DialTimeout(p.serverNet, p.serverAddr, connectTimeout)
+		if err != nil {
+			return fmt.Errorf("dial [%s] [%s] failed: %v", p.serverNet, p.serverAddr, err)
+		}
 	}
 
 	svrConn := serverConnHolder{&tcpServerConn{conn}}
@@ -734,56 +795,75 @@ func (p *clientProxy) renewTcpPath(connectTimeout time.Duration) error {
 	return nil
 }
 
-func (p *clientProxy) renewUdpPath(connectTimeout time.Duration) error {
-	serverAddr, err := net.ResolveUDPAddr(p.serverNet, p.serverAddr)
-	if err != nil {
-		return fmt.Errorf("resolve addr [%s] [%s] failed: %v", p.serverNet, p.serverAddr, err)
+func (p *clientProxy) renewUdpPath(proxyClient *SshUdpClient, connectTimeout time.Duration) error {
+	var conn *serverConnHolder
+	if proxyClient != nil {
+		udpConn, err := proxyClient.DialUDP(p.serverNet, p.serverAddr)
+		if err != nil {
+			return fmt.Errorf("proxy dial [%s] [%s] failed: %v", p.serverNet, p.serverAddr, err)
+		}
+		conn = &serverConnHolder{udpConn}
+	} else {
+		serverAddr, err := net.ResolveUDPAddr(p.serverNet, p.serverAddr)
+		if err != nil {
+			return fmt.Errorf("resolve addr [%s] [%s] failed: %v", p.serverNet, p.serverAddr, err)
+		}
+		udpConn, err := net.DialUDP("udp", nil, serverAddr)
+		if err != nil {
+			return fmt.Errorf("dial [%s] [%s] failed: %v", p.serverNet, p.serverAddr, err)
+		}
+		_ = udpConn.SetReadBuffer(kProxyBufferSize)
+		_ = udpConn.SetWriteBuffer(kProxyBufferSize)
+		conn = &serverConnHolder{&udpServerConn{udpConn}}
 	}
-	conn, err := net.DialUDP("udp", nil, serverAddr)
-	if err != nil {
-		return fmt.Errorf("dial [%s] [%s] failed: %v", p.serverNet, p.serverAddr, err)
-	}
-	_ = conn.SetReadBuffer(kProxyBufferSize)
-	_ = conn.SetWriteBuffer(kProxyBufferSize)
-	svrConn := serverConnHolder{&udpServerConn{conn}}
 
 	ctx, cancel := context.WithTimeout(context.Background(), connectTimeout)
 	defer cancel()
+
+	done := make(chan error, 1)
 	go func() {
-		_ = p.sendAuthPacket(svrConn)
-		for {
-			select {
-			case <-ctx.Done():
-				if err := ctx.Err(); err != nil && errors.Is(err, context.DeadlineExceeded) {
-					_ = conn.Close()
-				}
+		defer close(done)
+		buffer := make([]byte, 256)
+		for ctx.Err() == nil {
+			n, err := conn.Read(buffer)
+			if err != nil {
+				done <- fmt.Errorf("read auth packet failed: %v", err)
 				return
-			case <-time.After(100 * time.Millisecond):
-				_ = p.sendAuthPacket(svrConn)
+			}
+			if p.isAuthSuccessful(buffer[:n]) {
+				p.client.debug("serial number [%d] auth success", p.serialNumber)
+				p.backendConn.Store(conn)
+				done <- nil
+				return
 			}
 		}
 	}()
 
-	buffer := make([]byte, 256)
+	ticker := time.NewTicker(100 * time.Millisecond)
+	defer ticker.Stop()
+
+	if err := p.sendAuthPacket(conn); err != nil {
+		_ = conn.Close()
+		return fmt.Errorf("send auth packet failed: %v", err)
+	}
+
 	for {
-		if err := ctx.Err(); err != nil {
+		select {
+		case err := <-done:
+			return err
+		case <-ticker.C:
+			if err := p.sendAuthPacket(conn); err != nil {
+				_ = conn.Close()
+				return fmt.Errorf("send auth packet failed: %v", err)
+			}
+		case <-ctx.Done():
 			_ = conn.Close()
-			return fmt.Errorf("renew path to [%s] [%s] failed: %v", p.serverNet, serverAddr.String(), err)
-		}
-		n, _, err := conn.ReadFromUDP(buffer)
-		if err != nil || n <= 0 {
-			_ = conn.Close()
-			return fmt.Errorf("read auth packet failed: %v", err)
-		}
-		if p.isAuthSuccessful(buffer[:n]) {
-			p.client.debug("serial number [%d] auth success", p.serialNumber)
-			p.backendConn.Store(&svrConn)
-			return nil
+			return fmt.Errorf("renew path to [%s] [%s] timeout [%v]", p.serverNet, p.serverAddr, connectTimeout)
 		}
 	}
 }
 
-func (p *clientProxy) sendAuthPacket(conn serverConnection) error {
+func (p *clientProxy) sendAuthPacket(conn PacketConn) error {
 	data := make([]byte, 16)
 	binary.BigEndian.PutUint64(data[0:8], p.clientID)
 	binary.BigEndian.PutUint64(data[8:16], p.serialNumber)
@@ -815,17 +895,31 @@ func (p *clientProxy) serveProxy() {
 	_ = p.frontendConn.SetReadBuffer(kProxyBufferSize)
 	_ = p.frontendConn.SetWriteBuffer(kProxyBufferSize)
 	go p.frontendToBackend()
-	go p.backendToFrontend()
 }
 
-func startClientProxy(client *SshUdpClient, serverNet, serverAddr string, info *ServerInfo) (string, *clientProxy, error) {
-	proxyKey, err := hex.DecodeString(info.ProxyKey)
+func (p *clientProxy) Close() {
+	if !p.closed.CompareAndSwap(false, true) {
+		return
+	}
+
+	if conn := p.backendConn.Load(); conn != nil {
+		_ = conn.Close()
+		p.backendConn.Store(nil)
+	}
+
+	_ = p.frontendConn.Close()
+
+	p.serverChecker.Close()
+}
+
+func startClientProxy(client *SshUdpClient, opts *UdpClientOptions) (string, *clientProxy, error) {
+	proxyKey, err := hex.DecodeString(opts.ServerInfo.ProxyKey)
 	if err != nil {
-		return "", nil, fmt.Errorf("decode proxy key [%s] failed: %v", info.ProxyKey, err)
+		return "", nil, fmt.Errorf("decode proxy key [%s] failed: %v", opts.ServerInfo.ProxyKey, err)
 	}
 	cipherBlock, err := aes.NewCipher(proxyKey)
 	if err != nil {
-		return "", nil, fmt.Errorf("aes new cipher failed: %v", err)
+		return "", nil, fmt.Errorf("aes new cipher for key [%s] failed: %v", opts.ServerInfo.ProxyKey, err)
 	}
 
 	localAddr := "127.0.0.1:0"
@@ -839,16 +933,48 @@ func startClientProxy(client *SshUdpClient, serverNet, serverAddr string, info *
 	}
 	proxyAddr := frontendConn.LocalAddr().String()
 
-	proxy := &clientProxy{
-		client:       client,
-		frontendConn: frontendConn,
-		proxyMode:    info.ProxyMode,
-		serverNet:    serverNet,
-		serverAddr:   serverAddr,
-		cipherBlock:  &cipherBlock,
-		clientID:     info.ClientID,
-		serverID:     info.ServerID,
+	network := "udp"
+	if opts.ServerInfo.ProxyMode == kProxyModeTCP {
+		network = "tcp"
 	}
+	if opts.IPv4 && !opts.IPv6 {
+		network += "4"
+	} else if opts.IPv6 && !opts.IPv4 {
+		network += "6"
+	}
+
+	proxy := &clientProxy{
+		client:        client,
+		frontendConn:  frontendConn,
+		proxyMode:     opts.ServerInfo.ProxyMode,
+		serverNet:     network,
+		serverAddr:    opts.TsshdAddr,
+		cipherBlock:   &cipherBlock,
+		clientID:      opts.ServerInfo.ClientID,
+		serverID:      opts.ServerInfo.ServerID,
+		serverChecker: newTimeoutChecker(opts.HeartbeatTimeout),
+	}
+
+	if enableDebugLogging {
+		proxy.serverChecker.onTimeout(func() {
+			client.debug("blocked due to no server output for [%v]", opts.HeartbeatTimeout)
+		})
+		proxy.serverChecker.onReconnected(func() {
+			client.debug("resumed after receiving server output")
+		})
+	}
+
+	if opts.ProxyClient != nil {
+		opts.ProxyClient.activeChecker.onReconnected(func() {
+			if conn := proxy.backendConn.Load(); conn != nil {
+				flushSize, flushCount := proxy.pktCache.sendCache(conn.Write)
+				if enableDebugLogging {
+					client.debug("send packet cache count [%d] cache size [%d]", flushCount, flushSize)
+				}
+			}
+		})
+	}
+
 	go proxy.serveProxy()
 
 	return proxyAddr, proxy, nil

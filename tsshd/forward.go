@@ -26,31 +26,30 @@ package tsshd
 
 import (
 	"fmt"
-	"io"
 	"net"
 	"os"
 	"strings"
 	"sync"
 	"sync/atomic"
-	"time"
 )
-
-type closeWriter interface {
-	CloseWrite() error
-}
 
 var acceptMutex sync.Mutex
 var acceptID atomic.Uint64
 var acceptMap = make(map[uint64]net.Conn)
 
-func sendProhibited(stream net.Conn, option string) {
+func sendProhibited(stream Stream, option string) {
 	sendErrorCode(stream, ErrProhibited, fmt.Sprintf("Check [%s] in [%s] on the server.", option, sshdConfigPath))
 }
 
-func handleDialEvent(stream net.Conn) {
+func handleDialEvent(stream Stream) {
 	var msg dialMessage
 	if err := recvMessage(stream, &msg); err != nil {
 		sendError(stream, fmt.Errorf("recv dial message failed: %v", err))
+		return
+	}
+
+	if strings.HasPrefix(msg.Net, "udp") {
+		sendError(stream, fmt.Errorf("use DialUDP for [%s]", msg.Net))
 		return
 	}
 
@@ -59,7 +58,7 @@ func handleDialEvent(stream net.Conn) {
 		return
 	}
 
-	if msg.Network == "unix" {
+	if msg.Net == "unix" {
 		if v := strings.ToLower(getSshdConfig("AllowStreamLocalForwarding")); v == "no" || v == "remote" {
 			sendProhibited(stream, "AllowStreamLocalForwarding")
 			return
@@ -74,9 +73,9 @@ func handleDialEvent(stream net.Conn) {
 	var err error
 	var conn net.Conn
 	if msg.Timeout > 0 {
-		conn, err = net.DialTimeout(msg.Network, msg.Addr, msg.Timeout)
+		conn, err = net.DialTimeout(msg.Net, msg.Addr, msg.Timeout)
 	} else {
-		conn, err = net.Dial(msg.Network, msg.Addr)
+		conn, err = net.Dial(msg.Net, msg.Addr)
 	}
 	if err != nil {
 		sendError(stream, err)
@@ -85,7 +84,11 @@ func handleDialEvent(stream net.Conn) {
 
 	defer func() { _ = conn.Close() }()
 
-	if err := sendSuccess(stream); err != nil { // ack ok
+	var resp dialResponse
+	if addr, ok := conn.RemoteAddr().(*net.TCPAddr); ok {
+		resp.RemoteAddr = addr
+	}
+	if err := sendResponse(stream, &resp); err != nil { // ack ok
 		warning("dial ack ok failed: %v", err)
 		return
 	}
@@ -93,7 +96,7 @@ func handleDialEvent(stream net.Conn) {
 	forwardConnection(stream, conn)
 }
 
-func handleListenEvent(stream net.Conn) {
+func handleListenEvent(stream Stream) {
 	var msg listenMessage
 	if err := recvMessage(stream, &msg); err != nil {
 		sendError(stream, fmt.Errorf("recv listen message failed: %v", err))
@@ -105,7 +108,7 @@ func handleListenEvent(stream net.Conn) {
 		return
 	}
 
-	if msg.Network == "unix" {
+	if msg.Net == "unix" {
 		if v := strings.ToLower(getSshdConfig("AllowStreamLocalForwarding")); v == "no" || v == "local" {
 			sendProhibited(stream, "AllowStreamLocalForwarding")
 			return
@@ -117,7 +120,7 @@ func handleListenEvent(stream net.Conn) {
 		return
 	}
 
-	listener, err := net.Listen(msg.Network, msg.Addr)
+	listener, err := net.Listen(msg.Net, msg.Addr)
 	if err != nil {
 		sendError(stream, err)
 		return
@@ -125,7 +128,7 @@ func handleListenEvent(stream net.Conn) {
 
 	onExitFuncs = append(onExitFuncs, func() {
 		_ = listener.Close()
-		if msg.Network == "unix" {
+		if msg.Net == "unix" {
 			_ = os.Remove(msg.Addr)
 		}
 	})
@@ -138,11 +141,11 @@ func handleListenEvent(stream net.Conn) {
 
 	for {
 		conn, err := listener.Accept()
-		if err == io.EOF {
-			break
-		}
 		if err != nil {
-			warning("listener %s [%s] accept failed: %v", msg.Network, msg.Addr, err)
+			if isClosedError(err) {
+				break
+			}
+			warning("listener %s [%s] accept failed: %v", msg.Net, msg.Addr, err)
 			continue
 		}
 		id := addAcceptConn(conn)
@@ -156,7 +159,7 @@ func handleListenEvent(stream net.Conn) {
 	}
 }
 
-func handleAcceptEvent(stream net.Conn) {
+func handleAcceptEvent(stream Stream) {
 	var msg acceptMessage
 	if err := recvMessage(stream, &msg); err != nil {
 		sendError(stream, fmt.Errorf("recv accept message failed: %v", err))
@@ -197,18 +200,17 @@ func getAcceptConn(id uint64) net.Conn {
 	return nil
 }
 
-func forwardConnection(stream net.Conn, conn net.Conn) {
+func forwardConnection(stream Stream, conn net.Conn) {
 	var wg sync.WaitGroup
 	wg.Go(func() { forwardConnInput(stream, conn) })
 	wg.Go(func() { forwardConnOutput(stream, conn) })
 	wg.Wait()
 }
 
-func forwardConnInput(stream net.Conn, conn net.Conn) {
+func forwardConnInput(stream Stream, conn net.Conn) {
 	buffer := make([]byte, 32*1024)
 	for {
 		n, err := stream.Read(buffer)
-		inputChecker.updateTime(time.Now().UnixMilli())
 		if n > 0 {
 			if err := writeAll(conn, buffer[:n]); err != nil {
 				break
@@ -219,22 +221,22 @@ func forwardConnInput(stream net.Conn, conn net.Conn) {
 		}
 	}
 
-	if cw, ok := conn.(closeWriter); ok {
+	if cw, ok := conn.(interface{ CloseWrite() error }); ok {
 		_ = cw.CloseWrite()
-	} else {
-		// close the entire stream since there is no half-close
-		time.Sleep(200 * time.Millisecond)
-		_ = conn.Close()
 	}
+
+	_ = stream.CloseRead()
 }
 
-func forwardConnOutput(stream net.Conn, conn net.Conn) {
+func forwardConnOutput(stream Stream, conn net.Conn) {
 	buffer := make([]byte, 32*1024)
 	for {
 		n, err := conn.Read(buffer)
 		if n > 0 {
-			for inputChecker.isTimeout() {
-				time.Sleep(10 * time.Millisecond)
+			if globalServerProxy.clientChecker.isTimeout() {
+				if globalServerProxy.clientChecker.waitUntilReconnected() != nil {
+					break
+				}
 			}
 			if err := writeAll(stream, buffer[:n]); err != nil {
 				break
@@ -245,157 +247,9 @@ func forwardConnOutput(stream net.Conn, conn net.Conn) {
 		}
 	}
 
-	if cw, ok := stream.(closeWriter); ok {
-		_ = cw.CloseWrite()
-	} else {
-		// close the entire stream since there is no half-close
-		time.Sleep(200 * time.Millisecond)
-		_ = stream.Close()
-	}
-}
+	_ = stream.CloseWrite()
 
-func handleUDPv1Event(stream net.Conn) {
-	var msg udpv1Message
-	if err := recvMessage(stream, &msg); err != nil {
-		sendError(stream, fmt.Errorf("recv UDPv1 message failed: %v", err))
-		return
-	}
-
-	udpAddr, err := net.ResolveUDPAddr("udp", msg.Addr)
-	if err != nil {
-		sendError(stream, fmt.Errorf("resolve udp addr [%s] failed: %v", msg.Addr, err))
-		return
-	}
-	testConn, err := net.DialUDP("udp", nil, udpAddr)
-	if err != nil {
-		sendError(stream, fmt.Errorf("dial udp [%s] failed: %v", msg.Addr, err))
-		return
-	}
-	_ = testConn.Close()
-
-	if err := sendSuccess(stream); err != nil { // ack ok
-		warning("UDPv1 ack ok failed: %v", err)
-		return
-	}
-
-	connMgr := &udpv1ConnManager{
-		stream:  stream,
-		udpAddr: udpAddr,
-		timeout: msg.Timeout,
-		connMap: make(map[uint16]*udpv1ConnEntry),
-	}
-	go connMgr.cleanupInactiveConn()
-	connMgr.frontendToBackend()
-}
-
-type udpv1ConnEntry struct {
-	udpPort   uint16
-	udpConn   *net.UDPConn
-	closeChan chan struct{}
-	aliveTime atomic.Int64
-}
-
-type udpv1ConnManager struct {
-	mutex     sync.Mutex
-	stream    net.Conn
-	udpAddr   *net.UDPAddr
-	timeout   time.Duration
-	connMap   map[uint16]*udpv1ConnEntry
-	aliveTime atomic.Int64
-	pktCache  packetCache
-}
-
-func (m *udpv1ConnManager) frontendToBackend() {
-	for {
-		port, data, err := recvUDPv1Packet(m.stream)
-		if err != nil {
-			warning("UDPv1 forward recv packet failed: %v", err)
-			return
-		}
-		now := time.Now().UnixMilli()
-		m.aliveTime.Store(now)
-		inputChecker.updateTime(now)
-		conn, err := m.getUdpConn(port)
-		if err != nil {
-			warning("UDPv1 forward get udp conn failed: %v", err)
-			continue
-		}
-		_, _ = conn.Write(data)
-	}
-}
-
-func (m *udpv1ConnManager) backendToFrontend(entry *udpv1ConnEntry) {
-	buffer := make([]byte, 0xffff)
-	for {
-		select {
-		case <-entry.closeChan:
-			return
-		default:
-			_ = entry.udpConn.SetReadDeadline(time.Now().Add(m.timeout))
-			n, _, err := entry.udpConn.ReadFromUDP(buffer)
-			if err != nil || n <= 0 {
-				continue
-			}
-			entry.aliveTime.Store(time.Now().UnixMilli())
-			if inputChecker.isTimeout() {
-				m.pktCache.addPacket(buffer[:n])
-				continue
-			}
-			if m.pktCache.size > 0 {
-				totalSize, totalCount, flushSize, flushCount := m.pktCache.flushCache(func(buf []byte) error {
-					return sendUDPv1Packet(m.stream, entry.udpPort, buf)
-				})
-				if enableDebugLogging {
-					debug("total packet cache count [%d] cache size [%d]", totalCount, totalSize)
-					debug("flush packet cache count [%d] cache size [%d]", flushCount, flushSize)
-				}
-			}
-			if err := sendUDPv1Packet(m.stream, entry.udpPort, buffer[:n]); err != nil {
-				warning("UDPv1 forward send back to [%d] failed: %v", entry.udpPort, err)
-			}
-		}
-	}
-}
-func (m *udpv1ConnManager) getUdpConn(port uint16) (*net.UDPConn, error) {
-	m.mutex.Lock()
-	defer m.mutex.Unlock()
-
-	if entry, ok := m.connMap[port]; ok {
-		return entry.udpConn, nil
-	}
-
-	conn, err := net.DialUDP("udp", nil, m.udpAddr)
-	if err != nil {
-		return nil, fmt.Errorf("dial udp [%s] failed: %v", m.udpAddr.String(), err)
-	}
-	_ = conn.SetReadBuffer(kProxyBufferSize)
-	_ = conn.SetWriteBuffer(kProxyBufferSize)
-
-	entry := &udpv1ConnEntry{
-		udpPort:   port,
-		udpConn:   conn,
-		closeChan: make(chan struct{}),
-	}
-	entry.aliveTime.Store(time.Now().UnixMilli())
-	m.connMap[port] = entry
-
-	go m.backendToFrontend(entry)
-	return conn, nil
-}
-
-func (m *udpv1ConnManager) cleanupInactiveConn() {
-	m.aliveTime.Store(time.Now().UnixMilli())
-	timeoutMilli := int64(m.timeout / time.Millisecond)
-	for {
-		time.Sleep(m.timeout)
-		m.mutex.Lock()
-		for port, entry := range m.connMap {
-			if m.aliveTime.Load()-entry.aliveTime.Load() > timeoutMilli {
-				close(entry.closeChan)
-				_ = entry.udpConn.Close()
-				delete(m.connMap, port)
-			}
-		}
-		m.mutex.Unlock()
+	if cr, ok := conn.(interface{ CloseRead() error }); ok {
+		_ = cr.CloseRead()
 	}
 }

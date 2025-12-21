@@ -66,43 +66,34 @@ const (
 var quicConfig = quic.Config{
 	HandshakeIdleTimeout: 30 * time.Second,
 	MaxIdleTimeout:       365 * 24 * time.Hour,
+	EnableDatagrams:      true,
 }
 
 func initServer(args *tsshdArgs) (*kcp.Listener, *quic.Listener, error) {
-	conn, port, err := listenOnFreePort(args)
+	connList, port, err := listenOnFreePort(args)
 	if err != nil {
 		return nil, nil, err
 	}
 
 	info := &ServerInfo{
-		Ver:  kTsshdVersion,
-		Port: port,
+		ServerVer: kTsshdVersion,
+		Port:      port,
 	}
 
-	if args.Proxy || args.TCP {
-		conn, err = startServerProxy(args, info, conn)
-		if err != nil {
-			return nil, nil, err
-		}
-	}
-
-	for i := 1; i < len(conn); i++ {
-		_ = conn[i].Close()
+	udpConn, err := startServerProxy(args, info, connList)
+	if err != nil {
+		return nil, nil, err
 	}
 
 	var kcpListener *kcp.Listener
 	var quicListener *quic.Listener
-	if udpConn, ok := conn[0].(*net.UDPConn); ok {
-		if args.KCP {
-			kcpListener, err = listenKCP(udpConn, info)
-		} else {
-			quicListener, err = listenQUIC(udpConn, info)
-		}
-		if err != nil {
-			return nil, nil, err
-		}
+	if args.KCP {
+		kcpListener, err = listenKCP(udpConn, info)
 	} else {
-		return nil, nil, fmt.Errorf("conn is not *net.UDPConn: %T", udpConn)
+		quicListener, err = listenQUIC(udpConn, info)
+	}
+	if err != nil {
+		return nil, nil, err
 	}
 
 	infoStr, err := json.Marshal(info)

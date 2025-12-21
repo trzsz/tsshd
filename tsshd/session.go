@@ -101,7 +101,7 @@ type sessionContext struct {
 type stderrStream struct {
 	id     uint64
 	wg     sync.WaitGroup
-	stream net.Conn
+	stream Stream
 }
 
 var sessionMutex sync.Mutex
@@ -142,7 +142,7 @@ func (c *sessionContext) StartCmd() error {
 	return nil
 }
 
-func (c *sessionContext) showMotd(stream net.Conn) {
+func (c *sessionContext) showMotd(stream Stream) {
 	printMotd := func(paths []string) {
 		for _, path := range paths {
 			file, err := os.Open(path)
@@ -202,12 +202,14 @@ func (c *sessionContext) discardPendingInput(buf []byte) error {
 	return nil
 }
 
-func (c *sessionContext) forwardInput(stream net.Conn) {
-	defer func() { _ = c.stdin.Close() }()
+func (c *sessionContext) forwardInput(stream Stream) {
+	defer func() {
+		_ = c.stdin.Close()
+		_ = stream.CloseRead()
+	}()
 	buffer := make([]byte, 32*1024)
 	for {
 		n, err := stream.Read(buffer)
-		inputChecker.updateTime(time.Now().UnixMilli())
 		if n > 0 {
 			if discardPendingInputFlag.Load() {
 				if err := c.discardPendingInput(buffer[:n]); err != nil {
@@ -226,16 +228,18 @@ func (c *sessionContext) forwardInput(stream net.Conn) {
 	debug("session [%d] stdin completed", c.id)
 }
 
-func (c *sessionContext) forwardOutput(name string, reader io.Reader, writer io.WriteCloser) {
-	defer func() { _ = writer.Close() }()
+func (c *sessionContext) forwardOutput(name string, reader io.Reader, stream Stream) {
+	defer func() { _ = stream.CloseWrite() }()
 	buffer := make([]byte, 32*1024)
 	for {
 		n, err := reader.Read(buffer)
 		if n > 0 {
-			for inputChecker.isTimeout() {
-				time.Sleep(10 * time.Millisecond)
+			if globalServerProxy.clientChecker.isTimeout() {
+				if globalServerProxy.clientChecker.waitUntilReconnected() != nil {
+					break
+				}
 			}
-			if err := writeAll(writer, buffer[:n]); err != nil {
+			if err := writeAll(stream, buffer[:n]); err != nil {
 				break
 			}
 		}
@@ -246,7 +250,7 @@ func (c *sessionContext) forwardOutput(name string, reader io.Reader, writer io.
 	debug("session [%d] %s completed", c.id, name)
 }
 
-func (c *sessionContext) forwardIO(stream net.Conn) {
+func (c *sessionContext) forwardIO(stream Stream) {
 	if c.stdin != nil {
 		go c.forwardInput(stream)
 	}
@@ -259,6 +263,7 @@ func (c *sessionContext) forwardIO(stream net.Conn) {
 		c.wg.Go(func() {
 			if stderr := getStderrStream(c.id); stderr != nil {
 				c.forwardOutput("stderr", c.stderr, stderr.stream)
+				stderr.Close()
 			} else {
 				_, _ = io.Copy(io.Discard, c.stderr)
 				debug("session [%d] stderr completed", c.id)
@@ -340,7 +345,7 @@ func (c *sessionContext) SetSize(cols, rows int, redraw bool) error {
 	return nil
 }
 
-func handleSessionEvent(stream net.Conn) {
+func handleSessionEvent(stream Stream) {
 	var msg startMessage
 	if err := recvMessage(stream, &msg); err != nil {
 		sendError(stream, fmt.Errorf("recv start message failed: %v", err))
@@ -416,7 +421,7 @@ func (c *stderrStream) Close() {
 	delete(stderrMap, c.id)
 }
 
-func newStderrStream(id uint64, stream net.Conn) (*stderrStream, error) {
+func newStderrStream(id uint64, stream Stream) (*stderrStream, error) {
 	stderrMutex.Lock()
 	defer stderrMutex.Unlock()
 	if _, ok := stderrMap[id]; ok {
@@ -522,7 +527,7 @@ func getSubsystemCmd(name string) (*exec.Cmd, error) {
 	return exec.Command(args[0], args[1:]...), nil
 }
 
-func handleStderrEvent(stream net.Conn) {
+func handleStderrEvent(stream Stream) {
 	var msg stderrMessage
 	if err := recvMessage(stream, &msg); err != nil {
 		sendError(stream, fmt.Errorf("recv stderr message failed: %v", err))
@@ -543,7 +548,7 @@ func handleStderrEvent(stream net.Conn) {
 	errStream.Wait()
 }
 
-func handleResizeEvent(stream net.Conn) error {
+func handleResizeEvent(stream Stream) error {
 	var msg resizeMessage
 	if err := recvMessage(stream, &msg); err != nil {
 		return fmt.Errorf("recv resize message failed: %v", err)

@@ -6,11 +6,11 @@ require (
 	github.com/UserExistsError/conpty v0.1.4
 	github.com/creack/pty v1.1.24
 	github.com/google/shlex v0.0.0-20191202100458-e7afc7fbc510
-	github.com/quic-go/quic-go v0.57.1
+	github.com/quic-go/quic-go v0.58.0
 	github.com/stretchr/testify v1.11.1
 	github.com/trzsz/shellescape v1.6.0
-	github.com/xtaci/kcp-go/v5 v5.6.56
-	github.com/xtaci/smux v1.5.47
+	github.com/xtaci/kcp-go/v5 v5.6.59
+	github.com/xtaci/smux v1.5.49
 	golang.org/x/crypto v0.46.0
 	golang.org/x/sys v0.39.0
 )

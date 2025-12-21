@@ -42,6 +42,27 @@ var smuxConfig = smux.Config{
 	MaxReceiveBuffer:  20 * 1024 * 1024,
 }
 
+// Stream extends net.Conn by adding support for half-close operations
+type Stream interface {
+	net.Conn
+	// CloseRead shuts down the reading side of the stream gracefully
+	CloseRead() error
+	// CloseWrite shuts down the writing side of the stream gracefully
+	CloseWrite() error
+}
+
+type smuxStream struct {
+	*smux.Stream
+}
+
+func (s *smuxStream) CloseRead() error {
+	return fmt.Errorf("smux: half-close is not yet supported")
+}
+
+func (s *smuxStream) CloseWrite() error {
+	return fmt.Errorf("smux: half-close is not yet supported")
+}
+
 type quicStream struct {
 	*quic.Stream
 	conn *quic.Conn
@@ -53,6 +74,25 @@ func (s *quicStream) LocalAddr() net.Addr {
 
 func (s *quicStream) RemoteAddr() net.Addr {
 	return s.conn.RemoteAddr()
+}
+
+func (s *quicStream) CloseRead() error {
+	s.CancelRead(0)
+	return nil
+}
+
+func (s *quicStream) CloseWrite() error {
+	// CancelWrite aborts sending on this stream.
+	// Data already written, but not yet delivered to the peer is not guaranteed to be delivered reliably.
+
+	// Close closes the send-direction of the stream.
+	// It does not close the receive-direction of the stream.
+	return s.Stream.Close()
+}
+
+func (s *quicStream) Close() error {
+	_ = s.CloseRead()
+	return s.CloseWrite()
 }
 
 func serveKCP(listener *kcp.Listener) {
@@ -67,7 +107,7 @@ func serveKCP(listener *kcp.Listener) {
 }
 
 func handleKcpConn(conn *kcp.UDPSession) {
-	defer func() { _ = conn.Close() }()
+	onExitFuncs = append(onExitFuncs, func() { _ = conn.Close() })
 
 	if serving.Load() {
 		return
@@ -86,10 +126,12 @@ func handleKcpConn(conn *kcp.UDPSession) {
 	for {
 		stream, err := session.AcceptStream()
 		if err != nil {
-			warning("kcp smux accept stream failed: %v", err)
+			if !isClosedError(err) {
+				warning("kcp smux accept stream failed: %v", err)
+			}
 			return
 		}
-		go handleStream(stream)
+		go handleStream(&smuxStream{stream})
 	}
 }
 
@@ -105,25 +147,27 @@ func serveQUIC(listener *quic.Listener) {
 }
 
 func handleQuicConn(conn *quic.Conn) {
-	defer func() {
-		_ = conn.CloseWithError(0, "")
-	}()
+	onExitFuncs = append(onExitFuncs, func() { _ = conn.CloseWithError(0, "") })
 
 	if serving.Load() {
 		return
 	}
 
+	globalUdpForwarder = &udpForwarder{conn: conn}
+
 	for {
 		stream, err := conn.AcceptStream(context.Background())
 		if err != nil {
-			warning("quic accept stream failed: %v", err)
+			if !isClosedError(err) {
+				warning("quic accept stream failed: %v", err)
+			}
 			return
 		}
 		go handleStream(&quicStream{stream, conn})
 	}
 }
 
-func handleStream(stream net.Conn) {
+func handleStream(stream Stream) {
 	defer func() { _ = stream.Close() }()
 
 	command, err := recvCommand(stream)
@@ -132,7 +176,7 @@ func handleStream(stream net.Conn) {
 		return
 	}
 
-	var handler func(net.Conn)
+	var handler func(Stream)
 
 	switch command {
 	case "bus":
@@ -147,8 +191,8 @@ func handleStream(stream net.Conn) {
 		handler = handleListenEvent
 	case "accept":
 		handler = handleAcceptEvent
-	case "UDPv1":
-		handler = handleUDPv1Event
+	case "dial-udp":
+		handler = handleDialUdpEvent
 	default:
 		sendError(stream, fmt.Errorf("unknown stream command: %s", command))
 		return

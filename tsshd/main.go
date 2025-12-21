@@ -45,7 +45,6 @@ type tsshdArgs struct {
 	TCP            bool
 	IPv4           bool
 	IPv6           bool
-	Proxy          bool
 	Debug          bool
 	Port           string
 	ConnectTimeout time.Duration
@@ -56,7 +55,7 @@ func printVersion() {
 }
 
 func printHelp() {
-	fmt.Printf("usage: tsshd [-h] [-v] [--kcp] [--tcp] [--ipv4] [--ipv6] [--proxy] [--debug] [--port low-high] [--connect-timeout t]\n\n" +
+	fmt.Printf("usage: tsshd [-h] [-v] [--kcp] [--tcp] [--ipv4] [--ipv6] [--debug] [--port low-high] [--connect-timeout t]\n\n" +
 		"tsshd: trzsz-ssh(tssh) server that supports connection migration for roaming.\n\n" +
 		"optional arguments:\n" +
 		"  -h, --help             show this help message and exit\n" +
@@ -65,7 +64,6 @@ func printHelp() {
 		"  --tcp                  Use UDP-over-TCP to bypass UDP blocking\n" +
 		"  --ipv4                 UDP only listens on IPv4, ignoring IPv6\n" +
 		"  --ipv6                 UDP only listens on IPv6, ignoring IPv4\n" +
-		"  --proxy                With UDP proxy for connection migration\n" +
 		"  --debug                Send debugging messages to the client\n" +
 		"  --port low-high        UDP port range that the tsshd listens on\n" +
 		"  --connect-timeout t    The timeout for tssh connecting to tsshd\n")
@@ -89,8 +87,6 @@ func parseTsshdArgs() *tsshdArgs {
 			args.IPv4 = true
 		case "--ipv6":
 			args.IPv6 = true
-		case "--proxy":
-			args.Proxy = true
 		case "--debug":
 			args.Debug = true
 		case "--port":
