@@ -44,6 +44,8 @@ import (
 	"github.com/trzsz/shellescape"
 )
 
+var maxPendingOutputLines = 1000
+
 var discardPendingInputFlag atomic.Bool
 var discardPendingInputMarker []byte
 var discardMarkerCurrentIndex uint32
@@ -229,21 +231,185 @@ func (c *sessionContext) forwardInput(stream Stream) {
 }
 
 func (c *sessionContext) forwardOutput(name string, reader io.Reader, stream Stream) {
-	defer func() { _ = stream.CloseWrite() }()
+	var writeError atomic.Bool
+	var chHasNewLine bool
+	done := make(chan struct{})
+	ch := make(chan []byte, 1)
+	defer func() { close(ch); <-done }()
+	go func() {
+		defer func() { _ = stream.CloseWrite(); close(done) }()
+		for buf := range ch {
+			if err := writeAll(stream, buf); err != nil {
+				writeError.Store(true)
+				warning("write to [%s] failed: %v", name, err)
+				return
+			}
+		}
+	}()
+
+	var cacheLines [][]byte
+	var tmuxOutputPrefix string
+	var discardLines, discardBytes, voidedCapacity int
+
+	cacheOutput := func(buf []byte) {
+		for len(buf) > 0 {
+			pos := bytes.IndexByte(buf, '\n')
+
+			var line []byte
+			if pos >= 0 {
+				line = buf[:pos+1]
+				buf = buf[pos+1:]
+			} else {
+				line = buf
+				buf = nil
+			}
+
+			if len(cacheLines) == 0 {
+				cacheLines = append(cacheLines, line)
+				continue
+			}
+			last := cacheLines[len(cacheLines)-1]
+			if last[len(last)-1] != '\n' {
+				cacheLines[len(cacheLines)-1] = append(last, line...)
+				continue
+			}
+			cacheLines = append(cacheLines, line)
+		}
+
+		maxLines := max(maxPendingOutputLines, c.rows*2)
+		if len(cacheLines) > maxLines {
+			if discardLines == 0 {
+				tmuxOutputPrefix = extractTmuxOutputPrefix(cacheLines)
+			}
+
+			dropLines := len(cacheLines) - maxLines
+			discardLines += dropLines
+			for i := range dropLines {
+				discardBytes += len(cacheLines[i])
+			}
+			cacheLines = cacheLines[dropLines:]
+
+			voidedCapacity += dropLines
+			if voidedCapacity > maxLines {
+				newCacheLines := make([][]byte, len(cacheLines), maxLines*2+10)
+				copy(newCacheLines, cacheLines)
+				cacheLines = newCacheLines
+				voidedCapacity = 0
+			}
+		}
+	}
+
+	flushOutput := func() {
+		for i := -1; i < len(cacheLines); i++ {
+			var line []byte
+			if i < 0 {
+				if discardLines == 0 {
+					continue
+				}
+				line = fmt.Appendf(nil,
+					"\r\033[0;33mWarning: tsshd discarded %d lines %d bytes of output during client disconnection at this point!\033[0m\033[K\r\n",
+					discardLines, discardBytes)
+				if len(tmuxOutputPrefix) > 0 {
+					line = encodeTmuxOutput(tmuxOutputPrefix, line)
+				}
+			} else {
+				line = cacheLines[i]
+			}
+		out:
+			for {
+				select {
+				case ch <- line:
+					if i < 0 {
+						debug("discard output %d lines %d bytes", discardLines, discardBytes)
+						discardLines, discardBytes = 0, 0
+					}
+					break out
+				default:
+					if globalServerProxy.clientChecker.isTimeout() {
+						if i > 0 {
+							cacheLines = cacheLines[i:]
+						}
+						return
+					}
+					if writeError.Load() {
+						return
+					}
+					time.Sleep(10 * time.Millisecond)
+				}
+			}
+		}
+
+		cacheLines, chHasNewLine = nil, false
+	}
+
 	buffer := make([]byte, 32*1024)
 	for {
 		n, err := reader.Read(buffer)
 		if n > 0 {
-			if globalServerProxy.clientChecker.isTimeout() {
-				if globalServerProxy.clientChecker.waitUntilReconnected() != nil {
-					break
+			buf := make([]byte, n)
+			copy(buf, buffer[:n])
+
+			if chHasNewLine && globalServerProxy.clientChecker.isTimeout() && !globalSetting.keepPendingOutput.Load() {
+				cacheOutput(buf)
+				continue
+			}
+
+			if len(cacheLines) > 0 {
+				cacheOutput(buf)
+				flushOutput()
+				continue
+			}
+
+		out:
+			for {
+				select {
+				case ch <- buf:
+					break out
+				default:
+					if globalServerProxy.clientChecker.isTimeout() {
+						if globalSetting.keepPendingOutput.Load() {
+							if globalServerProxy.clientChecker.waitUntilReconnected() != nil {
+								return
+							}
+							continue
+						}
+						select {
+						case b := <-ch:
+							buf = append(b, buf...)
+						default:
+						}
+						pos := bytes.IndexByte(buf, '\n')
+						if pos < 0 {
+							ch <- buf
+							break out
+						}
+
+						ch <- buf[:pos+1]
+						chHasNewLine = true
+
+						left := buf[pos+1:]
+						if len(left) > 0 {
+							cacheOutput(left)
+						}
+						break out
+					}
+					if writeError.Load() {
+						return
+					}
+					time.Sleep(10 * time.Millisecond)
 				}
 			}
-			if err := writeAll(stream, buffer[:n]); err != nil {
-				break
-			}
 		}
+
 		if err != nil {
+			for len(cacheLines) > 0 && !writeError.Load() {
+				if globalServerProxy.clientChecker.isTimeout() {
+					if globalServerProxy.clientChecker.waitUntilReconnected() != nil {
+						break
+					}
+				}
+				flushOutput()
+			}
 			break
 		}
 	}
@@ -342,6 +508,7 @@ func (c *sessionContext) SetSize(cols, rows int, redraw bool) error {
 	if err := c.pty.Resize(cols, rows); err != nil {
 		return fmt.Errorf("pty set size failed: %v", err)
 	}
+	c.cols, c.rows = cols, rows
 	return nil
 }
 

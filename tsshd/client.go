@@ -381,9 +381,14 @@ func (c *SshUdpClient) SendRequest(name string, wantReply bool, payload []byte) 
 	return false, nil, fmt.Errorf("ssh udp client SendRequest is not supported yet")
 }
 
-// SetKeepPendingInput sets whether to keep the pending input during reconnection.
+// SetKeepPendingInput sets whether to keep the pending input during disconnection.
 func (c *SshUdpClient) SetKeepPendingInput(keep bool) error {
 	return c.sendBusMessage("setting", settingsMessage{KeepPendingInput: &keep})
+}
+
+// SetKeepPendingOutput sets whether to keep the pending output during disconnection.
+func (c *SshUdpClient) SetKeepPendingOutput(keep bool) error {
+	return c.sendBusMessage("setting", settingsMessage{KeepPendingOutput: &keep})
 }
 
 // IsClosed returns whether the client has closed

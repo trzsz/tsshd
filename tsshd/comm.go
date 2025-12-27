@@ -37,7 +37,8 @@ import (
 )
 
 type globalSettings struct {
-	keepPendingInput atomic.Bool
+	keepPendingInput  atomic.Bool
+	keepPendingOutput atomic.Bool
 }
 
 var globalSetting = &globalSettings{}

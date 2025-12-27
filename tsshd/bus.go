@@ -199,6 +199,9 @@ func handleSettingEvent(stream Stream) error {
 	if msg.KeepPendingInput != nil {
 		globalSetting.keepPendingInput.Store(*msg.KeepPendingInput)
 	}
+	if msg.KeepPendingOutput != nil {
+		globalSetting.keepPendingOutput.Store(*msg.KeepPendingOutput)
+	}
 	return nil
 }
 

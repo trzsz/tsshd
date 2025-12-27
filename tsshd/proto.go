@@ -213,7 +213,8 @@ type discardMessage struct {
 }
 
 type settingsMessage struct {
-	KeepPendingInput *bool `json:",omitempty"`
+	KeepPendingInput  *bool `json:",omitempty"`
+	KeepPendingOutput *bool `json:",omitempty"`
 }
 
 type errorResponder interface {
