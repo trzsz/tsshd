@@ -37,11 +37,21 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"golang.org/x/net/ipv4"
+	"golang.org/x/net/ipv6"
 )
 
 var globalServerProxy *serverProxy
 
 const kProxyBufferSize = 1024 * 1024
+
+const kProxyDSCP = 46
+
+func setDSCP(conn net.Conn, dscp int) {
+	_ = ipv4.NewConn(conn).SetTOS(dscp << 2)
+	_ = ipv6.NewConn(conn).SetTrafficClass(dscp)
+}
 
 func aesEncrypt(cipherBlock *cipher.Block, buf []byte) []byte {
 	gcm, err := cipher.NewGCM(*cipherBlock)
@@ -72,14 +82,14 @@ func aesDecrypt(cipherBlock *cipher.Block, buf []byte) []byte {
 	return plainText
 }
 
-func sendUdpPacket(conn net.Conn, data []byte) error {
+func sendUdpPacket(conn io.Writer, data []byte) error {
 	buf := make([]byte, 2+len(data))
 	binary.BigEndian.PutUint16(buf, uint16(len(data)))
 	copy(buf[2:], data)
 	return writeAll(conn, buf)
 }
 
-func recvUdpPacket(conn net.Conn, data []byte) (int, error) {
+func recvUdpPacket(conn io.Reader, data []byte) (int, error) {
 	buf := make([]byte, 2)
 	if _, err := io.ReadFull(conn, buf); err != nil {
 		return 0, err
@@ -464,6 +474,9 @@ func (p *serverProxy) tcpServeFrontendListener(listener *net.TCPListener) {
 			continue
 		}
 		neverAccepted = false
+		setDSCP(conn, kProxyDSCP)
+		_ = conn.SetReadBuffer(kProxyBufferSize)
+		_ = conn.SetWriteBuffer(kProxyBufferSize)
 		go p.tcpFrontendToBackend(conn)
 	}
 }
@@ -500,6 +513,7 @@ func (p *serverProxy) serveProxy() {
 		p.bufChan = make(chan *udpBuffer) // unbuffered channel to avaid copying buffer
 		for _, c := range p.frontendList {
 			if conn, ok := c.(*net.UDPConn); ok {
+				setDSCP(conn, kProxyDSCP)
 				_ = conn.SetReadBuffer(kProxyBufferSize)
 				_ = conn.SetWriteBuffer(kProxyBufferSize)
 				go p.udpServeFrontendConn(conn)
@@ -752,28 +766,42 @@ func (p *clientProxy) renewTransportPath(proxyClient *SshUdpClient, connectTimeo
 }
 
 func (p *clientProxy) renewTcpPath(proxyClient *SshUdpClient, connectTimeout time.Duration) error {
-	var err error
-	var conn net.Conn
+	var conn *serverConnHolder
+	var setReadDeadline func(t time.Time) error
 	if proxyClient != nil {
-		conn, err = proxyClient.DialTimeout(p.serverNet, p.serverAddr, connectTimeout)
+		tcpConn, err := proxyClient.DialTimeout(p.serverNet, p.serverAddr, connectTimeout)
 		if err != nil {
 			return fmt.Errorf("proxy dial [%s] [%s] failed: %v", p.serverNet, p.serverAddr, err)
 		}
+		setReadDeadline = tcpConn.SetReadDeadline
+		conn = &serverConnHolder{&tcpServerConn{tcpConn}}
 	} else {
-		conn, err = net.DialTimeout(p.serverNet, p.serverAddr, connectTimeout)
+		serverAddr, err := doWithTimeout(func() (*net.TCPAddr, error) {
+			return net.ResolveTCPAddr(p.serverNet, p.serverAddr)
+		}, connectTimeout)
+		if err != nil {
+			return fmt.Errorf("resolve addr [%s] [%s] failed: %v", p.serverNet, p.serverAddr, err)
+		}
+		tcpConn, err := doWithTimeout(func() (*net.TCPConn, error) {
+			return net.DialTCP(p.serverNet, nil, serverAddr)
+		}, connectTimeout)
 		if err != nil {
 			return fmt.Errorf("dial [%s] [%s] failed: %v", p.serverNet, p.serverAddr, err)
 		}
+		setDSCP(tcpConn, kProxyDSCP)
+		_ = tcpConn.SetReadBuffer(kProxyBufferSize)
+		_ = tcpConn.SetWriteBuffer(kProxyBufferSize)
+		setReadDeadline = tcpConn.SetReadDeadline
+		conn = &serverConnHolder{&tcpServerConn{tcpConn}}
 	}
 
-	svrConn := serverConnHolder{&tcpServerConn{conn}}
-
-	if err := p.sendAuthPacket(svrConn); err != nil {
+	if err := p.sendAuthPacket(conn); err != nil {
 		_ = conn.Close()
 		return err
 	}
 
-	if err := conn.SetReadDeadline(time.Now().Add(connectTimeout)); err != nil {
+	if err := setReadDeadline(time.Now().Add(connectTimeout)); err != nil {
+		_ = conn.Close()
 		return fmt.Errorf("set read deadline failed: %v", err)
 	}
 
@@ -790,21 +818,23 @@ func (p *clientProxy) renewTcpPath(proxyClient *SshUdpClient, connectTimeout tim
 	}
 	p.client.debug("serial number [%d] auth success", p.serialNumber)
 
-	_ = conn.SetReadDeadline(time.Time{})
-	p.backendConn.Store(&svrConn)
+	_ = setReadDeadline(time.Time{})
+	p.backendConn.Store(conn)
 	return nil
 }
 
 func (p *clientProxy) renewUdpPath(proxyClient *SshUdpClient, connectTimeout time.Duration) error {
 	var conn *serverConnHolder
 	if proxyClient != nil {
-		udpConn, err := proxyClient.DialUDP(p.serverNet, p.serverAddr)
+		udpConn, err := proxyClient.DialUDP(p.serverNet, p.serverAddr, connectTimeout)
 		if err != nil {
 			return fmt.Errorf("proxy dial [%s] [%s] failed: %v", p.serverNet, p.serverAddr, err)
 		}
 		conn = &serverConnHolder{udpConn}
 	} else {
-		serverAddr, err := net.ResolveUDPAddr(p.serverNet, p.serverAddr)
+		serverAddr, err := doWithTimeout(func() (*net.UDPAddr, error) {
+			return net.ResolveUDPAddr(p.serverNet, p.serverAddr)
+		}, connectTimeout)
 		if err != nil {
 			return fmt.Errorf("resolve addr [%s] [%s] failed: %v", p.serverNet, p.serverAddr, err)
 		}
@@ -812,6 +842,7 @@ func (p *clientProxy) renewUdpPath(proxyClient *SshUdpClient, connectTimeout tim
 		if err != nil {
 			return fmt.Errorf("dial [%s] [%s] failed: %v", p.serverNet, p.serverAddr, err)
 		}
+		setDSCP(udpConn, kProxyDSCP)
 		_ = udpConn.SetReadBuffer(kProxyBufferSize)
 		_ = udpConn.SetWriteBuffer(kProxyBufferSize)
 		conn = &serverConnHolder{&udpServerConn{udpConn}}

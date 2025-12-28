@@ -27,11 +27,12 @@ package tsshd
 import (
 	"context"
 	"fmt"
+	"io"
 	"net"
 
 	"github.com/quic-go/quic-go"
+	"github.com/trzsz/smux"
 	"github.com/xtaci/kcp-go/v5"
-	"github.com/xtaci/smux"
 )
 
 var smuxConfig = smux.Config{
@@ -53,14 +54,6 @@ type Stream interface {
 
 type smuxStream struct {
 	*smux.Stream
-}
-
-func (s *smuxStream) CloseRead() error {
-	return fmt.Errorf("smux: half-close is not yet supported")
-}
-
-func (s *smuxStream) CloseWrite() error {
-	return fmt.Errorf("smux: half-close is not yet supported")
 }
 
 type quicStream struct {
@@ -95,27 +88,89 @@ func (s *quicStream) Close() error {
 	return s.CloseWrite()
 }
 
-func serveKCP(listener *kcp.Listener) {
-	for {
-		conn, err := listener.AcceptKCP()
-		if err != nil {
-			warning("kcp accept failed: %v", err)
-			return
-		}
-		go handleKcpConn(conn)
+type kcpDatagramConn struct {
+	*kcp.UDPSession
+	buf chan []byte
+	mtu uint16
+}
+
+func newKcpDatagramConn(conn *kcp.UDPSession) datagramConn {
+	dc := &kcpDatagramConn{
+		conn,
+		make(chan []byte, 1024),
+		uint16(conn.GetOOBMaxSize()) - 8, // Reserve 8 bytes from the MTU for the channel ID
+	}
+	_ = conn.SetOOBHandler(dc.datagramHandler)
+	return dc
+}
+
+func (c *kcpDatagramConn) datagramHandler(buf []byte) {
+	select {
+	case c.buf <- append([]byte(nil), buf...):
+	default:
 	}
 }
 
-func handleKcpConn(conn *kcp.UDPSession) {
-	onExitFuncs = append(onExitFuncs, func() { _ = conn.Close() })
+func (c *kcpDatagramConn) SendDatagram(data []byte) error {
+	return c.SendOOB(data)
+}
 
-	if serving.Load() {
+func (c *kcpDatagramConn) ReceiveDatagram(ctx context.Context) ([]byte, error) {
+	select {
+	case buf, ok := <-c.buf:
+		if !ok {
+			return nil, io.EOF
+		}
+		return buf, nil
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+}
+
+func (c *kcpDatagramConn) GetMaxDatagramSize() uint16 {
+	return c.mtu
+}
+
+type quicDatagramConn struct {
+	*quic.Conn
+	mtu uint16
+}
+
+func newQuicDatagramConn(conn *quic.Conn) datagramConn {
+	return &quicDatagramConn{
+		conn,
+		// This depends on quicConfig.InitialPacketSize being properly clamped to the valid MTU range.
+		// See TestQUIC_InitialPacketSize for the test that ensures this behavior.
+		quicConfig.InitialPacketSize - kQuicShortHeaderSize - 8, // Reserve 8 bytes from the MTU for the channel ID
+	}
+}
+
+func (c *quicDatagramConn) GetMaxDatagramSize() uint16 {
+	return c.mtu
+}
+
+func serveKCP(listener *kcp.Listener, mtu uint16) {
+	conn, err := listener.AcceptKCP()
+	if err != nil {
+		warning("kcp accept failed: %v", err)
 		return
 	}
+	handleKcpConn(conn, mtu)
+}
+
+func handleKcpConn(conn *kcp.UDPSession, mtu uint16) {
+	onExitFuncs = append(onExitFuncs, func() { _ = conn.Close() })
 
 	conn.SetWindowSize(1024, 1024)
 	conn.SetNoDelay(1, 10, 2, 1)
 	conn.SetWriteDelay(false)
+	if mtu > 0 {
+		conn.SetMtu(int(mtu))
+	} else {
+		conn.SetMtu(kDefaultMTU)
+	}
+
+	globalUdpForwarder = &udpForwarder{conn: newKcpDatagramConn(conn)}
 
 	session, err := smux.Server(conn, &smuxConfig)
 	if err != nil {
@@ -136,24 +191,18 @@ func handleKcpConn(conn *kcp.UDPSession) {
 }
 
 func serveQUIC(listener *quic.Listener) {
-	for {
-		conn, err := listener.Accept(context.Background())
-		if err != nil {
-			warning("quic accept conn failed: %v", err)
-			return
-		}
-		go handleQuicConn(conn)
+	conn, err := listener.Accept(context.Background())
+	if err != nil {
+		warning("quic accept conn failed: %v", err)
+		return
 	}
+	handleQuicConn(conn)
 }
 
 func handleQuicConn(conn *quic.Conn) {
 	onExitFuncs = append(onExitFuncs, func() { _ = conn.CloseWithError(0, "") })
 
-	if serving.Load() {
-		return
-	}
-
-	globalUdpForwarder = &udpForwarder{conn: conn}
+	globalUdpForwarder = &udpForwarder{conn: newQuicDatagramConn(conn)}
 
 	for {
 		stream, err := conn.AcceptStream(context.Background())

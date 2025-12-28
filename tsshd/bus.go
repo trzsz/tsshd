@@ -128,6 +128,8 @@ func handleBusEvent(stream Stream) {
 		}
 
 		switch command {
+		case "exit":
+			err = handleExitEvent(stream)
 		case "resize":
 			err = handleResizeEvent(stream)
 		case "close":
@@ -148,6 +150,15 @@ func handleBusEvent(stream Stream) {
 			warning("handle bus command [%s] failed: %v", command, err)
 		}
 	}
+}
+
+func handleExitEvent(stream Stream) error {
+	var exitMsg exitMessage
+	if err := recvMessage(stream, &exitMsg); err != nil {
+		return fmt.Errorf("recv exit message failed: %v", err)
+	}
+	closeSession(exitMsg.ID)
+	return nil
 }
 
 func handleCloseEvent() {

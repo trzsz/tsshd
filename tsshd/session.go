@@ -871,12 +871,23 @@ func handleChannelAccept(listener net.Listener, channelType string) {
 	}
 }
 
+func closeSession(id uint64) {
+	sessionMutex.Lock()
+	defer sessionMutex.Unlock()
+	if ctx, ok := sessionMap[id]; ok {
+		debug("closing the session [%d]", id)
+		ctx.Close()
+		delete(sessionMap, id)
+	}
+}
+
 func closeAllSessions() {
 	sessionMutex.Lock()
 	var sessions []*sessionContext
 	for _, session := range sessionMap {
 		sessions = append(sessions, session)
 	}
+	sessionMap = make(map[uint64]*sessionContext)
 	sessionMutex.Unlock()
 
 	debug("closing all the sessions")

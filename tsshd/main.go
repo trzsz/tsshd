@@ -46,6 +46,7 @@ type tsshdArgs struct {
 	IPv4           bool
 	IPv6           bool
 	Debug          bool
+	MTU            uint16
 	Port           string
 	ConnectTimeout time.Duration
 }
@@ -55,7 +56,7 @@ func printVersion() {
 }
 
 func printHelp() {
-	fmt.Printf("usage: tsshd [-h] [-v] [--kcp] [--tcp] [--ipv4] [--ipv6] [--debug] [--port low-high] [--connect-timeout t]\n\n" +
+	fmt.Printf("usage: tsshd [-h] [-v] [--kcp] [--tcp] [--ipv4] [--ipv6] [--debug] [--mtu N] [--port low-high] [--connect-timeout t]\n\n" +
 		"tsshd: trzsz-ssh(tssh) server that supports connection migration for roaming.\n\n" +
 		"optional arguments:\n" +
 		"  -h, --help             show this help message and exit\n" +
@@ -65,6 +66,7 @@ func printHelp() {
 		"  --ipv4                 UDP only listens on IPv4, ignoring IPv6\n" +
 		"  --ipv6                 UDP only listens on IPv6, ignoring IPv4\n" +
 		"  --debug                Send debugging messages to the client\n" +
+		"  --mtu N                Sets the Maximum Transmission Unit (MTU)\n" +
 		"  --port low-high        UDP port range that the tsshd listens on\n" +
 		"  --connect-timeout t    The timeout for tssh connecting to tsshd\n")
 }
@@ -89,6 +91,13 @@ func parseTsshdArgs() *tsshdArgs {
 			args.IPv6 = true
 		case "--debug":
 			args.Debug = true
+		case "--mtu":
+			if i+1 < len(os.Args) && !strings.HasPrefix(os.Args[i+1], "-") {
+				if mtu, err := strconv.ParseUint(os.Args[i+1], 10, 16); err == nil {
+					args.MTU = uint16(mtu)
+				}
+				i++
+			}
 		case "--port":
 			if i+1 < len(os.Args) && !strings.HasPrefix(os.Args[i+1], "-") {
 				args.Port = os.Args[i+1]
@@ -195,7 +204,7 @@ func TsshdMain() int {
 
 	if kcpListener != nil {
 		defer func() { _ = kcpListener.Close() }()
-		go serveKCP(kcpListener)
+		go serveKCP(kcpListener, args.MTU)
 	}
 	if quicListener != nil {
 		defer func() { _ = quicListener.Close() }()

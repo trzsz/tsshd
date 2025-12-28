@@ -39,8 +39,8 @@ import (
 	"time"
 
 	"github.com/quic-go/quic-go"
+	"github.com/trzsz/smux"
 	"github.com/xtaci/kcp-go/v5"
-	"github.com/xtaci/smux"
 	"golang.org/x/crypto/pbkdf2"
 )
 
@@ -191,8 +191,9 @@ type acceptMessage struct {
 }
 
 type dialUdpMessage struct {
-	Net  string `json:",omitempty"`
-	Addr string `json:",omitempty"`
+	Net     string        `json:",omitempty"`
+	Addr    string        `json:",omitempty"`
+	Timeout time.Duration `json:",omitempty"`
 }
 
 type dialUdpResponse struct {
@@ -340,7 +341,9 @@ type protocolClient interface {
 }
 
 type kcpClient struct {
-	session *smux.Session
+	conn      *kcp.UDPSession
+	session   *smux.Session
+	forwarder *udpForwarder
 }
 
 func (c *kcpClient) closeClient() error {
@@ -348,7 +351,7 @@ func (c *kcpClient) closeClient() error {
 }
 
 func (c *kcpClient) getUdpForwarder() *udpForwarder {
-	return nil
+	return c.forwarder
 }
 
 func (c *kcpClient) newStream(connectTimeout time.Duration) (Stream, error) {
@@ -360,8 +363,8 @@ func (c *kcpClient) newStream(connectTimeout time.Duration) (Stream, error) {
 }
 
 type quicClient struct {
-	conn *quic.Conn
-	uf   *udpForwarder
+	conn      *quic.Conn
+	forwarder *udpForwarder
 }
 
 func (c *quicClient) closeClient() error {
@@ -369,7 +372,7 @@ func (c *quicClient) closeClient() error {
 }
 
 func (c *quicClient) getUdpForwarder() *udpForwarder {
-	return c.uf
+	return c.forwarder
 }
 
 func (c *quicClient) newStream(connectTimeout time.Duration) (Stream, error) {
@@ -382,20 +385,20 @@ func (c *quicClient) newStream(connectTimeout time.Duration) (Stream, error) {
 	return &quicStream{stream, c.conn}, err
 }
 
-func newProtoClient(addr string, info *ServerInfo, connectTimeout time.Duration) (protocolClient, error) {
+func newProtoClient(addr string, info *ServerInfo, mtu uint16, connectTimeout time.Duration) (protocolClient, error) {
 	switch info.Mode {
 	case "":
 		return nil, fmt.Errorf("%s", "Please upgrade tsshd")
 	case kUdpModeKCP:
-		return newKcpClient(addr, info)
+		return newKcpClient(addr, info, mtu)
 	case kUdpModeQUIC:
-		return newQuicClient(addr, info, connectTimeout)
+		return newQuicClient(addr, info, mtu, connectTimeout)
 	default:
 		return nil, fmt.Errorf("unknown tsshd mode: %s", info.Mode)
 	}
 }
 
-func newKcpClient(addr string, info *ServerInfo) (protocolClient, error) {
+func newKcpClient(addr string, info *ServerInfo, mtu uint16) (protocolClient, error) {
 	pass, err := hex.DecodeString(info.Pass)
 	if err != nil {
 		return nil, fmt.Errorf("decode pass [%s] failed: %w", info.Pass, err)
@@ -416,14 +419,19 @@ func newKcpClient(addr string, info *ServerInfo) (protocolClient, error) {
 	conn.SetWindowSize(1024, 1024)
 	conn.SetNoDelay(1, 10, 2, 1)
 	conn.SetWriteDelay(false)
+	if mtu > 0 {
+		conn.SetMtu(int(mtu))
+	} else {
+		conn.SetMtu(kDefaultMTU)
+	}
 	session, err := smux.Client(conn, &smuxConfig)
 	if err != nil {
 		return nil, fmt.Errorf("kcp smux client failed: %w", err)
 	}
-	return &kcpClient{session}, nil
+	return &kcpClient{conn, session, &udpForwarder{conn: newKcpDatagramConn(conn)}}, nil
 }
 
-func newQuicClient(addr string, info *ServerInfo, connectTimeout time.Duration) (protocolClient, error) {
+func newQuicClient(addr string, info *ServerInfo, mtu uint16, connectTimeout time.Duration) (protocolClient, error) {
 	serverCert, err := hex.DecodeString(info.ServerCert)
 	if err != nil {
 		return nil, fmt.Errorf("decode server cert [%s] failed: %w", info.ServerCert, err)
@@ -448,11 +456,19 @@ func newQuicClient(addr string, info *ServerInfo, connectTimeout time.Duration) 
 		RootCAs:      serverCertPool,
 		ServerName:   "tsshd",
 	}
+
+	if mtu > 0 {
+		quicConfig.InitialPacketSize = mtu
+		quicConfig.DisablePathMTUDiscovery = true
+	} else {
+		quicConfig.InitialPacketSize = kDefaultMTU
+	}
+
 	ctx, cancel := context.WithTimeout(context.Background(), connectTimeout)
 	defer cancel()
 	conn, err := quic.DialAddr(ctx, addr, tlsConfig, &quicConfig)
 	if err != nil {
 		return nil, fmt.Errorf("quic dail [%s] failed: %w", addr, err)
 	}
-	return &quicClient{conn, &udpForwarder{conn: conn}}, nil
+	return &quicClient{conn, &udpForwarder{conn: newQuicDatagramConn(conn)}}, nil
 }

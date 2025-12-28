@@ -63,6 +63,15 @@ const (
 	kDefaultPortRangeHigh = 61999
 )
 
+const (
+	kDefaultMTU = 1400
+
+	kQuicMinMTU = 1200
+	kQuicMaxMTU = 1452
+	// 1 /* type byte */ + 20 /* maximum connection ID length */ + 16 /* tag size */
+	kQuicShortHeaderSize = 37
+)
+
 var quicConfig = quic.Config{
 	HandshakeIdleTimeout: 30 * time.Second,
 	MaxIdleTimeout:       365 * 24 * time.Hour,
@@ -90,7 +99,7 @@ func initServer(args *tsshdArgs) (*kcp.Listener, *quic.Listener, error) {
 	if args.KCP {
 		kcpListener, err = listenKCP(udpConn, info)
 	} else {
-		quicListener, err = listenQUIC(udpConn, info)
+		quicListener, err = listenQUIC(udpConn, info, args.MTU)
 	}
 	if err != nil {
 		return nil, nil, err
@@ -297,7 +306,7 @@ func listenKCP(conn *net.UDPConn, info *ServerInfo) (*kcp.Listener, error) {
 	return listener, nil
 }
 
-func listenQUIC(conn *net.UDPConn, info *ServerInfo) (*quic.Listener, error) {
+func listenQUIC(conn net.PacketConn, info *ServerInfo, mtu uint16) (*quic.Listener, error) {
 	serverCertPEM, serverKeyPEM, err := generateCertKeyPair()
 	if err != nil {
 		return nil, err
@@ -318,6 +327,13 @@ func listenQUIC(conn *net.UDPConn, info *ServerInfo) (*quic.Listener, error) {
 		Certificates: []tls.Certificate{serverTlsCert},
 		ClientCAs:    clientCertPool,
 		ClientAuth:   tls.RequireAndVerifyClientCert,
+	}
+
+	if mtu > 0 {
+		quicConfig.InitialPacketSize = mtu
+		quicConfig.DisablePathMTUDiscovery = true
+	} else {
+		quicConfig.InitialPacketSize = kDefaultMTU
 	}
 
 	listener, err := (&quic.Transport{Conn: conn}).Listen(tlsConfig, &quicConfig)

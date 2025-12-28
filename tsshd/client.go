@@ -61,7 +61,7 @@ type SshUdpClient struct {
 	networkProxy    *clientProxy
 	intervalTime    time.Duration
 	connectTimeout  time.Duration
-	waitGroup       sync.WaitGroup
+	exitWG          sync.WaitGroup
 	closed          atomic.Bool
 	busMutex        sync.Mutex
 	busStream       Stream
@@ -135,7 +135,11 @@ func NewSshUdpClient(opts *UdpClientOptions) (*SshUdpClient, error) {
 		return nil, err
 	}
 
-	udpClient.protoClient, err = newProtoClient(tsshdAddr, opts.ServerInfo, opts.ConnectTimeout)
+	mtu := uint16(0)
+	if opts.ProxyClient != nil {
+		mtu = opts.ProxyClient.GetMaxDatagramSize()
+	}
+	udpClient.protoClient, err = newProtoClient(tsshdAddr, opts.ServerInfo, mtu, opts.ConnectTimeout)
 	if err != nil {
 		return nil, err
 	}
@@ -203,7 +207,7 @@ func (c *SshUdpClient) warning(format string, a ...any) {
 
 // Wait blocks until the client has shut down
 func (c *SshUdpClient) Wait() error {
-	c.waitGroup.Wait()
+	c.exitWG.Wait()
 	return nil
 }
 
@@ -269,9 +273,9 @@ func (c *SshUdpClient) NewSession() (*SshUdpSession, error) {
 	if err != nil {
 		return nil, err
 	}
-	c.waitGroup.Add(1)
+	c.exitWG.Add(1)
 	udpSession := &SshUdpSession{client: c, stream: stream, envs: make(map[string]string)}
-	udpSession.wg.Add(1)
+	udpSession.exitWG.Add(1)
 	c.sessionMutex.Lock()
 	defer c.sessionMutex.Unlock()
 	udpSession.id = c.sessionID.Add(1) - 1
@@ -299,20 +303,21 @@ func (c *SshUdpClient) DialTimeout(network, addr string, timeout time.Duration) 
 		_ = stream.Close()
 		return nil, err
 	}
-	c.waitGroup.Add(1)
+	c.exitWG.Add(1)
 	return &sshUdpConn{Stream: stream, rAddr: resp.RemoteAddr, client: c}, nil
 }
 
 // DialUDP initiates a logical UDP connection to the addr from the remote host
-func (c *SshUdpClient) DialUDP(network, addr string) (PacketConn, error) {
+func (c *SshUdpClient) DialUDP(network, addr string, timeout time.Duration) (PacketConn, error) {
 	stream, err := c.newStream("dial-udp")
 	if err != nil {
 		return nil, err
 	}
 
 	msg := dialUdpMessage{
-		Net:  network,
-		Addr: addr,
+		Net:     network,
+		Addr:    addr,
+		Timeout: timeout,
 	}
 	if err := sendMessage(stream, &msg); err != nil {
 		_ = stream.Close()
@@ -332,7 +337,7 @@ func (c *SshUdpClient) DialUDP(network, addr string) (PacketConn, error) {
 		return nil, fmt.Errorf("send udp ready message failed: %w", err)
 	}
 
-	c.waitGroup.Add(1)
+	c.exitWG.Add(1)
 	return &sshUdpPacketConn{conn, c}, nil
 }
 
@@ -354,7 +359,7 @@ func (c *SshUdpClient) Listen(network, addr string) (net.Listener, error) {
 		_ = stream.Close()
 		return nil, err
 	}
-	c.waitGroup.Add(1)
+	c.exitWG.Add(1)
 	return &sshUdpListener{client: c, stream: stream}, nil
 }
 
@@ -415,6 +420,12 @@ func (c *SshUdpClient) GetLastReconnectError() error {
 		return *err
 	}
 	return nil
+}
+
+// GetMaxDatagramSize returns the maximum payload size (in bytes) that
+// can be sent in a single datagram over this SshUdpClient.
+func (c *SshUdpClient) GetMaxDatagramSize() uint16 {
+	return c.protoClient.getUdpForwarder().conn.GetMaxDatagramSize()
 }
 
 func (c *SshUdpClient) tryToReconnect() {
@@ -568,7 +579,7 @@ func (c *SshUdpClient) handleExitEvent() {
 	udpSession.exit(exitMsg.ExitCode)
 
 	delete(c.sessionMap, exitMsg.ID)
-	c.waitGroup.Done()
+	c.exitWG.Done()
 }
 
 func (c *SshUdpClient) handleDebugEvent() {
@@ -653,7 +664,7 @@ func (c *SshUdpClient) handleDiscardEvent() {
 // SshUdpSession represents a connection to a remote command or shell
 type SshUdpSession struct {
 	id      uint64
-	wg      sync.WaitGroup
+	exitWG  sync.WaitGroup
 	client  *SshUdpClient
 	stream  Stream
 	pty     bool
@@ -672,7 +683,7 @@ type SshUdpSession struct {
 
 // Wait waits for the remote command to exit
 func (s *SshUdpSession) Wait() error {
-	s.wg.Wait()
+	s.exitWG.Wait()
 	return nil
 }
 
@@ -682,11 +693,49 @@ func (s *SshUdpSession) Close() error {
 		return nil
 	}
 
+	isExited := func(timeout time.Duration) bool {
+		done := make(chan struct{})
+		go func() {
+			s.exitWG.Wait()
+			close(done)
+		}()
+
+		select {
+		case <-done:
+			return true
+		case <-time.After(timeout):
+			return false
+		}
+	}
+
 	_, err := doWithTimeout(func() (int, error) {
+
+		if isExited(100 * time.Millisecond) {
+			err := s.stream.Close()
+			return 0, err
+		}
+
+		s.client.debug("requesting exit session [%d]", s.id)
+		if err := s.client.sendBusMessage("exit", exitMessage{ID: s.id}); err != nil {
+			s.client.debug("exit session [%d] failed: %v", s.id, err)
+			err := s.stream.Close()
+			return 0, err
+		}
+
+		if isExited(350 * time.Millisecond) {
+			s.client.debug("exit session [%d] wait completed", s.id)
+		}
+
 		err := s.stream.Close()
-		s.client.debug("close session stream completed")
 		return 0, err
-	}, 100*time.Millisecond)
+
+	}, 500*time.Millisecond)
+
+	if err != nil {
+		s.client.debug("close session [%d] failed: %v", s.id, err)
+	} else {
+		s.client.debug("close session [%d] completed", s.id)
+	}
 	return err
 }
 
@@ -760,7 +809,7 @@ func (s *SshUdpSession) startSession(msg *startMessage) error {
 		go s.forwardInput()
 	}
 	if s.stdout != nil {
-		s.wg.Go(func() { s.forwardOutput("stdout", s.stream, s.stdout) })
+		s.exitWG.Go(func() { s.forwardOutput("stdout", s.stream, s.stdout) })
 	}
 	return nil
 }
@@ -769,8 +818,7 @@ func (s *SshUdpSession) forwardInput() {
 	defer func() {
 		_ = s.stdin.Close()
 		if err := s.stream.CloseWrite(); err != nil {
-			// KCP streams do not support half-close. Close the entire stream to exit properly.
-			_ = s.stream.Close()
+			s.client.debug("session [%d] close write failed: %v", s.id, err)
 		}
 	}()
 	buffer := make([]byte, 32*1024)
@@ -816,7 +864,7 @@ func (s *SshUdpSession) forwardOutput(name string, reader Stream, writer *io.Pip
 
 func (s *SshUdpSession) exit(code int) {
 	s.code = code
-	s.wg.Done()
+	s.exitWG.Done()
 }
 
 // WindowChange informs the remote host about a terminal window dimension
@@ -879,7 +927,7 @@ func (s *SshUdpSession) StderrPipe() (io.Reader, error) {
 	}
 	reader, writer := io.Pipe()
 	s.stderr = writer
-	s.wg.Go(func() { s.forwardOutput("stderr", stream, s.stderr) })
+	s.exitWG.Go(func() { s.forwardOutput("stderr", stream, s.stderr) })
 	return reader, nil
 }
 
@@ -1018,7 +1066,7 @@ func (l *sshUdpListener) Accept() (net.Conn, error) {
 		_ = stream.Close()
 		return nil, err
 	}
-	l.client.waitGroup.Add(1)
+	l.client.exitWG.Add(1)
 	return &sshUdpConn{Stream: stream, client: l.client}, nil
 }
 
@@ -1027,7 +1075,7 @@ func (l *sshUdpListener) Close() error {
 		return nil
 	}
 	err := l.stream.Close()
-	l.client.waitGroup.Done()
+	l.client.exitWG.Done()
 	return err
 }
 
@@ -1056,7 +1104,7 @@ func (c *sshUdpConn) Close() error {
 		return nil
 	}
 	err := c.Stream.Close()
-	c.client.waitGroup.Done()
+	c.client.exitWG.Done()
 	return err
 }
 
@@ -1086,7 +1134,7 @@ func (c *sshUdpNewChannel) Accept() (ssh.Channel, <-chan *ssh.Request, error) {
 		_ = stream.Close()
 		return nil, nil, err
 	}
-	c.client.waitGroup.Add(1)
+	c.client.exitWG.Add(1)
 	return &sshUdpChannel{Stream: stream, client: c.client}, nil, nil
 }
 
@@ -1122,7 +1170,7 @@ func (c *sshUdpChannel) Close() error {
 		return nil
 	}
 	err := c.Stream.Close()
-	c.client.waitGroup.Done()
+	c.client.exitWG.Done()
 	return err
 }
 
@@ -1142,6 +1190,6 @@ type sshUdpPacketConn struct {
 
 func (c *sshUdpPacketConn) Close() error {
 	err := c.packetConn.Close()
-	c.client.waitGroup.Done()
+	c.client.exitWG.Done()
 	return err
 }

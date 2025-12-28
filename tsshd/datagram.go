@@ -33,8 +33,6 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
-
-	"github.com/quic-go/quic-go"
 )
 
 var globalUdpForwarder *udpForwarder
@@ -59,8 +57,14 @@ type PacketConn interface {
 	Consume(consumeFn func([]byte) error) error
 }
 
+type datagramConn interface {
+	GetMaxDatagramSize() uint16
+	SendDatagram(data []byte) error
+	ReceiveDatagram(ctx context.Context) ([]byte, error)
+}
+
 type udpForwarder struct {
-	conn       *quic.Conn
+	conn       datagramConn
 	channelMap sync.Map
 	workerOnce sync.Once
 	closingCh  chan uint64
@@ -135,9 +139,8 @@ func (f *udpForwarder) startWorker() {
 }
 
 func (f *udpForwarder) sendDatagram(id uint64, buf []byte) bool {
-	// Since packet loss detection is not implemented, we conservatively limit
-	// the payload size to avoid drops caused by exceeding the effective MTU.
-	if len(buf) > 1100 {
+	if len(buf) > int(f.conn.GetMaxDatagramSize()) {
+		debug("datagram buffer size [%d] larger than [%d]", len(buf), f.conn.GetMaxDatagramSize())
 		return false
 	}
 
@@ -325,7 +328,9 @@ func handleDialUdpEvent(stream Stream) {
 		return
 	}
 
-	addr, err := net.ResolveUDPAddr(msg.Net, msg.Addr)
+	addr, err := doWithTimeout(func() (*net.UDPAddr, error) {
+		return net.ResolveUDPAddr(msg.Net, msg.Addr)
+	}, msg.Timeout)
 	if err != nil {
 		sendError(stream, err)
 		return
