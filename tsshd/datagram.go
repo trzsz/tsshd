@@ -328,9 +328,15 @@ func handleDialUdpEvent(stream Stream) {
 		return
 	}
 
-	addr, err := doWithTimeout(func() (*net.UDPAddr, error) {
-		return net.ResolveUDPAddr(msg.Net, msg.Addr)
-	}, msg.Timeout)
+	var err error
+	var addr *net.UDPAddr
+	if msg.Timeout > 0 {
+		addr, err = doWithTimeout(func() (*net.UDPAddr, error) {
+			return net.ResolveUDPAddr(msg.Net, msg.Addr)
+		}, msg.Timeout)
+	} else {
+		addr, err = net.ResolveUDPAddr(msg.Net, msg.Addr)
+	}
 	if err != nil {
 		sendError(stream, err)
 		return

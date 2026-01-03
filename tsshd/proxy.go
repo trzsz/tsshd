@@ -806,7 +806,7 @@ func (p *clientProxy) renewTcpPath(proxyClient *SshUdpClient, connectTimeout tim
 	}
 
 	buffer := make([]byte, 256)
-	n, err := recvUdpPacket(conn, buffer)
+	n, err := conn.Read(buffer)
 	if err != nil {
 		_ = conn.Close()
 		return fmt.Errorf("recv auth packet failed: %v", err)

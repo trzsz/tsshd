@@ -34,6 +34,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/quic-go/quic-go"
 )
 
 type globalSettings struct {
@@ -71,7 +73,7 @@ func debug(format string, a ...any) {
 	initDebugSenderOnce.Do(func() {
 		debugMsgChan = make(chan *debugMessage, 100)
 		busClosingWG.Go(func() {
-			for busStream == nil {
+			for !isBusStreamInited() {
 				time.Sleep(10 * time.Millisecond)
 			}
 			for msg := range debugMsgChan {
@@ -111,7 +113,7 @@ func warning(format string, a ...any) {
 	initWarningSenderOnce.Do(func() {
 		warningMsgChan = make(chan string, 10)
 		busClosingWG.Go(func() {
-			for busStream == nil {
+			for !isBusStreamInited() {
 				time.Sleep(10 * time.Millisecond)
 			}
 			for msg := range warningMsgChan {
@@ -158,6 +160,9 @@ func doWithTimeout[T any](task func() (T, error), timeout time.Duration) (T, err
 }
 
 func isClosedError(err error) bool {
+	if err == nil {
+		return false
+	}
 	if errors.Is(err, io.EOF) {
 		return true
 	}
@@ -167,7 +172,11 @@ func isClosedError(err error) bool {
 	if errors.Is(err, io.ErrClosedPipe) {
 		return true
 	}
-	if err != nil && strings.Contains(err.Error(), "io: read/write on closed pipe") {
+	var qse *quic.StreamError
+	if errors.As(err, &qse) && qse.ErrorCode == 0 {
+		return true
+	}
+	if strings.Contains(err.Error(), "io: read/write on closed pipe") {
 		return true
 	}
 	return false

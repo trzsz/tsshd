@@ -1,5 +1,7 @@
 cloud.google.com/go v0.26.0/go.mod h1:aQUYkXzVsufM+DwF1aE+0xfcU+56JwCaLick0ClmMTw=
 github.com/BurntSushi/toml v0.3.1/go.mod h1:xHWCNGjB5oqiDr8zfno3MHue2Ht5sIBksp03qcyfWMU=
+github.com/Microsoft/go-winio v0.6.2 h1:F2VQgta7ecxGYO8k3ZZz3RS8fVIXVxONVUPlNERoyfY=
+github.com/Microsoft/go-winio v0.6.2/go.mod h1:yd8OoFMLzJbo9gZq8j5qaps8bJ9aShtEA8Ipt1oGCvU=
 github.com/UserExistsError/conpty v0.1.4 h1:+3FhJhiqhyEJa+K5qaK3/w6w+sN3Nh9O9VbJyBS02to=
 github.com/UserExistsError/conpty v0.1.4/go.mod h1:PDglKIkX3O/2xVk0MV9a6bCWxRmPVfxqZoTG/5sSd9I=
 github.com/census-instrumentation/opencensus-proto v0.2.1/go.mod h1:f6KPmirojxKA12rnyqOA5BBL4O983OfeGPqjHWSTneU=
@@ -55,8 +57,8 @@ github.com/trzsz/shellescape v1.6.0 h1:Xtbjtc1X5xnQHQnzXvmJj+X0I3t7iPMOyeylKitzj
 github.com/trzsz/shellescape v1.6.0/go.mod h1:HNPLv0Eucq99+zd8JndNxbg8e0vAWDTwMLBSss79rcw=
 github.com/trzsz/smux v1.6.0 h1:HsO9v13afXmoY4YTRjXHDaRNtVKjfkODrMepWPVFyeE=
 github.com/trzsz/smux v1.6.0/go.mod h1:wbXsDGhxb1gAtvRfgudcu4MLSI8ZMAY9xNe+Ggj+RwU=
-github.com/xtaci/kcp-go/v5 v5.6.60 h1:Z4EZ793htKDlUKxnFz9Ky5XmSUHYPwsYDIwzRsSnuBQ=
-github.com/xtaci/kcp-go/v5 v5.6.60/go.mod h1:9O3D8WR+cyyUjGiTILYfg17vn72otWuXK2AFfqIe6CM=
+github.com/xtaci/kcp-go/v5 v5.6.61 h1:ajm12pGuWO+GWQNusPyPESC7Rq0yTC2rEXVYkM8ExOg=
+github.com/xtaci/kcp-go/v5 v5.6.61/go.mod h1:9O3D8WR+cyyUjGiTILYfg17vn72otWuXK2AFfqIe6CM=
 github.com/xtaci/lossyconn v0.0.0-20190602105132-8df528c0c9ae h1:J0GxkO96kL4WF+AIT3M4mfUVinOCPgf2uUWYFUzN0sM=
 github.com/xtaci/lossyconn v0.0.0-20190602105132-8df528c0c9ae/go.mod h1:gXtu8J62kEgmN++bm9BVICuT/e8yiLI2KFobd/TRFsE=
 go.uber.org/mock v0.6.0 h1:hyF9dfmbgIX5EfOdasqLsWD6xqpNZlXblLB/Dbnwv3Y=

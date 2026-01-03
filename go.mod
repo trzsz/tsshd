@@ -3,6 +3,7 @@ module github.com/trzsz/tsshd
 go 1.25
 
 require (
+	github.com/Microsoft/go-winio v0.6.2
 	github.com/UserExistsError/conpty v0.1.4
 	github.com/creack/pty v1.1.24
 	github.com/google/shlex v0.0.0-20191202100458-e7afc7fbc510
@@ -10,7 +11,7 @@ require (
 	github.com/stretchr/testify v1.11.1
 	github.com/trzsz/shellescape v1.6.0
 	github.com/trzsz/smux v1.6.0
-	github.com/xtaci/kcp-go/v5 v5.6.60
+	github.com/xtaci/kcp-go/v5 v5.6.61
 	golang.org/x/crypto v0.46.0
 	golang.org/x/net v0.48.0
 	golang.org/x/sys v0.39.0

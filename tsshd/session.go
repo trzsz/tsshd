@@ -232,7 +232,6 @@ func (c *sessionContext) forwardInput(stream Stream) {
 
 func (c *sessionContext) forwardOutput(name string, reader io.Reader, stream Stream) {
 	var writeError atomic.Bool
-	var chHasNewLine bool
 	done := make(chan struct{})
 	ch := make(chan []byte, 1)
 	defer func() { close(ch); <-done }()
@@ -299,7 +298,18 @@ func (c *sessionContext) forwardOutput(name string, reader io.Reader, stream Str
 		}
 	}
 
+	// chHasNewLine ensures the client receives a complete line before further output is cached.
+	var chHasNewLine bool
+
 	flushOutput := func() {
+		filteredCount := 0
+		if enableDebugLogging {
+			defer func() {
+				if filteredCount > 0 {
+					debug("filtered %d ESC[6n cursor position request(s)", filteredCount)
+				}
+			}()
+		}
 		for i := -1; i < len(cacheLines); i++ {
 			var line []byte
 			if i < 0 {
@@ -314,6 +324,13 @@ func (c *sessionContext) forwardOutput(name string, reader io.Reader, stream Str
 				}
 			} else {
 				line = cacheLines[i]
+				if enableDebugLogging {
+					filteredCount += bytes.Count(line, []byte("\x1b[6n"))
+				}
+				line = bytes.ReplaceAll(line, []byte("\x1b[6n"), []byte(""))
+				if len(line) == 0 {
+					continue
+				}
 			}
 		out:
 			for {
@@ -360,6 +377,15 @@ func (c *sessionContext) forwardOutput(name string, reader io.Reader, stream Str
 				continue
 			}
 
+			var remaining []byte
+			if globalServerProxy.clientChecker.isTimeout() && !globalSetting.keepPendingOutput.Load() {
+				if pos := bytes.IndexByte(buf, '\n'); pos >= 0 {
+					remaining = buf[pos+1:]
+					buf = buf[:pos+1]
+					chHasNewLine = true
+				}
+			}
+
 		out:
 			for {
 				select {
@@ -398,6 +424,10 @@ func (c *sessionContext) forwardOutput(name string, reader io.Reader, stream Str
 					}
 					time.Sleep(10 * time.Millisecond)
 				}
+			}
+
+			if len(remaining) > 0 {
+				cacheOutput(remaining)
 			}
 		}
 
@@ -827,27 +857,12 @@ func handleAgentRequest(msg *startMessage) {
 		return
 	}
 
-	tempDir, err := os.MkdirTemp("", "tsshd-")
+	listener, agentPath, err := listenForAgent()
 	if err != nil {
-		warning("agent forwarding mkdir temp failed: %v", err)
+		warning("listen for agent forwarding failed: %v", err)
 		return
 	}
-	onExitFuncs = append(onExitFuncs, func() {
-		_ = os.RemoveAll(tempDir)
-	})
-	agentPath := filepath.Join(tempDir, fmt.Sprintf("agent.%d", os.Getpid()))
-	listener, err := net.Listen("unix", agentPath)
-	if err != nil {
-		warning("agent forwarding listen on [%s] failed: %v", agentPath, err)
-		return
-	}
-	if err := os.Chmod(agentPath, 0600); err != nil {
-		warning("agent forwarding chmod [%s] failed: %v", agentPath, err)
-	}
-	onExitFuncs = append(onExitFuncs, func() {
-		_ = listener.Close()
-		_ = os.Remove(agentPath)
-	})
+
 	go handleChannelAccept(listener, msg.Agent.ChannelType)
 	if msg.Envs == nil {
 		msg.Envs = make(map[string]string)
@@ -859,7 +874,11 @@ func handleChannelAccept(listener net.Listener, channelType string) {
 	for {
 		conn, err := listener.Accept()
 		if err != nil {
-			warning("channel accept failed: %v", err)
+			if isClosedError(err) {
+				debug("listen channel closed: %v", err)
+				break
+			}
+			warning("listen channel accept failed: %v", err)
 			break
 		}
 		go func(conn net.Conn) {

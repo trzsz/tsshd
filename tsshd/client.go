@@ -448,9 +448,12 @@ func (c *SshUdpClient) tryToReconnect() {
 		time.Sleep(c.intervalTime)
 	}
 
-	for c.activeChecker.isTimeout() {
+	for c.activeChecker.isTimeout() && !c.IsClosed() {
 		c.debug("attempting new transport path")
 		if err := c.networkProxy.renewTransportPath(c.proxyClient, c.connectTimeout); err != nil {
+			if c.IsClosed() {
+				return
+			}
 			c.debug("reconnect failed: %v", err)
 			c.reconnectError.Store(&err)
 			time.Sleep(c.intervalTime) // don't reconnect too frequently
@@ -480,14 +483,14 @@ func (c *SshUdpClient) keepAlive(intervalTime time.Duration) {
 		}
 
 		aliveTime := time.Now().UnixMilli()
-		if enableDebugLogging && c.activeChecker.isTimeout() {
+		if c.activeChecker.isTimeout() && enableDebugLogging {
 			c.debug("sending new keep alive [%d]", aliveTime)
 		}
 		if err := c.sendBusMessage("alive2", aliveMessage{aliveTime}); err != nil {
 			if !c.IsClosed() {
 				c.warning("send keep alive [%d] failed: %v", aliveTime, err)
 			}
-		} else if enableDebugLogging && c.activeChecker.isTimeout() {
+		} else if c.activeChecker.isTimeout() && enableDebugLogging {
 			c.debug("keep alive [%d] sent success", aliveTime)
 		}
 

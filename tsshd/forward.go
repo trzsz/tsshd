@@ -145,8 +145,8 @@ func handleListenEvent(stream Stream) {
 			if isClosedError(err) {
 				break
 			}
-			warning("listener %s [%s] accept failed: %v", msg.Net, msg.Addr, err)
-			continue
+			warning("listener [%s] [%s] accept failed: %v", msg.Net, msg.Addr, err)
+			break
 		}
 		id := addAcceptConn(conn)
 		if err := sendMessage(stream, acceptMessage{id}); err != nil {

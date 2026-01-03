@@ -70,6 +70,12 @@ func initBusStream(stream Stream) error {
 	return nil
 }
 
+func isBusStreamInited() bool {
+	busMutex.Lock()
+	defer busMutex.Unlock()
+	return busStream != nil
+}
+
 func handleBusEvent(stream Stream) {
 	var msg busMessage
 	if err := recvMessage(stream, &msg); err != nil {
@@ -124,7 +130,7 @@ func handleBusEvent(stream Stream) {
 				break
 			}
 			warning("recv bus command failed: %v", err)
-			continue
+			break
 		}
 
 		switch command {

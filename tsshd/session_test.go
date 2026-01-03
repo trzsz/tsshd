@@ -409,3 +409,126 @@ func TestForwardOutput_DiscardExtendedOutput(t *testing.T) {
 	assert.Contains(output, "%output %123 \\015\\033[0;33mWarning: tsshd discarded")
 	assert.True(strings.HasSuffix(output, "%extended-output %123 0 : 99\r\n"), output)
 }
+
+func TestForwardOutput_FilterAllESC6n(t *testing.T) {
+	assert := assert.New(t)
+	s, reset := newTestSessionContext(false, true, 10)
+	defer reset()
+
+	stream := newMockStream()
+	reader := &chunkReader{
+		data: [][]byte{
+			[]byte("X\n\x1b[6nY\n\x1b[6nZ\x1b[6n"),
+		},
+		chunk: 1,
+	}
+
+	s.forwardOutput("stdout", reader, stream)
+
+	assert.Equal("X\nY\nZ", stream.String())
+}
+
+func TestForwardOutput_KeepPendingESC6n(t *testing.T) {
+	assert := assert.New(t)
+	s, reset := newTestSessionContext(true, true, 10)
+	defer reset()
+
+	stream := newMockStream()
+	reader := &chunkReader{
+		data: [][]byte{
+			[]byte("X\n\x1b[6nY\n\x1b[6nZ\x1b[6n"),
+		},
+		chunk: 1,
+	}
+
+	s.forwardOutput("stdout", reader, stream)
+
+	assert.Equal("X\n\x1b[6nY\n\x1b[6nZ\x1b[6n", stream.String())
+}
+
+func TestForwardOutput_KeepESC6nAfterReconnect(t *testing.T) {
+	assert := assert.New(t)
+	s, reset := newTestSessionContext(false, true, 2)
+	defer reset()
+
+	stream := newMockStream()
+
+	signal := make(chan struct{})
+	reader := &chunkReader{
+		data: [][]byte{
+			[]byte("X\n\x1b[6nY\n\x1b[6nZ\x1b[6n"),
+			[]byte("1\x1b[6n\n\x1b[6n"),
+		},
+		signal: []chan struct{}{signal},
+		chunk:  1,
+	}
+
+	go func() {
+		time.Sleep(100 * time.Millisecond)
+		globalServerProxy.clientChecker.timeoutFlag.Store(false)
+		close(signal)
+	}()
+
+	s.forwardOutput("stdout", reader, stream)
+
+	assert.Equal("X\nY\nZ1\x1b[6n\n\x1b[6n", stream.String())
+}
+
+func TestForwardOutput_MultiLinesAtOnce(t *testing.T) {
+	assert := assert.New(t)
+	s, reset := newTestSessionContext(false, true, 2)
+	defer reset()
+
+	stream := newMockStream()
+	reader := &chunkReader{
+		data: [][]byte{
+			[]byte("1\n2\n3\n4\n5\n"),
+		},
+		chunk: 100,
+	}
+
+	s.forwardOutput("stdout", reader, stream)
+
+	output := stream.String()
+	assert.True(strings.HasPrefix(output, "1\n"), output)
+	assert.Contains(output, "Warning: tsshd discarded")
+	assert.NotContains(output, "2\n")
+	assert.NotContains(output, "3\n")
+	assert.True(strings.HasSuffix(output, "4\n5\n"), output)
+}
+
+func TestForwardOutput_KeepMultiLines(t *testing.T) {
+	assert := assert.New(t)
+	s, reset := newTestSessionContext(true, true, 2)
+	defer reset()
+
+	stream := newMockStream()
+	reader := &chunkReader{
+		data: [][]byte{
+			[]byte("1\n2\n3\n4\n5\n"),
+		},
+		chunk: 100,
+	}
+
+	s.forwardOutput("stdout", reader, stream)
+
+	assert.Equal("1\n2\n3\n4\n5\n", stream.String())
+}
+
+func TestForwardOutput_NormalMultiLines(t *testing.T) {
+	assert := assert.New(t)
+	s, reset := newTestSessionContext(false, false, 2)
+	defer reset()
+
+	stream := newMockStream()
+	reader := &chunkReader{
+		data: [][]byte{
+			[]byte("1\n2\n3\n4\n5\n"),
+		},
+		chunk: 100,
+	}
+
+	s.forwardOutput("stdout", reader, stream)
+
+	assert.Equal("1\n2\n3\n4\n5\n", stream.String())
+}
