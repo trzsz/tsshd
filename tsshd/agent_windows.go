@@ -28,13 +28,22 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"os/user"
 
 	"github.com/Microsoft/go-winio"
 )
 
 func listenForAgent() (net.Listener, string, error) {
+	currentUser, err := user.Current()
+	if err != nil {
+		return nil, "", fmt.Errorf("get current user failed: %v", err)
+	}
+
+	pipeConfig := &winio.PipeConfig{
+		SecurityDescriptor: fmt.Sprintf("D:P(A;;GA;;;%s)", currentUser.Uid),
+	}
 	pipePath := fmt.Sprintf(`\\.\pipe\tsshd-agent-%d`, os.Getpid())
-	listener, err := winio.ListenPipe(pipePath, nil)
+	listener, err := winio.ListenPipe(pipePath, pipeConfig)
 	if err != nil {
 		return nil, "", fmt.Errorf("listen on [%s] failed: %v", pipePath, err)
 	}
