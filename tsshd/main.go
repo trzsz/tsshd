@@ -40,7 +40,8 @@ var exitChan = make(chan int, 1)
 
 type tsshdArgs struct {
 	Help           bool
-	Version        bool
+	VerShort       bool
+	VerDetailed    bool
 	KCP            bool
 	TCP            bool
 	IPv4           bool
@@ -51,16 +52,13 @@ type tsshdArgs struct {
 	ConnectTimeout time.Duration
 }
 
-func printVersion() {
-	fmt.Printf("trzsz sshd %s\n", kTsshdVersion)
-}
-
-func printHelp() {
-	fmt.Printf("usage: tsshd [-h] [-v] [--kcp] [--tcp] [--ipv4] [--ipv6] [--debug] [--mtu N] [--port low-high] [--connect-timeout t]\n\n" +
+func printHelp() int {
+	fmt.Printf("usage: tsshd [-h|-v|-V] [--kcp] [--tcp] [--ipv4] [--ipv6] [--debug] [--mtu N] [--port low-high] [--connect-timeout t]\n\n" +
 		"tsshd: trzsz-ssh(tssh) server that supports connection migration for roaming.\n\n" +
 		"optional arguments:\n" +
 		"  -h, --help             show this help message and exit\n" +
-		"  -v, --version          show program's version number and exit\n" +
+		"  -v                     show short version number and exit\n" +
+		"  -V                     show detailed version info and exit\n" +
 		"  --kcp                  KCP protocol (default is QUIC protocol)\n" +
 		"  --tcp                  Use UDP-over-TCP to bypass UDP blocking\n" +
 		"  --ipv4                 UDP only listens on IPv4, ignoring IPv6\n" +
@@ -69,6 +67,7 @@ func printHelp() {
 		"  --mtu N                Sets the Maximum Transmission Unit (MTU)\n" +
 		"  --port low-high        UDP port range that the tsshd listens on\n" +
 		"  --connect-timeout t    The timeout for tssh connecting to tsshd\n")
+	return 0
 }
 
 func parseTsshdArgs() *tsshdArgs {
@@ -77,10 +76,10 @@ func parseTsshdArgs() *tsshdArgs {
 		switch os.Args[i] {
 		case "-h", "--help":
 			args.Help = true
-			return args
 		case "-v", "--version":
-			args.Version = true
-			return args
+			args.VerShort = true
+		case "-V":
+			args.VerDetailed = true
 		case "--kcp":
 			args.KCP = true
 		case "--tcp":
@@ -145,12 +144,13 @@ func cleanupOnExit() {
 func TsshdMain() int {
 	args := parseTsshdArgs()
 	if args.Help {
-		printHelp()
-		return 0
+		return printHelp()
 	}
-	if args.Version {
-		printVersion()
-		return 0
+	if args.VerShort {
+		return printVersionShort()
+	}
+	if args.VerDetailed {
+		return printVersionDetailed()
 	}
 
 	parent, stdout, err := background()
@@ -186,6 +186,7 @@ func TsshdMain() int {
 	enableWarningLogging = true
 	if args.Debug {
 		enableDebugLogging = true
+		debug("tsshd version: %s", getTsshdVersion())
 	} else {
 		if v := strings.ToLower(getSshdConfig("LogLevel")); v == "quiet" || v == "fatal" {
 			enableWarningLogging = false

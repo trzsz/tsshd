@@ -24,4 +24,61 @@ SOFTWARE.
 
 package tsshd
 
+import (
+	"fmt"
+	dbg "runtime/debug"
+	"strings"
+)
+
 const kTsshdVersion = "0.1.5"
+
+// buildTag stores the version tag injected at build time via -ldflags.
+var buildTag = ""
+
+func getTsshdVersion() string {
+	var version strings.Builder
+	version.WriteString("trzsz sshd ")
+	version.WriteString(kTsshdVersion)
+
+	if buildTag != "" {
+		version.WriteByte('(')
+		version.WriteString(buildTag)
+		version.WriteByte(')')
+	}
+
+	if info, ok := dbg.ReadBuildInfo(); ok {
+		var vcs, revision, modified string
+		for _, setting := range info.Settings {
+			switch setting.Key {
+			case "vcs":
+				vcs = setting.Value
+			case "vcs.revision":
+				revision = setting.Value
+			case "vcs.modified":
+				modified = setting.Value
+			}
+		}
+
+		if vcs == "git" {
+			if revision != "" {
+				version.WriteByte('-')
+				version.WriteString(revision[:min(7, len(revision))])
+				if strings.ToLower(modified) == "true" {
+					version.WriteString("-m")
+				}
+			}
+		}
+	}
+
+	return version.String()
+}
+
+func printVersionShort() int {
+	fmt.Println("trzsz sshd " + kTsshdVersion)
+	return 0
+}
+
+func printVersionDetailed() int {
+	fmt.Println(getTsshdVersion())
+	return 0
+}
