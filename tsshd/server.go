@@ -25,6 +25,7 @@ SOFTWARE.
 package tsshd
 
 import (
+	"context"
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	crypto_rand "crypto/rand"
@@ -39,12 +40,14 @@ import (
 	math_rand "math/rand"
 	"net"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
 	"unicode"
 
 	"github.com/quic-go/quic-go"
+	"github.com/quic-go/quic-go/qlogwriter"
 	"github.com/xtaci/kcp-go/v5"
 	"golang.org/x/crypto/pbkdf2"
 )
@@ -76,6 +79,27 @@ var quicConfig = quic.Config{
 	HandshakeIdleTimeout: 30 * time.Second,
 	MaxIdleTimeout:       365 * 24 * time.Hour,
 	EnableDatagrams:      true,
+
+	// qlog files can be analyzed at https://qvis.quictools.info/
+	Tracer: func(ctx context.Context, isClient bool, connID quic.ConnectionID) qlogwriter.Trace {
+		role := "server"
+		if isClient {
+			role = "client"
+		}
+
+		const path = "/tmp/qlog/"
+		_ = os.MkdirAll(path, 0755)
+		name := fmt.Sprintf("%s_%x_%d.qlog", role, connID, time.Now().UnixNano())
+		file, err := os.Create(filepath.Join(path, name))
+		if err != nil {
+			return nil
+		}
+
+		writer := qlogwriter.NewConnectionFileSeq(file, isClient, connID, nil)
+		go writer.Run()
+
+		return writer
+	},
 }
 
 func initServer(args *tsshdArgs) (*kcp.Listener, *quic.Listener, error) {
