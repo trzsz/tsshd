@@ -782,65 +782,153 @@ func handleX11Request(msg *startMessage) {
 		}
 	}
 
-	listener, port, err := listenTcpOnFreePort("localhost", 6000+displayOffset, min(6000+displayOffset+1000, 65535))
+	useLocalhost := strings.ToLower(getSshdConfig("X11UseLocalhost")) != "no"
+	listeners, port, err := listenTcpOnFreePort(useLocalhost, 6000+displayOffset, min(6000+displayOffset+1000, 65535))
 	if err != nil {
 		warning("X11 forwarding listen failed: %v", err)
 		return
 	}
 	onExitFuncs = append(onExitFuncs, func() {
-		_ = listener.Close()
-	})
-	displayNumber := port - 6000
-	if msg.X11.AuthProtocol != "" && msg.X11.AuthCookie != "" {
-		authDisplay := fmt.Sprintf("unix:%d.%d", displayNumber, msg.X11.ScreenNumber)
-		input := fmt.Sprintf("remove %s\nadd %s %s %s\n", authDisplay, authDisplay, msg.X11.AuthProtocol, msg.X11.AuthCookie)
-		if err := writeXauthData(input); err == nil {
-			onExitFuncs = append(onExitFuncs, func() {
-				_ = writeXauthData(fmt.Sprintf("remove %s\n", authDisplay))
-			})
+		for _, listener := range listeners {
+			_ = listener.Close()
 		}
+	})
+
+	hostname := getHostnameForX11(useLocalhost)
+	displayNumber := port - 6000
+	display := fmt.Sprintf("%s:%d.%d", hostname, displayNumber, msg.X11.ScreenNumber)
+	authDisplay := display
+	if useLocalhost {
+		authDisplay = fmt.Sprintf("unix:%d.%d", displayNumber, msg.X11.ScreenNumber)
 	}
-	go handleChannelAccept(listener, msg.X11.ChannelType)
+
+	xauthPath := getXauthPath()
+	xauthInput := fmt.Sprintf("remove %s\nadd %s %s %s\n", authDisplay, authDisplay, msg.X11.AuthProtocol, msg.X11.AuthCookie)
+	if err := writeXauthData(xauthPath, xauthInput); err != nil {
+		warning("write xauth data failed: %v", err)
+	}
+	onExitFuncs = append(onExitFuncs, func() {
+		_ = writeXauthData(xauthPath, fmt.Sprintf("remove %s\n", authDisplay))
+	})
+
+	for _, listener := range listeners {
+		go handleChannelAccept(listener, msg.X11.ChannelType)
+	}
+
 	if msg.Envs == nil {
 		msg.Envs = make(map[string]string)
 	}
-	msg.Envs["DISPLAY"] = fmt.Sprintf("localhost:%d.%d", displayNumber, msg.X11.ScreenNumber)
+	msg.Envs["DISPLAY"] = display
 }
 
-func listenTcpOnFreePort(host string, low, high int) (net.Listener, int, error) {
-	var err error
-	var listener net.Listener
+func getHostnameForX11(useLocalhost bool) string {
+	if useLocalhost {
+		return "localhost"
+	}
+
+	hostname, err := os.Hostname()
+	if err != nil {
+		warning("get hostname for X11 forwarding failed: %v", err)
+		return "localhost"
+	}
+	return hostname
+}
+
+func listenTcpOnFreePort(useLocalhost bool, low, high int) ([]net.Listener, int, error) {
+	var ipv4Host, ipv6Host string
+	if useLocalhost {
+		ipv4Host, ipv6Host = "127.0.0.1", "::1"
+	} else {
+		ipv4Host, ipv6Host = "0.0.0.0", "::"
+	}
+
+	var netList, hostList []string
+	listener4, err4 := net.Listen("tcp4", net.JoinHostPort(ipv4Host, "0"))
+	if err4 == nil {
+		_ = listener4.Close()
+		netList = append(netList, "tcp4")
+		hostList = append(hostList, ipv4Host)
+	}
+	listener6, err6 := net.Listen("tcp6", net.JoinHostPort(ipv6Host, "0"))
+	if err6 == nil {
+		_ = listener6.Close()
+		netList = append(netList, "tcp6")
+		hostList = append(hostList, ipv6Host)
+	}
+
+	if err4 != nil && err6 != nil {
+		return nil, 0, fmt.Errorf("ipv4 and ipv6 both listen failed: %v, %v", err4, err6)
+	}
+
+	var lastErr error
 	for port := low; port <= high; port++ {
-		listener, err = net.Listen("tcp", fmt.Sprintf("%s:%d", host, port))
-		if err == nil {
-			return listener, port, nil
+		var listenerList []net.Listener
+		portStr := strconv.Itoa(port)
+		for i := range len(netList) {
+			listener, err := net.Listen(netList[i], net.JoinHostPort(hostList[i], portStr))
+			if err != nil {
+				lastErr = err
+				continue
+			}
+			listenerList = append(listenerList, listener)
+		}
+		if len(listenerList) == len(netList) {
+			return listenerList, port, nil
+		}
+		for _, listener := range listenerList {
+			_ = listener.Close()
 		}
 	}
-	if err != nil {
-		return nil, 0, fmt.Errorf("listen tcp on %s:[%d,%d] failed: %v", host, low, high, err)
+	if lastErr != nil {
+		return nil, 0, fmt.Errorf("listen tcp on [%s,%s][%d,%d] failed: %v", ipv4Host, ipv6Host, low, high, lastErr)
 	}
-	return nil, 0, fmt.Errorf("listen tcp on %s:[%d,%d] failed", host, low, high)
+	return nil, 0, fmt.Errorf("listen tcp on [%s,%s][%d,%d] failed", ipv4Host, ipv6Host, low, high)
 }
 
-func writeXauthData(input string) error {
-	cmd := exec.Command("xauth", "-q", "-")
+func getXauthPath() string {
+	xauthPath := getSshdConfig("XAuthLocation")
+	if xauthPath != "" {
+		if _, err := os.Stat(xauthPath); err != nil {
+			warning("XAuthLocation [%s] not found: %v", xauthPath, err)
+			return "xauth"
+		}
+		return xauthPath
+	}
+
+	return "xauth"
+}
+
+func writeXauthData(xauthPath, xauthInput string) error {
+	cmd := exec.Command(xauthPath, "-q", "-")
 	stdin, err := cmd.StdinPipe()
 	if err != nil {
-		return err
+		return fmt.Errorf("stdin pipe failed: %v", err)
 	}
 	defer func() { _ = stdin.Close() }()
+
+	var errBuf bytes.Buffer
+	cmd.Stderr = &errBuf
+	cmd.Stdout = io.Discard
+
 	if err := cmd.Start(); err != nil {
-		return err
+		return fmt.Errorf("xauth start failed: %v", err)
 	}
-	if _, err := stdin.Write([]byte(input)); err != nil {
-		return err
+
+	if _, err := stdin.Write([]byte(xauthInput)); err != nil {
+		return fmt.Errorf("stdin write failed: %v", err)
 	}
 	_ = stdin.Close()
-	_, _ = doWithTimeout(func() (int, error) {
-		_ = cmd.Wait()
+
+	_, err = doWithTimeout(func() (int, error) {
+		if err := cmd.Wait(); err != nil {
+			if errBuf.Len() > 0 {
+				return 0, fmt.Errorf("%s", strings.TrimSpace(errBuf.String()))
+			}
+			return 0, fmt.Errorf("xauth wait failed: %v", err)
+		}
 		return 0, nil
-	}, 200*time.Millisecond)
-	return nil
+	}, 1000*time.Millisecond)
+	return err
 }
 
 func handleAgentRequest(msg *startMessage) {
@@ -864,6 +952,7 @@ func handleAgentRequest(msg *startMessage) {
 	}
 
 	go handleChannelAccept(listener, msg.Agent.ChannelType)
+
 	if msg.Envs == nil {
 		msg.Envs = make(map[string]string)
 	}
