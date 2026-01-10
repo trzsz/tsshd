@@ -42,6 +42,8 @@ func estimateMaxPayloadSize(mtu int64) int64
 func listenRandomUDP(t *testing.T) *net.UDPConn {
 	t.Helper()
 
+	quicConfig.Tracer = nil
+
 	const addr = "127.0.0.1:0"
 
 	udpAddr, err := net.ResolveUDPAddr("udp", addr)
