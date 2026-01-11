@@ -7,14 +7,14 @@ require (
 	github.com/UserExistsError/conpty v0.1.4
 	github.com/creack/pty v1.1.24
 	github.com/google/shlex v0.0.0-20191202100458-e7afc7fbc510
-	github.com/quic-go/quic-go v0.58.0
+	github.com/quic-go/quic-go v0.59.0
 	github.com/stretchr/testify v1.11.1
 	github.com/trzsz/shellescape v1.6.0
 	github.com/trzsz/smux v1.6.0
 	github.com/xtaci/kcp-go/v5 v5.6.61
 	golang.org/x/crypto v0.46.0
 	golang.org/x/net v0.48.0
-	golang.org/x/sys v0.39.0
+	golang.org/x/sys v0.40.0
 )
 
 require (
