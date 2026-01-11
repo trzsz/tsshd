@@ -42,7 +42,6 @@ import (
 	"strconv"
 	"strings"
 	"time"
-	"unicode"
 
 	"github.com/quic-go/quic-go"
 	"github.com/xtaci/kcp-go/v5"
@@ -58,10 +57,7 @@ const (
 	kProxyModeTCP = "TCP"
 )
 
-const (
-	kDefaultPortRangeLow  = 61001
-	kDefaultPortRangeHigh = 61999
-)
+const kDefaultPortRange = "61001-61999"
 
 const (
 	kDefaultMTU = 1400
@@ -120,25 +116,71 @@ func initServer(args *tsshdArgs) (*kcp.Listener, *quic.Listener, error) {
 	return kcpListener, quicListener, nil
 }
 
-func getPortRange(args *tsshdArgs) (int, int) {
-	if args.Port == "" {
-		return kDefaultPortRangeLow, kDefaultPortRangeHigh
-	}
-	ports := strings.FieldsFunc(args.Port, func(c rune) bool {
-		return unicode.IsSpace(c) || c == ',' || c == '-'
-	})
-	if len(ports) == 1 {
-		if port, err := strconv.Atoi(ports[0]); err == nil {
-			return port, port
+func parsePortRanges(tsshdPort string) [][2]uint16 {
+	var ranges [][2]uint16
+
+	addPortRange := func(lowPort string, highPort *string) {
+		low, err := strconv.ParseUint(lowPort, 10, 16)
+		if err != nil || low == 0 {
+			warning("tsshd port [%s] invalid: port [%s] is not a value in [1, 65535]", tsshdPort, lowPort)
+			return
 		}
-	} else if len(ports) == 2 {
-		port0, err0 := strconv.Atoi(ports[0])
-		port1, err1 := strconv.Atoi(ports[1])
-		if err0 == nil && err1 == nil {
-			return port0, port1
+		high := low
+		if highPort != nil {
+			high, err = strconv.ParseUint(*highPort, 10, 16)
+			if err != nil || high == 0 {
+				warning("tsshd port [%s] invalid: port [%s] is not a value in [1, 65535]", tsshdPort, *highPort)
+				return
+			}
+		}
+		if low > high {
+			warning("tsshd port [%s] invalid: port range [%d-%d] is invalid (low > high)", tsshdPort, low, high)
+			return
+		}
+		ranges = append(ranges, [2]uint16{uint16(low), uint16(high)})
+	}
+
+	for seg := range strings.SplitSeq(tsshdPort, ",") {
+		tokens := strings.Fields(seg)
+		k := -1
+		for i := 0; i < len(tokens); i++ {
+			token := tokens[i]
+			// Case 1: combined form like "8000-9000"
+			if strings.Contains(token, "-") && token != "-" {
+				parts := strings.Split(token, "-")
+				if len(parts) != 2 || parts[0] == "" || parts[1] == "" {
+					warning("tsshd port [%s] invalid: malformed port range [%s]", tsshdPort, token)
+					continue
+				}
+				addPortRange(parts[0], &parts[1])
+				continue
+			}
+			// Case 2: single "-"
+			if token == "-" {
+				if i == 0 || i+1 >= len(tokens) || i-1 <= k {
+					warning("tsshd port [%s] invalid: '-' must appear between two ports", tsshdPort)
+					i++
+					continue
+				}
+				addPortRange(tokens[i-1], &tokens[i+1])
+				k = i + 1
+				i++ // skip high
+				continue
+			}
+			// Case 3: part of a range: skip (handled by '-')
+			if i+1 < len(tokens) && tokens[i+1] == "-" {
+				continue
+			}
+			// Case 4: plain number
+			if i > 0 && tokens[i-1] == "-" {
+				warning("tsshd port [%s] invalid: malformed port range [- %s]", tsshdPort, token)
+				continue
+			}
+			addPortRange(token, nil)
 		}
 	}
-	return kDefaultPortRangeLow, kDefaultPortRangeHigh
+
+	return ranges
 }
 
 func canListenOnIP(args *tsshdArgs, udpAddr *net.UDPAddr) bool {
@@ -228,42 +270,57 @@ func getUdpAddrs(args *tsshdArgs) ([]*net.UDPAddr, error) {
 }
 
 func listenOnFreePort(args *tsshdArgs) ([]io.Closer, int, error) {
-	portRangeLow, portRangeHigh := getPortRange(args)
-	if portRangeHigh < portRangeLow {
-		return nil, 0, fmt.Errorf("no port in [%d,%d]", portRangeLow, portRangeHigh)
+	tsshdPort := args.Port
+	if tsshdPort == "" {
+		tsshdPort = kDefaultPortRange
 	}
+	portRanges := parsePortRanges(tsshdPort)
+	if len(portRanges) == 0 {
+		return nil, 0, fmt.Errorf("no available port in [%s]", tsshdPort)
+	}
+	if len(portRanges) > 1 {
+		math_rand.Shuffle(len(portRanges), func(i, j int) {
+			portRanges[i], portRanges[j] = portRanges[j], portRanges[i]
+		})
+	}
+
 	addrs, err := getUdpAddrs(args)
 	if err != nil {
 		return nil, 0, fmt.Errorf("get available udp address failed: %v", err)
 	}
+
 	var lastErr error
-	size := portRangeHigh - portRangeLow + 1
-	port := portRangeLow + math_rand.Intn(size)
-	for range size {
-		var connList []io.Closer
-		for _, addr := range addrs {
-			conn, err := listenOnPort(args, addr, port)
-			if err != nil {
-				lastErr = err
-				break
+	for _, portRange := range portRanges {
+		portRangeLow, portRangeHigh := int(portRange[0]), int(portRange[1])
+		size := portRangeHigh - portRangeLow + 1
+		port := portRangeLow + math_rand.Intn(size)
+		for range size {
+			var connList []io.Closer
+			for _, addr := range addrs {
+				conn, err := listenOnPort(args, addr, port)
+				if err != nil {
+					lastErr = err
+					break
+				}
+				connList = append(connList, conn)
 			}
-			connList = append(connList, conn)
-		}
-		if len(connList) == len(addrs) {
-			return connList, port, nil
-		}
-		for _, conn := range connList {
-			_ = conn.Close()
-		}
-		port++
-		if port > portRangeHigh {
-			port = portRangeLow
+			if len(connList) == len(addrs) {
+				return connList, port, nil
+			}
+			for _, conn := range connList {
+				_ = conn.Close()
+			}
+			port++
+			if port > portRangeHigh {
+				port = portRangeLow
+			}
 		}
 	}
+
 	if lastErr != nil {
-		return nil, 0, fmt.Errorf("listen udp on [%d,%d] failed: %v", portRangeLow, portRangeHigh, lastErr)
+		return nil, 0, fmt.Errorf("listen udp on [%s] failed: %v", tsshdPort, lastErr)
 	}
-	return nil, 0, fmt.Errorf("listen udp on [%d,%d] failed", portRangeLow, portRangeHigh)
+	return nil, 0, fmt.Errorf("listen udp on [%s] failed", tsshdPort)
 }
 
 func listenOnPort(args *tsshdArgs, udpAddr *net.UDPAddr, port int) (conn io.Closer, err error) {

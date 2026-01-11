@@ -39,11 +39,11 @@ tssh and tsshd works exactly like ssh, there are no plans to support local echo 
 
 2. Install [tsshd](https://github.com/trzsz/tsshd?tab=readme-ov-file#installation) on the server ( the remote host ).
 
-3. Use `tssh --udp xxx` to login to the server. Or configure as follows in `~/.ssh/config` to omit `--udp`:
+3. Use `tssh --udp xxx` to log in (latency-sensitive users can specify `--kcp` option). Or configure as follows in `~/.ssh/config` to omit `--udp` or `--kcp` option:
 
    ```
    Host xxx
-       #!! UdpMode yes
+       #!! UdpMode Yes/QUIC/KCP
    ```
 
 ### How it works
@@ -52,7 +52,7 @@ tssh and tsshd works exactly like ssh, there are no plans to support local echo 
 
 - The `tssh` will first login to the server normally as an ssh client, and then run a new `tsshd` process on the server.
 
-- The `tsshd` process listens on a random udp port between 61001 and 61999 (can be customized by `UdpPort`), and sends its port number and some secret keys back to the `tssh` process over the ssh channel. The ssh connection is then shut down, and the `tssh` process communicates with the `tsshd` process over udp.
+- The `tsshd` process listens on a random udp port between 61001 and 61999 (can be customized by `TsshdPort`), and sends its port number and some secret keys back to the `tssh` process over the ssh channel. The ssh connection is then shut down, and the `tssh` process communicates with the `tsshd` process over udp.
 
 ### Reconnection
 
@@ -99,7 +99,7 @@ tssh and tsshd works exactly like ssh, there are no plans to support local echo 
 ```
 Host xxx
     #!! UdpMode Yes
-    #!! UdpPort 61001-61999
+    #!! TsshdPort 61001-61999
     #!! TsshdPath ~/go/bin/tsshd
     #!! UdpAliveTimeout 86400
     #!! UdpHeartbeatTimeout 3
@@ -111,9 +111,9 @@ Host xxx
 
 - `UdpMode`: `No` (the default: tssh works in TCP mode), `Yes` (default protocol: `QUIC`), `QUIC` ([QUIC](https://github.com/quic-go/quic-go) protocol: faster speed), `KCP` ([KCP](https://github.com/xtaci/kcp-go) protocol: lower latency).
 
-- `UdpPort`: Specifies the range of UDP ports that tsshd listens on, the default value is [61001, 61999].
+- `TsshdPort`: Specifies the port range that tsshd listens on, default is [61001, 61999]. You can specify multiple discrete ports (e.g., `6022,7022`) or multiple discrete ranges (e.g., `8010-8020,9020-9030,10080`); tsshd will randomly choose an available port. You can also specify the port on the command line using `--tsshd-port`.
 
-- `TsshdPath`: Specifies the path to the tsshd binary on the server, lookup in $PATH if not configured.
+- `TsshdPath`: Specifies the path to the tsshd binary on the server, lookup in $PATH if not configured. You can also specify the path on the command line using `--tsshd-path`.
 
 - `UdpAliveTimeout`: If the disconnection lasts longer than `UdpAliveTimeout` in seconds, tssh and tsshd will both exit, and no longer support reconnection. The default is 86400 seconds.
 

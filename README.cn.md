@@ -38,11 +38,11 @@ tssh 和 tsshd 的工作方式与 ssh 完全相同，没有计划支持本地回
 
 2. 在服务端（远程机器）上安装 [tsshd](https://github.com/trzsz/tsshd?tab=readme-ov-file#installation)。
 
-3. 使用 `tssh --udp xxx` 登录服务器。在 `~/.ssh/config` 中如下配置可省略 `--udp` 参数：
+3. 使用 `tssh --udp xxx` 登录服务器（对延迟敏感可指定 `--kcp` 选项）。在 `~/.ssh/config` 中如下配置可省略 `--udp` 或 `--kcp` 选项：
 
    ```
    Host xxx
-       #!! UdpMode yes
+       #!! UdpMode Yes/QUIC/KCP
    ```
 
 ## 原理简介
@@ -51,7 +51,7 @@ tssh 和 tsshd 的工作方式与 ssh 完全相同，没有计划支持本地回
 
 - `tssh` 会先作为一个 ssh 客户端正常登录到服务器上，然后在服务器上启动一个新的 `tsshd` 进程。
 
-- `tsshd` 进程会随机侦听一个 61001 到 61999 之间的 UDP 端口（可通过 `UdpPort` 配置自定义），并将其端口和几个密钥通过 ssh 通道发回给 `tssh` 进程。登录的 ssh 连接会被关闭，然后 `tssh` 进程通过 UDP 与 `tsshd` 进程通讯。
+- `tsshd` 进程会随机侦听一个 61001 到 61999 之间的 UDP 端口（可通过 `TsshdPort` 配置自定义），并将其端口和几个密钥通过 ssh 通道发回给 `tssh` 进程。登录的 ssh 连接会被关闭，然后 `tssh` 进程通过 UDP 与 `tsshd` 进程通讯。
 
 ## 重连架构
 
@@ -98,7 +98,7 @@ tssh 和 tsshd 的工作方式与 ssh 完全相同，没有计划支持本地回
 ```
 Host xxx
     #!! UdpMode Yes
-    #!! UdpPort 61001-61999
+    #!! TsshdPort 61001-61999
     #!! TsshdPath ~/go/bin/tsshd
     #!! UdpAliveTimeout 86400
     #!! UdpHeartbeatTimeout 3
@@ -110,9 +110,9 @@ Host xxx
 
 - `UdpMode`: `No` (默认为`No`: tssh 工作在 TCP 模式), `Yes` (默认协议: `QUIC`), `QUIC` ([QUIC](https://github.com/quic-go/quic-go) 协议：速度更快), `KCP` ([KCP](https://github.com/xtaci/kcp-go) 协议：延迟更低).
 
-- `UdpPort`: 指定 tsshd 监听的 UDP 端口范围，默认值为 [61001, 61999]。
+- `TsshdPort`: 指定 tsshd 监听的端口范围，默认值为 [61001, 61999]。支持指定离散的端口列表(如`6022,7022`)，也支持指定离散的端口范围(如`8010-8020,9020-9030,10080`)，tsshd 会随机监听其中一个空闲的端口。也可在命令行中使用 `--tsshd-port` 指定端口。
 
-- `TsshdPath`: 指定服务器上 tsshd 二进制程序的路径，如果未配置，则在 $PATH 中查找。
+- `TsshdPath`: 指定服务器上 tsshd 二进制程序的路径，如果未配置，则在 $PATH 中查找。也可在命令行中使用 `--tsshd-path` 指定路径。
 
 - `UdpAliveTimeout`: 如果断开连接的时间超过 `UdpAliveTimeout` 秒，tssh 和 tsshd 都会退出，不再支持重连。默认值为 86400 秒。
 
