@@ -1,4 +1,4 @@
-## tsshd - tssh server that supports connection migration for roaming
+## tsshd - tssh udp server that supports connection migration for roaming
 
 [![MIT License](https://img.shields.io/badge/license-MIT-green.svg?style=flat)](https://choosealicense.com/licenses/mit/)
 [![GitHub Release](https://img.shields.io/github/v/release/trzsz/tsshd)](https://github.com/trzsz/tsshd/releases)

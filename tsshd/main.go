@@ -54,7 +54,7 @@ type tsshdArgs struct {
 
 func printHelp() int {
 	fmt.Printf("usage: tsshd [-h|-v|-V] [--kcp] [--tcp] [--ipv4] [--ipv6] [--debug] [--mtu N] [--port low-high] [--connect-timeout t]\n\n" +
-		"tsshd: trzsz-ssh(tssh) server that supports connection migration for roaming.\n\n" +
+		"tsshd: trzsz-ssh(tssh) udp server that supports connection migration for roaming.\n\n" +
 		"optional arguments:\n" +
 		"  -h, --help             show this help message and exit\n" +
 		"  -v                     show short version number and exit\n" +
