@@ -86,8 +86,7 @@ func handleBusEvent(stream Stream) {
 		return
 	}
 
-	err := initBusStream(stream)
-	if err != nil {
+	if err := initBusStream(stream); err != nil {
 		sendError(stream, err)
 		return
 	}

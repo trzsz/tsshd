@@ -104,12 +104,13 @@ func recvUdpPacket(conn io.Reader, data []byte) (int, error) {
 	return n, nil
 }
 
+const kPacketCacheSize = 100
+
 type packetCache struct {
-	buffer     [100][]byte
 	mutex      sync.Mutex
-	head       int
-	tail       int
-	size       int
+	firstBuf   [][]byte
+	recentBuf  [][]byte
+	recentIdx  int
 	totalSize  int
 	totalCount int
 }
@@ -118,21 +119,32 @@ func (p *packetCache) addPacket(buf []byte) {
 	p.mutex.Lock()
 	defer p.mutex.Unlock()
 
+	p.totalSize += len(buf)
+	p.totalCount++
+
 	data := make([]byte, len(buf))
 	copy(data, buf)
 
-	p.buffer[p.tail] = data
-	p.tail = (p.tail + 1) % len(p.buffer)
-
-	if p.size < len(p.buffer) {
-		p.size++
-	} else {
-		p.head = (p.head + 1) % len(p.buffer)
+	if len(p.firstBuf) < kPacketCacheSize {
+		if p.firstBuf == nil {
+			p.firstBuf = make([][]byte, 0, kPacketCacheSize)
+		}
+		p.firstBuf = append(p.firstBuf, data)
+		return
 	}
 
-	if enableDebugLogging {
-		p.totalSize += len(buf)
-		p.totalCount++
+	if len(p.recentBuf) < kPacketCacheSize {
+		if p.recentBuf == nil {
+			p.recentBuf = make([][]byte, 0, kPacketCacheSize)
+		}
+		p.recentBuf = append(p.recentBuf, data)
+		return
+	}
+
+	p.recentBuf[p.recentIdx] = data
+	p.recentIdx = p.recentIdx + 1
+	if p.recentIdx >= kPacketCacheSize {
+		p.recentIdx = 0
 	}
 }
 
@@ -140,16 +152,17 @@ func (p *packetCache) sendCache(writeFn func([]byte) error) (flushSize, flushCou
 	p.mutex.Lock()
 	defer p.mutex.Unlock()
 
-	for i := 0; i < p.size; i++ {
-		index := (p.head + i) % len(p.buffer)
-		if p.buffer[index] == nil {
-			continue
-		}
-		if enableDebugLogging {
-			flushSize += len(p.buffer[index])
-			flushCount++
-		}
-		_ = writeFn(p.buffer[index])
+	for _, buf := range p.firstBuf {
+		_ = writeFn(buf)
+		flushSize += len(buf)
+		flushCount++
+	}
+
+	for i := range len(p.recentBuf) {
+		buf := p.recentBuf[(p.recentIdx+i)%kPacketCacheSize]
+		_ = writeFn(buf)
+		flushSize += len(buf)
+		flushCount++
 	}
 
 	return flushSize, flushCount
@@ -159,17 +172,10 @@ func (p *packetCache) clearCache() (totalSize, totalCount int) {
 	p.mutex.Lock()
 	defer p.mutex.Unlock()
 
-	for i := 0; i < p.size; i++ {
-		index := (p.head + i) % len(p.buffer)
-		p.buffer[index] = nil
-	}
+	p.firstBuf, p.recentBuf, p.recentIdx = nil, nil, 0
 
-	p.head, p.size = p.tail, 0
-
-	if enableDebugLogging {
-		totalSize, totalCount = p.totalSize, p.totalCount
-		p.totalSize, p.totalCount = 0, 0
-	}
+	totalSize, totalCount = p.totalSize, p.totalCount
+	p.totalSize, p.totalCount = 0, 0
 	return
 }
 
@@ -311,8 +317,8 @@ func (p *serverProxy) setClientConn(newClientConn *clientConnHolder) {
 	}
 
 	flushSize, flushCount := p.pktCache.sendCache(newClientConn.Write)
-	if enableDebugLogging {
-		debug("send packet cache count [%d] cache size [%d]", flushCount, flushSize)
+	if enableDebugLogging && (flushSize > 0 || flushCount > 0) {
+		debug("send packet cache count [%d] size [%d]", flushCount, flushSize)
 	}
 }
 
@@ -399,8 +405,8 @@ func (p *serverProxy) onClientActive(writeFn func([]byte) error) {
 	if p.sendCacheFlag.Load() {
 		p.sendCacheFlag.Store(false)
 		flushSize, flushCount := p.pktCache.sendCache(writeFn)
-		if enableDebugLogging {
-			debug("send packet cache count [%d] cache size [%d]", flushCount, flushSize)
+		if enableDebugLogging && (flushSize > 0 || flushCount > 0) {
+			debug("send packet cache count [%d] size [%d]", flushCount, flushSize)
 		}
 	}
 }
@@ -759,8 +765,8 @@ func (p *clientProxy) renewTransportPath(proxyClient *SshUdpClient, connectTimeo
 	p.serverChecker.updateNow()
 
 	flushSize, flushCount := p.pktCache.sendCache(p.backendConn.Load().Write)
-	if enableDebugLogging {
-		p.client.debug("send packet cache count [%d] cache size [%d]", flushCount, flushSize)
+	if p.client.enableDebugging && (flushSize > 0 || flushCount > 0) {
+		p.client.debug("send packet cache count [%d] size [%d]", flushCount, flushSize)
 	}
 	return nil
 }
@@ -986,7 +992,7 @@ func startClientProxy(client *SshUdpClient, opts *UdpClientOptions) (string, *cl
 		serverChecker: newTimeoutChecker(opts.HeartbeatTimeout),
 	}
 
-	if enableDebugLogging {
+	if client.enableDebugging {
 		proxy.serverChecker.onTimeout(func() {
 			client.debug("blocked due to no server output for [%v]", opts.HeartbeatTimeout)
 		})
@@ -999,8 +1005,8 @@ func startClientProxy(client *SshUdpClient, opts *UdpClientOptions) (string, *cl
 		opts.ProxyClient.activeChecker.onReconnected(func() {
 			if conn := proxy.backendConn.Load(); conn != nil {
 				flushSize, flushCount := proxy.pktCache.sendCache(conn.Write)
-				if enableDebugLogging {
-					client.debug("send packet cache count [%d] cache size [%d]", flushCount, flushSize)
+				if client.enableDebugging && (flushSize > 0 || flushCount > 0) {
+					client.debug("send packet cache count [%d] size [%d]", flushCount, flushSize)
 				}
 			}
 		})

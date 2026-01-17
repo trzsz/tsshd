@@ -142,7 +142,7 @@ func NewSshUdpClient(opts *UdpClientOptions) (*SshUdpClient, error) {
 	}
 
 	udpClient.activeChecker = newTimeoutChecker(opts.HeartbeatTimeout)
-	if enableDebugLogging {
+	if udpClient.enableDebugging {
 		udpClient.activeChecker.onTimeout(func() {
 			udpClient.debug("transport offline, last activity at %v", time.UnixMilli(udpClient.activeChecker.getAliveTime()).Format("15:04:05.000"))
 		})
@@ -158,21 +158,27 @@ func NewSshUdpClient(opts *UdpClientOptions) (*SshUdpClient, error) {
 	})
 	udpClient.activeChecker.onTimeout(udpClient.tryToReconnect)
 
-	busStream, err := udpClient.newStream("bus")
+	busStream, err := doWithTimeout(func() (Stream, error) {
+		return udpClient.newStream("bus")
+	}, opts.ConnectTimeout)
 	if err != nil {
-		return nil, err
+		_ = udpClient.Close()
+		return nil, fmt.Errorf("new bus stream failed: %v", err)
 	}
+
 	if err := sendMessage(busStream, busMessage{
 		ClientVer:        kTsshdVersion,
 		AliveTimeout:     opts.AliveTimeout,
 		IntervalTime:     opts.IntervalTime,
 		HeartbeatTimeout: opts.HeartbeatTimeout}); err != nil {
 		_ = busStream.Close()
+		_ = udpClient.Close()
 		return nil, fmt.Errorf("send bus message failed: %w", err)
 	}
 	if err := recvError(busStream); err != nil {
 		_ = busStream.Close()
-		return nil, err
+		_ = udpClient.Close()
+		return nil, fmt.Errorf("bus stream init failed: %v", err)
 	}
 
 	udpClient.busStream, udpClient.busClosed = busStream, make(chan struct{})
@@ -215,6 +221,10 @@ func (c *SshUdpClient) Close() error {
 	}
 
 	_, _ = doWithTimeout(func() (int, error) {
+		if c.busStream == nil {
+			return 0, nil
+		}
+
 		if err := c.sendBusCommand("close"); err != nil {
 			c.debug("send cmd [close] failed: %v", err)
 		} else {
