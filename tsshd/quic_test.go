@@ -85,7 +85,7 @@ func TestQUIC_InitialPacketSize(t *testing.T) {
 		acceptDone := make(chan struct{})
 		go func() {
 			defer func() { _ = listener.Close() }()
-			ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+			ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 			defer cancel()
 
 			conn, err := listener.Accept(ctx)
@@ -97,9 +97,18 @@ func TestQUIC_InitialPacketSize(t *testing.T) {
 			close(acceptDone)
 		}()
 
+		// mock GetMaxDatagramSize
+		old := getMaxDatagramSizeFunc
+		defer func() { getMaxDatagramSizeFunc = old }()
+		getMaxDatagramSizeFunc = func(c *SshUdpClient) uint16 { return requestedMTU }
+
 		// Client
 		quicConfig.InitialPacketSize = 0
-		client, err := newQuicClient(conn.LocalAddr().String(), info, requestedMTU, time.Second)
+		client, err := newQuicClient(&UdpClientOptions{
+			ServerInfo:     info,
+			ProxyClient:    &SshUdpClient{},
+			ConnectTimeout: 3 * time.Second,
+		}, conn.LocalAddr().String())
 		if err != nil {
 			t.Fatalf("newQuicClient failed (mtu=%d): %v", requestedMTU, err)
 		}
@@ -276,7 +285,16 @@ func TestQUIC_RespectMTU(t *testing.T) {
 	// ----------------- client -----------------
 	go func() {
 		defer close(clientErrCh)
-		client, err := newQuicClient(conn.LocalAddr().String(), info, mtu, time.Second)
+		// mock GetMaxDatagramSize
+		old := getMaxDatagramSizeFunc
+		defer func() { getMaxDatagramSizeFunc = old }()
+		getMaxDatagramSizeFunc = func(c *SshUdpClient) uint16 { return mtu }
+
+		client, err := newQuicClient(&UdpClientOptions{
+			ServerInfo:     info,
+			ProxyClient:    &SshUdpClient{},
+			ConnectTimeout: 3 * time.Second,
+		}, conn.LocalAddr().String())
 		if err != nil {
 			clientErrCh <- fmt.Errorf("client failed to dial QUIC server: %w", err)
 			return
@@ -369,5 +387,124 @@ func TestQUIC_RespectMTU(t *testing.T) {
 	// sanity check: ensure UDP layer was exercised sufficiently.
 	if got := conn.cnt.Load(); got < 300 {
 		t.Fatalf("insufficient UDP traffic observed: cnt=%d", got)
+	}
+}
+
+func TestQUIC_CertValidation(t *testing.T) {
+	info := ServerInfo{}
+	conn := listenRandomUDP(t)
+	defer func() { _ = conn.Close() }()
+
+	// Start QUIC server
+	listener, err := listenQUIC(conn, &info, 0)
+	if err != nil {
+		t.Fatalf("listenQUIC failed: %v", err)
+	}
+
+	serverErrCh := make(chan error, 1)
+	go func() {
+		defer close(serverErrCh)
+		defer func() { _ = listener.Close() }()
+
+		// The server intentionally accepts ONLY ONCE.
+		// If an invalid client is accepted here, the valid case must fail later.
+		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		defer cancel()
+		conn, err := listener.Accept(ctx)
+		if err != nil {
+			serverErrCh <- fmt.Errorf("server failed to accept QUIC connection: %w", err)
+			return
+		}
+		defer func() { _ = conn.CloseWithError(0, "") }()
+
+		// accept one stream
+		stream, err := conn.AcceptStream(ctx)
+		if err != nil {
+			serverErrCh <- fmt.Errorf("server failed to accept stream: %w", err)
+			return
+		}
+		defer func() { _ = stream.Close() }()
+
+		// stream echo loop
+		buf := make([]byte, 1024)
+		for {
+			n, err := stream.Read(buf)
+			if err != nil {
+				if isClosedError(err) {
+					return
+				}
+				serverErrCh <- fmt.Errorf("server stream read error: %w", err)
+				return
+			}
+			if _, err := stream.Write(buf[:n]); err != nil {
+				serverErrCh <- fmt.Errorf("server stream write error: %w", err)
+				return
+			}
+		}
+	}()
+
+	// Case 1: Invalid client certificate
+	illegalInfo := info
+	illegalCertPEM, illegalKeyPEM, err := generateCertKeyPair()
+	if err != nil {
+		t.Fatalf("generateCertKeyPair failed: %v", err)
+	}
+	illegalInfo.ClientCert = fmt.Sprintf("%x", illegalCertPEM)
+	illegalInfo.ClientKey = fmt.Sprintf("%x", illegalKeyPEM)
+	// The client does not know whether it failed, so we don't assert here.
+	// If it happens to succeed, case 3 (valid certificates) will fail later.
+	_, _ = newQuicClient(&UdpClientOptions{ServerInfo: &illegalInfo, ConnectTimeout: 3 * time.Second}, conn.LocalAddr().String())
+
+	// Case 2: Invalid server certificate
+	illegalInfo = info
+	illegalInfo.ServerCert = fmt.Sprintf("%x", illegalCertPEM)
+	_, err = newQuicClient(&UdpClientOptions{ServerInfo: &illegalInfo, ConnectTimeout: 3 * time.Second}, conn.LocalAddr().String())
+	if err == nil {
+		t.Fatalf("Client should not succeed with invalid server certificate")
+	}
+
+	// Case 3: Valid client and server certificates
+	client, err := newQuicClient(&UdpClientOptions{ServerInfo: &info, ConnectTimeout: 3 * time.Second}, conn.LocalAddr().String())
+	if err != nil {
+		// If this fails, it could be because case 1 succeeded with an invalid client certificate.
+		t.Fatalf("Valid client certificate should succeed: %v", err)
+	}
+	defer func() { _ = client.closeClient() }()
+
+	// Open a stream to ensure that:
+	// 1. the QUIC handshake has completed successfully
+	// 2. TLS certificate validation passed
+	// 3. application data can be exchanged over the connection
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	stream, err := client.(*quicClient).conn.OpenStreamSync(ctx)
+	if err != nil {
+		t.Fatalf("client failed to open stream: %v", err)
+	}
+	defer func() { _ = stream.Close() }()
+
+	data := []byte("message from valid client")
+	if _, err := stream.Write(data); err != nil {
+		t.Fatalf("client stream write error: %v", err)
+	}
+
+	echo := make([]byte, len(data))
+	if _, err := io.ReadFull(stream, echo); err != nil {
+		t.Fatalf("client stream read error: %v", err)
+	}
+	if !bytes.Equal(data, echo) {
+		t.Fatalf("stream echo data mismatch")
+	}
+
+	// Wait for completion
+	_ = stream.Close()
+	select {
+	case err := <-serverErrCh:
+		if err != nil {
+			t.Fatalf("server failure: %v", err)
+		}
+	case <-ctx.Done():
+		t.Fatalf("test timed out")
 	}
 }

@@ -26,7 +26,6 @@ package tsshd
 
 import (
 	"context"
-	"crypto/sha1"
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/binary"
@@ -41,7 +40,6 @@ import (
 	"github.com/quic-go/quic-go"
 	"github.com/trzsz/smux"
 	"github.com/xtaci/kcp-go/v5"
-	"golang.org/x/crypto/pbkdf2"
 )
 
 const kNoErrorMsg = "_TSSHD_NO_ERROR_"
@@ -222,6 +220,10 @@ type errorResponder interface {
 	getErrorMessage() *errorMessage
 }
 
+type rekeyMessage struct {
+	PubKey []byte `json:",omitempty"`
+}
+
 func writeAll(dst io.Writer, data []byte) error {
 	m := 0
 	l := len(data)
@@ -365,6 +367,7 @@ func recvResponse(stream Stream, resp errorResponder) error {
 type protocolClient interface {
 	closeClient() error
 	getUdpForwarder() *udpForwarder
+	handleRekeyEvent(msg *rekeyMessage) error
 	newStream(connectTimeout time.Duration) (Stream, error)
 }
 
@@ -372,6 +375,7 @@ type kcpClient struct {
 	conn      *kcp.UDPSession
 	session   *smux.Session
 	forwarder *udpForwarder
+	crypto    *rotatingCrypto
 }
 
 func (c *kcpClient) closeClient() error {
@@ -380,6 +384,10 @@ func (c *kcpClient) closeClient() error {
 
 func (c *kcpClient) getUdpForwarder() *udpForwarder {
 	return c.forwarder
+}
+
+func (c *kcpClient) handleRekeyEvent(msg *rekeyMessage) error {
+	return c.crypto.handleClientRekey(msg)
 }
 
 func (c *kcpClient) newStream(connectTimeout time.Duration) (Stream, error) {
@@ -403,6 +411,11 @@ func (c *quicClient) getUdpForwarder() *udpForwarder {
 	return c.forwarder
 }
 
+func (c *quicClient) handleRekeyEvent(msg *rekeyMessage) error {
+	// rekey is handled by QUIC internally
+	return nil
+}
+
 func (c *quicClient) newStream(connectTimeout time.Duration) (Stream, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), connectTimeout)
 	defer cancel()
@@ -413,33 +426,35 @@ func (c *quicClient) newStream(connectTimeout time.Duration) (Stream, error) {
 	return &quicStream{stream, c.conn}, err
 }
 
-func newProtoClient(addr string, info *ServerInfo, mtu uint16, connectTimeout time.Duration) (protocolClient, error) {
-	switch info.Mode {
+func newProtoClient(client *SshUdpClient, opts *UdpClientOptions, addr string) (protocolClient, error) {
+	switch opts.ServerInfo.Mode {
 	case "":
 		return nil, fmt.Errorf("%s", "Please upgrade tsshd")
 	case kUdpModeKCP:
-		return newKcpClient(addr, info, mtu)
+		return newKcpClient(client, opts, addr)
 	case kUdpModeQUIC:
-		return newQuicClient(addr, info, mtu, connectTimeout)
+		return newQuicClient(opts, addr)
 	default:
-		return nil, fmt.Errorf("unknown tsshd mode: %s", info.Mode)
+		return nil, fmt.Errorf("unknown tsshd mode: %s", opts.ServerInfo.Mode)
 	}
 }
 
-func newKcpClient(addr string, info *ServerInfo, mtu uint16) (protocolClient, error) {
-	pass, err := hex.DecodeString(info.Pass)
+func newKcpClient(client *SshUdpClient, opts *UdpClientOptions, addr string) (protocolClient, error) {
+	pass, err := hex.DecodeString(opts.ServerInfo.Pass)
 	if err != nil {
-		return nil, fmt.Errorf("decode pass [%s] failed: %w", info.Pass, err)
+		return nil, fmt.Errorf("decode pass [%s] failed: %w", opts.ServerInfo.Pass, err)
 	}
-	salt, err := hex.DecodeString(info.Salt)
+	salt, err := hex.DecodeString(opts.ServerInfo.Salt)
 	if err != nil {
-		return nil, fmt.Errorf("decode salt [%s] failed: %w", info.Pass, err)
+		return nil, fmt.Errorf("decode salt [%s] failed: %w", opts.ServerInfo.Pass, err)
 	}
-	key := pbkdf2.Key(pass, salt, 4096, 32, sha1.New)
-	block, err := kcp.NewAESBlockCrypt(key)
+
+	crypto, err := newRotatingCrypto(client, pass, salt, kRekeyBytesThreshold, kRekeyTimeThreshold)
 	if err != nil {
-		return nil, fmt.Errorf("new aes block crypt failed: %w", err)
+		return nil, fmt.Errorf("new rotating gcm failed: %w", err)
 	}
+	block := kcp.NewAEADCrypt(crypto)
+
 	conn, err := kcp.DialWithOptions(addr, block, 1, 1)
 	if err != nil {
 		return nil, fmt.Errorf("kcp dial [%s] failed: %w", addr, err)
@@ -447,30 +462,32 @@ func newKcpClient(addr string, info *ServerInfo, mtu uint16) (protocolClient, er
 	conn.SetWindowSize(1024, 1024)
 	conn.SetNoDelay(1, 10, 2, 1)
 	conn.SetWriteDelay(false)
-	if mtu > 0 {
-		conn.SetMtu(int(mtu))
+
+	if opts.ProxyClient != nil {
+		conn.SetMtu(int(opts.ProxyClient.GetMaxDatagramSize()))
 	} else {
 		conn.SetMtu(kDefaultMTU)
 	}
+
 	session, err := smux.Client(conn, &smuxConfig)
 	if err != nil {
 		return nil, fmt.Errorf("kcp smux client failed: %w", err)
 	}
-	return &kcpClient{conn, session, &udpForwarder{conn: newKcpDatagramConn(conn)}}, nil
+	return &kcpClient{conn, session, &udpForwarder{conn: newKcpDatagramConn(conn)}, crypto}, nil
 }
 
-func newQuicClient(addr string, info *ServerInfo, mtu uint16, connectTimeout time.Duration) (protocolClient, error) {
-	serverCert, err := hex.DecodeString(info.ServerCert)
+func newQuicClient(opts *UdpClientOptions, addr string) (protocolClient, error) {
+	serverCert, err := hex.DecodeString(opts.ServerInfo.ServerCert)
 	if err != nil {
-		return nil, fmt.Errorf("decode server cert [%s] failed: %w", info.ServerCert, err)
+		return nil, fmt.Errorf("decode server cert [%s] failed: %w", opts.ServerInfo.ServerCert, err)
 	}
-	clientCert, err := hex.DecodeString(info.ClientCert)
+	clientCert, err := hex.DecodeString(opts.ServerInfo.ClientCert)
 	if err != nil {
-		return nil, fmt.Errorf("decode client cert [%s] failed: %w", info.ClientCert, err)
+		return nil, fmt.Errorf("decode client cert [%s] failed: %w", opts.ServerInfo.ClientCert, err)
 	}
-	clientKey, err := hex.DecodeString(info.ClientKey)
+	clientKey, err := hex.DecodeString(opts.ServerInfo.ClientKey)
 	if err != nil {
-		return nil, fmt.Errorf("decode client key [%s] failed: %w", info.ClientKey, err)
+		return nil, fmt.Errorf("decode client key [%s] failed: %w", opts.ServerInfo.ClientKey, err)
 	}
 
 	clientTlsCert, err := tls.X509KeyPair(clientCert, clientKey)
@@ -485,14 +502,14 @@ func newQuicClient(addr string, info *ServerInfo, mtu uint16, connectTimeout tim
 		ServerName:   "tsshd",
 	}
 
-	if mtu > 0 {
-		quicConfig.InitialPacketSize = mtu
+	if opts.ProxyClient != nil {
+		quicConfig.InitialPacketSize = opts.ProxyClient.GetMaxDatagramSize()
 		quicConfig.DisablePathMTUDiscovery = true
 	} else {
 		quicConfig.InitialPacketSize = kDefaultMTU
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), connectTimeout)
+	ctx, cancel := context.WithTimeout(context.Background(), opts.ConnectTimeout)
 	defer cancel()
 	conn, err := quic.DialAddr(ctx, addr, tlsConfig, &quicConfig)
 	if err != nil {

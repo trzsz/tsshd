@@ -136,11 +136,7 @@ func NewSshUdpClient(opts *UdpClientOptions) (*SshUdpClient, error) {
 		return nil, err
 	}
 
-	mtu := uint16(0)
-	if opts.ProxyClient != nil {
-		mtu = opts.ProxyClient.GetMaxDatagramSize()
-	}
-	udpClient.protoClient, err = newProtoClient(tsshdAddr, opts.ServerInfo, mtu, opts.ConnectTimeout)
+	udpClient.protoClient, err = newProtoClient(udpClient, opts, tsshdAddr)
 	if err != nil {
 		return nil, err
 	}
@@ -426,6 +422,10 @@ func (c *SshUdpClient) GetLastReconnectError() error {
 // GetMaxDatagramSize returns the maximum payload size (in bytes) that
 // can be sent in a single datagram over this SshUdpClient.
 func (c *SshUdpClient) GetMaxDatagramSize() uint16 {
+	return getMaxDatagramSizeFunc(c)
+}
+
+var getMaxDatagramSizeFunc = func(c *SshUdpClient) uint16 {
 	return c.protoClient.getUdpForwarder().conn.GetMaxDatagramSize()
 }
 
@@ -519,6 +519,12 @@ func (c *SshUdpClient) keepAlive(intervalTime time.Duration) {
 	}
 }
 
+func (c *SshUdpClient) isBusStreamInited() bool {
+	c.busMutex.Lock()
+	defer c.busMutex.Unlock()
+	return c.busStream != nil
+}
+
 func (c *SshUdpClient) sendBusCommand(command string) error {
 	c.busMutex.Lock()
 	defer c.busMutex.Unlock()
@@ -556,6 +562,8 @@ func (c *SshUdpClient) handleBusEvent() {
 			c.handleAliveEvent()
 		case "discard":
 			c.handleDiscardEvent()
+		case "rekey":
+			c.handleRekeyEvent()
 		default:
 			if err := handleUnknownEvent(c.busStream, command); err != nil {
 				c.warning("handle bus command [%s] failed: %v. You may need to upgrade tssh.", command, err)
@@ -662,6 +670,19 @@ func (c *SshUdpClient) handleDiscardEvent() {
 	}
 	if c.discardCallback != nil {
 		c.discardCallback(discardMsg.DiscardMarker, discardMsg.DiscardedInput)
+	}
+}
+
+func (c *SshUdpClient) handleRekeyEvent() {
+	var msg rekeyMessage
+	if err := recvMessage(c.busStream, &msg); err != nil {
+		c.warning("recv rekey message failed: %v", err)
+		return
+	}
+
+	if err := c.protoClient.handleRekeyEvent(&msg); err != nil {
+		c.warning("rekey failed: %v", err)
+		return
 	}
 }
 

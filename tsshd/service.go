@@ -170,7 +170,7 @@ func handleKcpConn(conn *kcp.UDPSession, mtu uint16) {
 		conn.SetMtu(kDefaultMTU)
 	}
 
-	globalUdpForwarder = &udpForwarder{conn: newKcpDatagramConn(conn)}
+	globalProtoServer.(*kcpServer).forwarder = &udpForwarder{conn: newKcpDatagramConn(conn)}
 
 	session, err := smux.Server(conn, &smuxConfig)
 	if err != nil {
@@ -202,7 +202,7 @@ func serveQUIC(listener *quic.Listener) {
 func handleQuicConn(conn *quic.Conn) {
 	onExitFuncs = append(onExitFuncs, func() { _ = conn.CloseWithError(0, "") })
 
-	globalUdpForwarder = &udpForwarder{conn: newQuicDatagramConn(conn)}
+	globalProtoServer = &quicServer{&udpForwarder{conn: newQuicDatagramConn(conn)}}
 
 	for {
 		stream, err := conn.AcceptStream(context.Background())

@@ -35,8 +35,6 @@ import (
 	"sync/atomic"
 )
 
-var globalUdpForwarder *udpForwarder
-
 var udpForwardChannelID atomic.Uint64
 
 // PacketConn represents a connection capable of sending and receiving packet-based data.
@@ -349,7 +347,7 @@ func handleDialUdpEvent(stream Stream) {
 	}
 
 	id := udpForwardChannelID.Add(1)
-	pconn := newPacketConn(stream, id, globalUdpForwarder, globalServerProxy.clientChecker)
+	pconn := newPacketConn(stream, id, globalProtoServer.getUdpForwarder(), globalServerProxy.clientChecker)
 
 	resp := dialUdpResponse{ID: id}
 	if err := sendResponse(stream, &resp); err != nil { // ack ok

@@ -129,6 +129,8 @@ func handleBusEvent(stream Stream) {
 			err = handleAliveEvent(stream, heartbeatTimeout, intervalTime)
 		case "setting":
 			err = handleSettingEvent(stream)
+		case "rekey":
+			err = handleRekeyEvent(stream)
 		default:
 			if err := handleUnknownEvent(stream, command); err != nil {
 				warning("handle bus command [%s] failed: %v. You may need to upgrade tsshd.", command, err)
@@ -218,6 +220,14 @@ func handleSettingEvent(stream Stream) error {
 		globalSetting.keepPendingOutput.Store(*msg.KeepPendingOutput)
 	}
 	return nil
+}
+
+func handleRekeyEvent(stream Stream) error {
+	var msg rekeyMessage
+	if err := recvMessage(stream, &msg); err != nil {
+		return fmt.Errorf("recv rekey message failed: %v", err)
+	}
+	return globalProtoServer.handleRekeyEvent(&msg)
 }
 
 func handleUnknownEvent(stream Stream, command string) error {

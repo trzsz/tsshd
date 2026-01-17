@@ -28,7 +28,6 @@ import (
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	crypto_rand "crypto/rand"
-	"crypto/sha1"
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/json"
@@ -45,7 +44,6 @@ import (
 
 	"github.com/quic-go/quic-go"
 	"github.com/xtaci/kcp-go/v5"
-	"golang.org/x/crypto/pbkdf2"
 )
 
 const (
@@ -72,6 +70,42 @@ var quicConfig = quic.Config{
 	HandshakeIdleTimeout: 30 * time.Second,
 	MaxIdleTimeout:       365 * 24 * time.Hour,
 	EnableDatagrams:      true,
+}
+
+var globalProtoServer protocolServer
+
+type protocolServer interface {
+	getUdpForwarder() *udpForwarder
+	handleRekeyEvent(msg *rekeyMessage) error
+}
+
+type kcpServer struct {
+	crypto    *rotatingCrypto
+	forwarder *udpForwarder
+}
+
+func (s *kcpServer) getUdpForwarder() *udpForwarder {
+	return s.forwarder
+}
+
+func (s *kcpServer) handleRekeyEvent(msg *rekeyMessage) error {
+	if err := s.crypto.handleServerRekey(msg); err != nil {
+		return fmt.Errorf("rekey failed: %v", err)
+	}
+	return nil
+}
+
+type quicServer struct {
+	forwarder *udpForwarder
+}
+
+func (s *quicServer) getUdpForwarder() *udpForwarder {
+	return s.forwarder
+}
+
+func (s *quicServer) handleRekeyEvent(msg *rekeyMessage) error {
+	// rekey is handled by QUIC internally
+	return nil
 }
 
 func initServer(args *tsshdArgs) (*kcp.Listener, *quic.Listener, error) {
@@ -337,20 +371,22 @@ func listenOnPort(args *tsshdArgs, udpAddr *net.UDPAddr, port int) (conn io.Clos
 }
 
 func listenKCP(conn *net.UDPConn, info *ServerInfo) (*kcp.Listener, error) {
-	pass := make([]byte, 32)
+	pass := make([]byte, 48)
 	if _, err := crypto_rand.Read(pass); err != nil {
 		return nil, fmt.Errorf("rand pass failed: %v", err)
 	}
-	salt := make([]byte, 32)
+	salt := make([]byte, 48)
 	if _, err := crypto_rand.Read(salt); err != nil {
 		return nil, fmt.Errorf("rand salt failed: %v", err)
 	}
-	key := pbkdf2.Key(pass, salt, 4096, 32, sha1.New)
 
-	block, err := kcp.NewAESBlockCrypt(key)
+	crypto, err := newRotatingCrypto(nil, pass, salt, 0, 0)
 	if err != nil {
-		return nil, fmt.Errorf("new aes block crypt failed: %v", err)
+		return nil, fmt.Errorf("new rotating gcm failed: %w", err)
 	}
+	block := kcp.NewAEADCrypt(crypto)
+
+	globalProtoServer = &kcpServer{crypto: crypto}
 
 	listener, err := kcp.ServeConn(block, 1, 1, conn)
 	if err != nil {
@@ -417,7 +453,7 @@ func generateCertKeyPair() ([]byte, []byte, error) {
 		DNSNames:     []string{"tsshd"},
 		NotBefore:    now.AddDate(0, 0, -1),
 		NotAfter:     now.AddDate(1, 0, 0),
-		KeyUsage:     x509.KeyUsageKeyEncipherment | x509.KeyUsageDigitalSignature,
+		KeyUsage:     x509.KeyUsageDigitalSignature,
 		ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth, x509.ExtKeyUsageClientAuth},
 	}
 	certDER, err := x509.CreateCertificate(crypto_rand.Reader, &template, &template, &key.PublicKey, key)
