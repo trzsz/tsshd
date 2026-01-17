@@ -43,7 +43,8 @@ var busClosing atomic.Bool
 var busClosingMu sync.Mutex
 var busClosingWG sync.WaitGroup
 
-var globalActiveChecker *timeoutChecker
+var clientAliveTime aliveTime
+var pendingClearPktCache bool
 
 func sendBusMessage(command string, msg any) error {
 	busMutex.Lock()
@@ -51,10 +52,7 @@ func sendBusMessage(command string, msg any) error {
 	if busStream == nil {
 		return fmt.Errorf("bus stream is nil")
 	}
-	if err := sendCommand(busStream, command); err != nil {
-		return err
-	}
-	return sendMessage(busStream, msg)
+	return sendCommandAndMessage(busStream, command, msg)
 }
 
 func initBusStream(stream Stream) error {
@@ -101,27 +99,13 @@ func handleBusEvent(stream Stream) {
 
 	serving.Store(true)
 
-	globalActiveChecker = newTimeoutChecker(msg.HeartbeatTimeout)
-	if enableDebugLogging {
-		globalActiveChecker.onTimeout(func() {
-			debug("transport offline, last activity at %v", time.UnixMilli(globalActiveChecker.getAliveTime()).Format("15:04:05.000"))
-		})
-		globalActiveChecker.onReconnected(func() {
-			debug("transport resumed, last activity at %v", time.UnixMilli(globalActiveChecker.getAliveTime()).Format("15:04:05.000"))
-		})
-	}
-	globalActiveChecker.onReconnected(func() {
-		totalSize, totalCount := globalServerProxy.pktCache.clearCache()
-		if enableDebugLogging {
-			debug("drop packet cache count [%d] cache size [%d]", totalCount, totalSize)
-		}
-	})
+	intervalTime := int64(msg.IntervalTime / time.Millisecond)
+	heartbeatTimeout := int64(msg.HeartbeatTimeout / time.Millisecond)
 
-	globalServerProxy.clientChecker.timeoutMilli.Store(int64(msg.HeartbeatTimeout / time.Millisecond))
+	globalServerProxy.clientChecker.timeoutMilli.Store(heartbeatTimeout)
 
-	activeAckChan := make(chan int64, 1)
-	defer close(activeAckChan)
-	go keepAlive(msg.AliveTimeout, msg.IntervalTime, activeAckChan)
+	clientAliveTime.addMilli(time.Now().UnixMilli())
+	go keepAlive(msg.AliveTimeout, msg.IntervalTime)
 
 	for {
 		command, err := recvCommand(stream)
@@ -141,10 +125,8 @@ func handleBusEvent(stream Stream) {
 		case "close":
 			handleCloseEvent()
 			return // return will close the bus stream
-		case "alive1":
-			err = handleAlive1Event(stream, activeAckChan)
-		case "alive2":
-			err = handleAlive2Event(stream)
+		case "alive":
+			err = handleAliveEvent(stream, heartbeatTimeout, intervalTime)
 		case "setting":
 			err = handleSettingEvent(stream)
 		default:
@@ -189,23 +171,39 @@ func handleCloseEvent() {
 	}()
 }
 
-func handleAlive1Event(stream Stream, activeAckChan chan<- int64) error {
+func handleAliveEvent(stream Stream, heartbeatTimeout, intervalTime int64) error {
 	var msg aliveMessage
 	if err := recvMessage(stream, &msg); err != nil {
 		return fmt.Errorf("recv alive message failed: %v", err)
 	}
 
-	activeAckChan <- msg.Time
-	return nil
-}
+	now := time.Now().UnixMilli()
 
-func handleAlive2Event(stream Stream) error {
-	var msg aliveMessage
-	if err := recvMessage(stream, &msg); err != nil {
-		return fmt.Errorf("recv alive message failed: %v", err)
+	// If the time since the last recorded activity exceeds heartbeatTimeout,
+	// it indicates that the client was previously disconnected and has now reconnected.
+	// Set the flag to clear the packet cache after the client stabilizes.
+	if now-clientAliveTime.latest() > heartbeatTimeout {
+		debug("client reconnected, last active at %v", time.UnixMilli(clientAliveTime.latest()).Format("15:04:05.000"))
+		pendingClearPktCache = true
+	} else if enableDebugLogging && pendingClearPktCache {
+		debug("client active at %v", time.UnixMilli(now).Format("15:04:05.000"))
 	}
 
-	return sendBusMessage("alive2", msg)
+	clientAliveTime.addMilli(now)
+
+	if pendingClearPktCache {
+		// If the client has remained active for a sufficient number of intervals,
+		// consider the connection stable and clear the packet cache.
+		if now-clientAliveTime.oldest() < (kAliveTimeCap+1)*intervalTime {
+			totalSize, totalCount := globalServerProxy.pktCache.clearCache()
+			if enableDebugLogging && (totalSize > 0 || totalCount > 0) {
+				debug("drop packet cache count [%d] size [%d]", totalCount, totalSize)
+			}
+			pendingClearPktCache = false
+		}
+	}
+
+	return sendBusMessage("alive", msg)
 }
 
 func handleSettingEvent(stream Stream) error {
@@ -230,29 +228,10 @@ func handleUnknownEvent(stream Stream, command string) error {
 	return fmt.Errorf("unknown command: %s", command)
 }
 
-func keepAlive(totalTimeout time.Duration, intervalTime time.Duration, activeAckChan <-chan int64) {
-	ticker := time.NewTicker(intervalTime)
-	defer ticker.Stop()
-	go func() {
-		for range ticker.C {
-			aliveTime := time.Now().UnixMilli()
-			if enableDebugLogging && globalActiveChecker.isTimeout() {
-				debug("sending new keep alive [%d]", aliveTime)
-			}
-			if err := sendBusMessage("alive1", aliveMessage{aliveTime}); err != nil {
-				warning("send keep alive [%d] failed: %v", aliveTime, err)
-			} else if enableDebugLogging && globalActiveChecker.isTimeout() {
-				debug("keep alive [%d] sent success", aliveTime)
-			}
-
-			ackTime := <-activeAckChan
-			globalActiveChecker.updateTime(ackTime)
-		}
-	}()
-
-	timeoutMilli := int64(totalTimeout / time.Millisecond)
+func keepAlive(aliveTimeout time.Duration, intervalTime time.Duration) {
+	timeoutMilli := int64(aliveTimeout / time.Millisecond)
 	for {
-		if time.Now().UnixMilli()-globalActiveChecker.getAliveTime() > timeoutMilli {
+		if time.Now().UnixMilli()-clientAliveTime.latest() > timeoutMilli {
 			warning("tsshd keep alive timeout")
 			exitChan <- 2
 			return

@@ -348,3 +348,30 @@ func (tc *timeoutChecker) Close() {
 	}
 	close(tc.closeChan)
 }
+
+const kAliveTimeCap = 10
+
+type aliveTime struct {
+	mutex sync.Mutex
+	last  int
+	buf   [kAliveTimeCap]int64
+}
+
+func (t *aliveTime) addMilli(milli int64) {
+	t.mutex.Lock()
+	defer t.mutex.Unlock()
+	t.last = (t.last + 1) % kAliveTimeCap
+	t.buf[t.last] = milli
+}
+
+func (r *aliveTime) latest() int64 {
+	r.mutex.Lock()
+	defer r.mutex.Unlock()
+	return r.buf[r.last]
+}
+
+func (r *aliveTime) oldest() int64 {
+	r.mutex.Lock()
+	defer r.mutex.Unlock()
+	return r.buf[(r.last+1)%kAliveTimeCap]
+}

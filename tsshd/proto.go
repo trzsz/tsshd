@@ -292,6 +292,34 @@ func recvMessage(stream Stream, msg any) error {
 	return nil
 }
 
+func sendCommandAndMessage(stream Stream, command string, msg any) error {
+	if len(command) == 0 {
+		return fmt.Errorf("send command is empty")
+	}
+	if len(command) > 255 {
+		return fmt.Errorf("send command too long: %s", command)
+	}
+
+	msgBuf, err := json.Marshal(msg)
+	if err != nil {
+		return fmt.Errorf("send message marshal failed: %w", err)
+	}
+
+	totalLen := 1 + len(command) + 4 + len(msgBuf)
+	buffer := make([]byte, totalLen)
+
+	buffer[0] = uint8(len(command))
+	copy(buffer[1:], []byte(command))
+
+	binary.BigEndian.PutUint32(buffer[1+len(command):], uint32(len(msgBuf)))
+	copy(buffer[1+len(command)+4:], msgBuf)
+
+	if err := writeAll(stream, buffer); err != nil {
+		return fmt.Errorf("send command and message failed: %w", err)
+	}
+	return nil
+}
+
 func sendError(stream Stream, err error) {
 	if e := sendMessage(stream, errorMessage{Msg: err.Error()}); e != nil {
 		warning("send error [%v] failed: %v", err, e)

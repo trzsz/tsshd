@@ -81,6 +81,7 @@ type SshUdpClient struct {
 	activeAckChan   chan int64
 	reconnectMutex  sync.Mutex
 	reconnectError  atomic.Pointer[error]
+	pendingClearPkt atomic.Bool
 }
 
 // UdpClientOptions contains all configuration parameters required to create and initialize a new SshUdpClient
@@ -154,10 +155,10 @@ func NewSshUdpClient(opts *UdpClientOptions) (*SshUdpClient, error) {
 		})
 	}
 	udpClient.activeChecker.onReconnected(func() {
-		totalSize, totalCount := udpClient.networkProxy.pktCache.clearCache()
-		if enableDebugLogging {
-			udpClient.debug("drop packet cache count [%d] cache size [%d]", totalCount, totalSize)
-		}
+		// Mark packet cache for deferred clearing.
+		// The cache is NOT cleared immediately on reconnection because
+		// the transport may appear reconnected while still being unstable.
+		udpClient.pendingClearPkt.Store(true)
 	})
 	udpClient.activeChecker.onTimeout(udpClient.tryToReconnect)
 
@@ -474,6 +475,7 @@ func (c *SshUdpClient) tryToReconnect() {
 }
 
 func (c *SshUdpClient) keepAlive(intervalTime time.Duration) {
+	var serverAliveTime aliveTime
 	ticker := time.NewTicker(intervalTime)
 	defer ticker.Stop()
 
@@ -483,19 +485,37 @@ func (c *SshUdpClient) keepAlive(intervalTime time.Duration) {
 		}
 
 		aliveTime := time.Now().UnixMilli()
-		if c.activeChecker.isTimeout() && enableDebugLogging {
+		if c.enableDebugging && c.activeChecker.isTimeout() {
 			c.debug("sending new keep alive [%d]", aliveTime)
 		}
-		if err := c.sendBusMessage("alive2", aliveMessage{aliveTime}); err != nil {
+		if err := c.sendBusMessage("alive", aliveMessage{aliveTime}); err != nil {
 			if !c.IsClosed() {
 				c.warning("send keep alive [%d] failed: %v", aliveTime, err)
 			}
-		} else if c.activeChecker.isTimeout() && enableDebugLogging {
+		} else if c.enableDebugging && c.activeChecker.isTimeout() {
 			c.debug("keep alive [%d] sent success", aliveTime)
 		}
 
 		ackTime := <-c.activeAckChan
 		c.activeChecker.updateTime(ackTime)
+
+		if c.pendingClearPkt.Load() {
+			if c.enableDebugging {
+				c.debug("server active at %v", time.UnixMilli(ackTime).Format("15:04:05.000"))
+			}
+
+			serverAliveTime.addMilli(ackTime)
+
+			// If the server has remained active for a sufficient number of intervals,
+			// consider the connection stable and clear the packet cache.
+			if time.Since(time.UnixMilli(serverAliveTime.oldest())) < time.Duration(kAliveTimeCap+1)*intervalTime {
+				totalSize, totalCount := c.networkProxy.pktCache.clearCache()
+				if c.enableDebugging && (totalSize > 0 || totalCount > 0) {
+					c.debug("drop packet cache count [%d] size [%d]", totalCount, totalSize)
+				}
+				c.pendingClearPkt.Store(false)
+			}
+		}
 	}
 }
 
@@ -508,10 +528,7 @@ func (c *SshUdpClient) sendBusCommand(command string) error {
 func (c *SshUdpClient) sendBusMessage(command string, msg any) error {
 	c.busMutex.Lock()
 	defer c.busMutex.Unlock()
-	if err := sendCommand(c.busStream, command); err != nil {
-		return err
-	}
-	return sendMessage(c.busStream, msg)
+	return sendCommandAndMessage(c.busStream, command, msg)
 }
 
 func (c *SshUdpClient) handleBusEvent() {
@@ -535,10 +552,8 @@ func (c *SshUdpClient) handleBusEvent() {
 			c.handleErrorEvent()
 		case "channel":
 			c.handleChannelEvent()
-		case "alive1":
-			c.handleAlive1Event()
-		case "alive2":
-			c.handleAlive2Event()
+		case "alive":
+			c.handleAliveEvent()
 		case "discard":
 			c.handleDiscardEvent()
 		default:
@@ -629,21 +644,7 @@ func (c *SshUdpClient) handleChannelEvent() {
 	}
 }
 
-func (c *SshUdpClient) handleAlive1Event() {
-	var aliveMsg aliveMessage
-	if err := recvMessage(c.busStream, &aliveMsg); err != nil {
-		c.warning("recv alive message failed: %v", err)
-		return
-	}
-
-	if err := c.sendBusMessage("alive1", aliveMsg); err != nil {
-		if !c.IsClosed() {
-			c.warning("send alive message failed: %v", err)
-		}
-	}
-}
-
-func (c *SshUdpClient) handleAlive2Event() {
+func (c *SshUdpClient) handleAliveEvent() {
 	var aliveMsg aliveMessage
 	if err := recvMessage(c.busStream, &aliveMsg); err != nil {
 		c.warning("recv alive message failed: %v", err)
