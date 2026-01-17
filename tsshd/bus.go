@@ -81,7 +81,12 @@ func handleBusEvent(stream Stream) {
 		return
 	}
 
-	if msg.ClientVer == "" {
+	ver, err := parseTsshdVersion(msg.ClientVer)
+	if err != nil {
+		sendError(stream, fmt.Errorf("tsshd version invalid: %v", err))
+		return
+	}
+	if ver.compare(&tsshdVersion{0, 1, 6}) < 0 {
 		sendError(stream, fmt.Errorf("please upgrade tssh to continue"))
 		return
 	}

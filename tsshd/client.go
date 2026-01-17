@@ -108,7 +108,11 @@ func NewSshUdpClient(opts *UdpClientOptions) (*SshUdpClient, error) {
 	enableDebugLogging, clientDebug = opts.EnableDebugging, opts.DebugFunc
 	enableWarningLogging, clientWarningFunc = opts.EnableWarning, opts.WarningFunc
 
-	if opts.ServerInfo.ServerVer == "" {
+	ver, err := parseTsshdVersion(opts.ServerInfo.ServerVer)
+	if err != nil {
+		return nil, fmt.Errorf("tsshd version invalid: %v", err)
+	}
+	if ver.compare(&tsshdVersion{0, 1, 6}) < 0 {
 		return nil, fmt.Errorf("please upgrade tsshd to continue")
 	}
 
@@ -126,7 +130,6 @@ func NewSshUdpClient(opts *UdpClientOptions) (*SshUdpClient, error) {
 		clientWarningFn: opts.WarningFunc,
 	}
 
-	var err error
 	var tsshdAddr string
 	tsshdAddr, udpClient.networkProxy, err = startClientProxy(udpClient, opts)
 	if err != nil {

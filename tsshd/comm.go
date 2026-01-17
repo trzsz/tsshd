@@ -30,6 +30,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -180,6 +181,39 @@ func isClosedError(err error) bool {
 		return true
 	}
 	return false
+}
+
+type tsshdVersion [3]uint32
+
+func parseTsshdVersion(ver string) (*tsshdVersion, error) {
+	if ver == "" {
+		return &tsshdVersion{}, nil
+	}
+	tokens := strings.Split(ver, ".")
+	if len(tokens) != 3 {
+		return nil, fmt.Errorf("invalid version format [%s]", ver)
+	}
+	var version tsshdVersion
+	for i := range 3 {
+		v, err := strconv.ParseUint(tokens[i], 10, 32)
+		if err != nil {
+			return nil, fmt.Errorf("invalid numeric part [%s] in version [%s]", tokens[i], ver)
+		}
+		version[i] = uint32(v)
+	}
+	return &version, nil
+}
+
+func (v *tsshdVersion) compare(ver *tsshdVersion) int {
+	for i := range 3 {
+		if v[i] < ver[i] {
+			return -1
+		}
+		if v[i] > ver[i] {
+			return 1
+		}
+	}
+	return 0
 }
 
 type timeoutChecker struct {
