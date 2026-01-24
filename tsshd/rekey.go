@@ -188,6 +188,10 @@ func (r *rotatingCrypto) startRekey() {
 		return
 	}
 
+	if r.client.IsClosed() {
+		return
+	}
+
 	err := func() error {
 		curve := ecdh.P256()
 		clientPriKey, err := curve.GenerateKey(crypto_rand.Reader)

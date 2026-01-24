@@ -90,7 +90,7 @@ type sessionContext struct {
 	rows    int
 	cmd     *exec.Cmd
 	pty     *tsshdPty
-	wg      sync.WaitGroup
+	outWG   sync.WaitGroup
 	stdin   io.WriteCloser
 	stdout  io.ReadCloser
 	stderr  io.ReadCloser
@@ -452,11 +452,11 @@ func (c *sessionContext) forwardIO(stream Stream) {
 	}
 
 	if c.stdout != nil {
-		c.wg.Go(func() { c.forwardOutput("stdout", c.stdout, stream) })
+		c.outWG.Go(func() { c.forwardOutput("stdout", c.stdout, stream) })
 	}
 
 	if c.stderr != nil {
-		c.wg.Go(func() {
+		c.outWG.Go(func() {
 			if stderr := getStderrStream(c.id); stderr != nil {
 				c.forwardOutput("stderr", c.stderr, stderr.stream)
 				stderr.Close()
@@ -475,17 +475,34 @@ func (c *sessionContext) Wait() {
 	// windows pty only close the stdout in pty.Wait
 	if runtime.GOOS == "windows" && c.pty != nil {
 		_ = c.pty.Wait()
-		c.wg.Wait()
+		c.outWG.Wait()
 		debug("session [%d] wait completed", c.id)
 		return
 	}
 
-	c.wg.Wait() // wait for the output done first to prevent cmd.Wait close output too early
+	done := make(chan struct{})
+	go func() {
+		c.outWG.Wait() // wait for the output first to prevent cmd.Wait close output too early
+		close(done)
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+	}
+
 	if c.pty != nil {
 		_ = c.pty.Wait()
 	} else {
 		_ = c.cmd.Wait()
 	}
+
+	select {
+	case <-done:
+	case <-time.After(3 * time.Second):
+		warning("child process has exited, but output streams did not close in time")
+	}
+
 	debug("session [%d] wait completed", c.id)
 }
 

@@ -29,6 +29,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -135,7 +136,20 @@ func NewSshUdpClient(opts *UdpClientOptions) (*SshUdpClient, error) {
 	if err != nil {
 		return nil, err
 	}
+	beginTime := time.Now()
 	if err := udpClient.networkProxy.renewTransportPath(opts.ProxyClient, opts.ConnectTimeout); err != nil {
+		if opts.ConnectTimeout > 2*time.Second && time.Since(beginTime) > (opts.ConnectTimeout-time.Second) {
+			net := "UDP"
+			if opts.ServerInfo.ProxyMode == kProxyModeTCP {
+				net = "TCP"
+			}
+			port := opts.TsshdAddr
+			if pos := strings.LastIndex(opts.TsshdAddr, ":"); pos >= 0 {
+				port = opts.TsshdAddr[pos+1:]
+			}
+			return nil, fmt.Errorf("%v\r\n%s", err, fmt.Sprintf(
+				"\033[0;36mHint:\033[0m This may be caused by a firewall blocking the %s port (%s) that tsshd is listening on.", net, port))
+		}
 		return nil, err
 	}
 
@@ -348,7 +362,7 @@ func (c *SshUdpClient) DialUDP(network, addr string, timeout time.Duration) (Pac
 	}
 
 	c.exitWG.Add(1)
-	return &sshUdpPacketConn{conn, c}, nil
+	return &sshUdpPacketConn{packetConn: conn, client: c}, nil
 }
 
 // Listen requests the remote peer open a listening socket on addr
@@ -1224,9 +1238,13 @@ func (c *sshUdpChannel) Stderr() io.ReadWriter {
 type sshUdpPacketConn struct {
 	*packetConn
 	client *SshUdpClient
+	closed atomic.Bool
 }
 
 func (c *sshUdpPacketConn) Close() error {
+	if !c.closed.CompareAndSwap(false, true) {
+		return nil
+	}
 	err := c.packetConn.Close()
 	c.client.exitWG.Done()
 	return err
