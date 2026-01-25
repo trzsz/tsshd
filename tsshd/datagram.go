@@ -30,6 +30,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"os"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -138,7 +139,6 @@ func (f *udpForwarder) startWorker() {
 
 func (f *udpForwarder) sendDatagram(id uint64, buf []byte) bool {
 	if len(buf) > int(f.conn.GetMaxDatagramSize()) {
-		debug("datagram buffer size [%d] larger than [%d]", len(buf), f.conn.GetMaxDatagramSize())
 		return false
 	}
 
@@ -314,7 +314,7 @@ func handleDialUdpEvent(stream Stream) {
 		return
 	}
 
-	if msg.Net == "unix" {
+	if msg.Net == "unixgram" {
 		if v := strings.ToLower(getSshdConfig("AllowStreamLocalForwarding")); v == "no" || v == "remote" {
 			sendProhibited(stream, "AllowStreamLocalForwarding")
 			return
@@ -326,21 +326,7 @@ func handleDialUdpEvent(stream Stream) {
 		return
 	}
 
-	var err error
-	var addr *net.UDPAddr
-	if msg.Timeout > 0 {
-		addr, err = doWithTimeout(func() (*net.UDPAddr, error) {
-			return net.ResolveUDPAddr(msg.Net, msg.Addr)
-		}, msg.Timeout)
-	} else {
-		addr, err = net.ResolveUDPAddr(msg.Net, msg.Addr)
-	}
-	if err != nil {
-		sendError(stream, err)
-		return
-	}
-
-	conn, err := net.DialUDP(msg.Net, nil, addr)
+	conn, err := dialUDP(&msg)
 	if err != nil {
 		sendError(stream, err)
 		return
@@ -364,7 +350,59 @@ func handleDialUdpEvent(stream Stream) {
 	forwardUDP(pconn, conn)
 }
 
-func forwardUDP(pconn *packetConn, conn *net.UDPConn) {
+type unixgramConn struct {
+	io.ReadWriteCloser
+	localAddr string
+}
+
+func (c *unixgramConn) Close() error {
+	err := c.ReadWriteCloser.Close()
+	_ = os.Remove(c.localAddr)
+	return err
+}
+
+func dialUDP(msg *dialUdpMessage) (io.ReadWriteCloser, error) {
+	if msg.Net == "unixgram" {
+		tmpFile, err := os.CreateTemp("", "tsshd_unixgram_*.sock")
+		if err != nil {
+			return nil, fmt.Errorf("create temp file failed: %v", err)
+		}
+		localAddr := tmpFile.Name()
+		if err := tmpFile.Close(); err != nil {
+			return nil, fmt.Errorf("close temp file failed: %v", err)
+		}
+		if err := os.Remove(localAddr); err != nil {
+			return nil, fmt.Errorf("remove temp file failed: %v", err)
+		}
+		laddr := &net.UnixAddr{Net: "unixgram", Name: localAddr}
+		raddr := &net.UnixAddr{Net: "unixgram", Name: msg.Addr}
+		conn, err := net.DialUnix("unixgram", laddr, raddr)
+		if err != nil {
+			if _, err := os.Stat(localAddr); err == nil {
+				_ = os.Remove(localAddr)
+			}
+			return nil, err
+		}
+		return &unixgramConn{conn, localAddr}, nil
+	}
+
+	var err error
+	var addr *net.UDPAddr
+	if msg.Timeout > 0 {
+		addr, err = doWithTimeout(func() (*net.UDPAddr, error) {
+			return net.ResolveUDPAddr(msg.Net, msg.Addr)
+		}, msg.Timeout)
+	} else {
+		addr, err = net.ResolveUDPAddr(msg.Net, msg.Addr)
+	}
+	if err != nil {
+		return nil, err
+	}
+
+	return net.DialUDP(msg.Net, nil, addr)
+}
+
+func forwardUDP(pconn *packetConn, conn io.ReadWriteCloser) {
 	defer func() {
 		_ = conn.Close()
 		_ = pconn.Close()
