@@ -126,7 +126,7 @@ func handleListenEvent(stream Stream) {
 		return
 	}
 
-	onExitFuncs = append(onExitFuncs, func() {
+	addOnExitFunc(func() {
 		_ = listener.Close()
 		if msg.Net == "unix" {
 			_ = os.Remove(msg.Addr)
