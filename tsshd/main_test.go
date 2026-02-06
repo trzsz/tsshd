@@ -1,5 +1,3 @@
-//go:build !windows
-
 /*
 MIT License
 
@@ -27,36 +25,44 @@ SOFTWARE.
 package tsshd
 
 import (
-	"fmt"
-	"net"
-	"os"
-	"path/filepath"
+	"sync"
+	"sync/atomic"
+	"testing"
 )
 
-func listenForAgent() (net.Listener, string, error) {
-	tempDir, err := os.MkdirTemp("", "tsshd-")
-	if err != nil {
-		return nil, "", fmt.Errorf("mkdir temp failed: %v", err)
+func TestAddOnExitFunc_Concurrent(t *testing.T) {
+	onExitFuncsMu.Lock()
+	saved := append([]func(){}, onExitFuncs...)
+	onExitFuncs = nil
+	onExitFuncsMu.Unlock()
+	defer func() {
+		onExitFuncsMu.Lock()
+		onExitFuncs = saved
+		onExitFuncsMu.Unlock()
+	}()
+
+	var executed atomic.Int32
+	const total = 200
+	var wg sync.WaitGroup
+	wg.Add(total)
+	for i := 0; i < total; i++ {
+		go func() {
+			defer wg.Done()
+			addOnExitFunc(func() {
+				executed.Add(1)
+			})
+		}()
 	}
-	addOnExitFunc(func() {
-		_ = os.RemoveAll(tempDir)
-	})
+	wg.Wait()
 
-	agentPath := filepath.Join(tempDir, fmt.Sprintf("agent.%d", os.Getpid()))
+	cleanupOnExit()
 
-	listener, err := net.Listen("unix", agentPath)
-	if err != nil {
-		return nil, "", fmt.Errorf("listen on [%s] failed: %v", agentPath, err)
+	if got := executed.Load(); got != total {
+		t.Fatalf("cleanupOnExit executed %d handlers, want %d", got, total)
 	}
-
-	if err := os.Chmod(agentPath, 0600); err != nil {
-		warning("agent forwarding chmod [%s] failed: %v", agentPath, err)
+	onExitFuncsMu.Lock()
+	defer onExitFuncsMu.Unlock()
+	if len(onExitFuncs) != 0 {
+		t.Fatalf("cleanupOnExit should drain handlers, got %d remaining", len(onExitFuncs))
 	}
-
-	addOnExitFunc(func() {
-		_ = listener.Close()
-		_ = os.Remove(agentPath)
-	})
-
-	return listener, agentPath, nil
 }

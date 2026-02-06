@@ -31,6 +31,7 @@ import (
 	"os/exec"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -132,11 +133,25 @@ func background() (bool, io.ReadCloser, error) {
 	return true, stdout, nil
 }
 
+var onExitFuncsMu sync.Mutex
 var onExitFuncs []func()
 
+func addOnExitFunc(fn func()) {
+	if fn == nil {
+		return
+	}
+	onExitFuncsMu.Lock()
+	onExitFuncs = append(onExitFuncs, fn)
+	onExitFuncsMu.Unlock()
+}
+
 func cleanupOnExit() {
-	for i := len(onExitFuncs) - 1; i >= 0; i-- {
-		onExitFuncs[i]()
+	onExitFuncsMu.Lock()
+	funcs := append([]func(){}, onExitFuncs...)
+	onExitFuncs = nil
+	onExitFuncsMu.Unlock()
+	for i := len(funcs) - 1; i >= 0; i-- {
+		funcs[i]()
 	}
 }
 
@@ -216,7 +231,10 @@ func TsshdMain() int {
 		// should be connected in time
 		time.Sleep(args.ConnectTimeout)
 		if !serving.Load() {
-			exitChan <- 1
+			select {
+			case exitChan <- 1:
+			default:
+			}
 		}
 	}()
 
