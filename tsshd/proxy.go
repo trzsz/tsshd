@@ -989,6 +989,7 @@ func startClientProxy(client *SshUdpClient, opts *UdpClientOptions) (string, *cl
 		cipherBlock:   &cipherBlock,
 		clientID:      opts.ServerInfo.ClientID,
 		serverID:      opts.ServerInfo.ServerID,
+		serialNumber:  opts.InitialSerialNumber,
 		serverChecker: newTimeoutChecker(opts.HeartbeatTimeout),
 	}
 

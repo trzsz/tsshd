@@ -87,21 +87,22 @@ type SshUdpClient struct {
 
 // UdpClientOptions contains all configuration parameters required to create and initialize a new SshUdpClient
 type UdpClientOptions struct {
-	ProxyClient      *SshUdpClient
-	EnableDebugging  bool
-	EnableWarning    bool
-	IPv4             bool
-	IPv6             bool
-	TsshdAddr        string
-	ServerInfo       *ServerInfo
-	AliveTimeout     time.Duration
-	IntervalTime     time.Duration
-	ConnectTimeout   time.Duration
-	HeartbeatTimeout time.Duration
-	DebugFunc        func(int64, string)
-	WarningFunc      func(string)
-	QuitCallback     func(reason string)
-	DiscardCallback  func(before []byte, after []byte)
+	ProxyClient         *SshUdpClient
+	EnableDebugging     bool
+	EnableWarning       bool
+	IPv4                bool
+	IPv6                bool
+	TsshdAddr           string
+	ServerInfo          *ServerInfo
+	AliveTimeout        time.Duration
+	IntervalTime        time.Duration
+	ConnectTimeout      time.Duration
+	HeartbeatTimeout    time.Duration
+	InitialSerialNumber uint64 // Seed roaming auth serial for resume across app termination
+	DebugFunc           func(int64, string)
+	WarningFunc         func(string)
+	QuitCallback        func(reason string)
+	DiscardCallback     func(before []byte, after []byte)
 }
 
 // NewSshUdpClient creates a SshUdpClient

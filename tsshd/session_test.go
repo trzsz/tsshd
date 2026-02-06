@@ -30,7 +30,9 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"os"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -39,6 +41,7 @@ import (
 )
 
 type mockStream struct {
+	mutex sync.RWMutex
 	buf   bytes.Buffer
 	err   error
 	first bool
@@ -53,6 +56,8 @@ func (s *mockStream) Read(b []byte) (n int, err error) {
 }
 
 func (s *mockStream) Write(p []byte) (int, error) {
+	s.mutex.Lock()
+	defer s.mutex.Unlock()
 	if s.first {
 		time.Sleep(10 * time.Millisecond)
 		s.first = false
@@ -61,6 +66,12 @@ func (s *mockStream) Write(p []byte) (int, error) {
 		return 0, s.err
 	}
 	return s.buf.Write(p)
+}
+
+func (s *mockStream) setErr(err error) {
+	s.mutex.Lock()
+	s.err = err
+	s.mutex.Unlock()
 }
 
 func (s *mockStream) Close() error {
@@ -96,6 +107,8 @@ func (s *mockStream) SetWriteDeadline(t time.Time) error {
 }
 
 func (s *mockStream) String() string {
+	s.mutex.RLock()
+	defer s.mutex.RUnlock()
 	return s.buf.String()
 }
 
@@ -105,6 +118,21 @@ type chunkReader struct {
 	chunk   int
 	offset  int // offset within current segment
 	segment int // current segment index
+}
+
+type blockingReader struct {
+	entered chan struct{}
+	once    sync.Once
+	dataCh  chan []byte
+}
+
+func (r *blockingReader) Read(p []byte) (int, error) {
+	r.once.Do(func() { close(r.entered) })
+	data, ok := <-r.dataCh
+	if !ok {
+		return 0, io.EOF
+	}
+	return copy(p, data), nil
 }
 
 func (r *chunkReader) Read(p []byte) (n int, err error) {
@@ -148,9 +176,136 @@ func newTestSessionContext(keepPending, timeout bool, maxLines int) (*sessionCon
 	globalServerProxy.clientChecker.timeoutFlag.Store(timeout)
 	maxPendingOutputLines = maxLines
 
-	return &sessionContext{rows: 0}, func() {
+	return &sessionContext{rows: 0, stdoutForwardToken: make(chan struct{}, 1)}, func() {
 		globalServerProxy, globalSetting, maxPendingOutputLines = oriServerProxy, orieStting, oriMaxLines
 	}
+}
+
+func TestDiscardPendingInputMarkerCopyAndClear(t *testing.T) {
+	clearDiscardPendingInputMarker()
+	defer clearDiscardPendingInputMarker()
+
+	marker := []byte{0x01, 0x02, 0x03}
+	setDiscardPendingInputMarker(marker)
+	marker[0] = 0xFF
+
+	got := getDiscardPendingInputMarker()
+	if len(got) != 3 {
+		t.Fatalf("unexpected marker length: %d", len(got))
+	}
+	if got[0] != 0x01 {
+		t.Fatalf("marker must be copied on set, got first byte: %#x", got[0])
+	}
+
+	clearDiscardPendingInputMarker()
+	if got := getDiscardPendingInputMarker(); got != nil {
+		t.Fatalf("marker should be nil after clear")
+	}
+	if discardPendingInputFlag.Load() {
+		t.Fatalf("discard pending flag should be false after clear")
+	}
+}
+
+func TestForwardOutput_NonPtyResumeUnblocksRead(t *testing.T) {
+	assert := assert.New(t)
+	s, reset := newTestSessionContext(false, false, 10)
+	defer reset()
+	s.resumeChan = make(chan struct{})
+
+	// Use a real os.Pipe to exercise the SetReadDeadline path,
+	// simulating what cmd.StdoutPipe() returns for non-PTY sessions.
+	pr, pw, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("os.Pipe failed: %v", err)
+	}
+	defer pr.Close()
+	defer pw.Close()
+
+	// s.pty is nil (non-PTY), s.stdout is the pipe read end.
+	s.stdout = pr
+
+	oldStream := newMockStream()
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		s.forwardOutput("stdout", pr, oldStream)
+	}()
+
+	// Give the forwarder time to enter reader.Read() which blocks on the pipe.
+	time.Sleep(50 * time.Millisecond)
+
+	// Write some data before resume so it gets read and buffered.
+	_, _ = pw.Write([]byte("before-resume\n"))
+	time.Sleep(50 * time.Millisecond)
+
+	// Resume: interruptStdoutRead sets a past deadline, unblocking the Read.
+	s.signalResume()
+
+	// The old forwarder should exit promptly (not hang for 30s).
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatalf("old stdout forwarder did not exit after resume")
+	}
+
+	// Write more data after resume — this will be picked up by the new forwarder.
+	_, _ = pw.Write([]byte("after-resume\n"))
+
+	// New forwarder should acquire the token and read from the pipe.
+	newStream := newMockStream()
+	done2 := make(chan struct{})
+	go func() {
+		defer close(done2)
+		s.forwardOutput("stdout", pr, newStream)
+	}()
+
+	// Give the new forwarder time to start and read.
+	time.Sleep(100 * time.Millisecond)
+
+	// Close write end to make the new forwarder's Read return EOF.
+	pw.Close()
+
+	select {
+	case <-done2:
+	case <-time.After(5 * time.Second):
+		t.Fatalf("new stdout forwarder did not complete")
+	}
+
+	// The new forwarder should have received the pending output from
+	// the old forwarder plus data written after resume.
+	output := newStream.String()
+	assert.Contains(output, "after-resume\n")
+}
+
+func TestForwardOutput_ResumeStoresPendingOutput(t *testing.T) {
+	assert := assert.New(t)
+	s, reset := newTestSessionContext(false, false, 10)
+	defer reset()
+	s.resumeChan = make(chan struct{})
+
+	oldStream := newMockStream()
+	reader := &blockingReader{
+		entered: make(chan struct{}),
+		dataCh:  make(chan []byte, 1),
+	}
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		s.forwardOutput("stdout", reader, oldStream)
+	}()
+
+	<-reader.entered
+	s.signalResume()
+	reader.dataCh <- []byte("resume-data")
+	close(reader.dataCh)
+	<-done
+
+	assert.Equal("", oldStream.String())
+
+	newStream := newMockStream()
+	eofReader := &chunkReader{}
+	s.forwardOutput("stdout", eofReader, newStream)
+	assert.Equal("resume-data", newStream.String())
 }
 
 func TestForwardOutput_Normal(t *testing.T) {
@@ -189,7 +344,7 @@ func TestForwardOutput_WriteError(t *testing.T) {
 	defer reset()
 
 	stream := newMockStream()
-	stream.err = errors.New("mock write error")
+	stream.setErr(errors.New("mock write error"))
 	reader := &chunkReader{data: [][]byte{[]byte("a\nb\nc\n")}, chunk: 1}
 
 	s.forwardOutput("stdout", reader, stream)
@@ -294,7 +449,7 @@ func TestForwardOutput_FlushWriteError(t *testing.T) {
 	go func() {
 		time.Sleep(100 * time.Millisecond)
 		globalServerProxy.clientChecker.timeoutFlag.Store(false)
-		stream.err = errors.New("mock write error")
+		stream.setErr(errors.New("mock write error"))
 		close(signal)
 	}()
 

@@ -75,17 +75,11 @@ var quicConfig = quic.Config{
 var globalProtoServer protocolServer
 
 type protocolServer interface {
-	getUdpForwarder() *udpForwarder
 	handleRekeyEvent(msg *rekeyMessage) error
 }
 
 type kcpServer struct {
-	crypto    *rotatingCrypto
-	forwarder *udpForwarder
-}
-
-func (s *kcpServer) getUdpForwarder() *udpForwarder {
-	return s.forwarder
+	crypto *rotatingCrypto
 }
 
 func (s *kcpServer) handleRekeyEvent(msg *rekeyMessage) error {
@@ -95,13 +89,7 @@ func (s *kcpServer) handleRekeyEvent(msg *rekeyMessage) error {
 	return nil
 }
 
-type quicServer struct {
-	forwarder *udpForwarder
-}
-
-func (s *quicServer) getUdpForwarder() *udpForwarder {
-	return s.forwarder
-}
+type quicServer struct{}
 
 func (s *quicServer) handleRekeyEvent(msg *rekeyMessage) error {
 	// rekey is handled by QUIC internally
@@ -433,6 +421,8 @@ func listenQUIC(conn net.PacketConn, info *ServerInfo, mtu uint16) (*quic.Listen
 	if err != nil {
 		return nil, fmt.Errorf("quic listen failed: %v", err)
 	}
+
+	globalProtoServer = &quicServer{}
 
 	info.Mode = kUdpModeQUIC
 	info.ServerCert = fmt.Sprintf("%x", serverCertPEM)
