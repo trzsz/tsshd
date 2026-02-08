@@ -786,7 +786,7 @@ func (p *clientProxy) renewTcpPath(proxyClient *SshUdpClient, connectTimeout tim
 			return net.ResolveTCPAddr(p.serverNet, p.serverAddr)
 		}, connectTimeout)
 		if err != nil {
-			return fmt.Errorf("resolve addr [%s] [%s] failed: %v", p.serverNet, p.serverAddr, err)
+			return fmt.Errorf("resolve tcp addr [%s] [%s] failed: %v", p.serverNet, p.serverAddr, err)
 		}
 		tcpConn, err := doWithTimeout(func() (*net.TCPConn, error) {
 			return net.DialTCP(p.serverNet, nil, serverAddr)
@@ -842,7 +842,7 @@ func (p *clientProxy) renewUdpPath(proxyClient *SshUdpClient, connectTimeout tim
 			return net.ResolveUDPAddr(p.serverNet, p.serverAddr)
 		}, connectTimeout)
 		if err != nil {
-			return fmt.Errorf("resolve addr [%s] [%s] failed: %v", p.serverNet, p.serverAddr, err)
+			return fmt.Errorf("resolve udp addr [%s] [%s] failed: %v", p.serverNet, p.serverAddr, err)
 		}
 		udpConn, err := net.DialUDP("udp", nil, serverAddr)
 		if err != nil {

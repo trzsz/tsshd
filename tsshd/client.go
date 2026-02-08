@@ -365,7 +365,7 @@ func (c *SshUdpClient) DialUDP(network, addr string, timeout time.Duration) (Pac
 	return &sshUdpPacketConn{packetConn: conn, client: c}, nil
 }
 
-// Listen requests the remote peer open a listening socket on addr
+// Listen requests the remote peer to open a listening socket on addr
 func (c *SshUdpClient) Listen(network, addr string) (net.Listener, error) {
 	stream, err := c.newStream("listen")
 	if err != nil {
@@ -385,6 +385,28 @@ func (c *SshUdpClient) Listen(network, addr string) (net.Listener, error) {
 	}
 	c.exitWG.Add(1)
 	return &sshUdpListener{client: c, stream: stream}, nil
+}
+
+// ListenUDP requests the remote peer to open a UDP listening endpoint on addr
+func (c *SshUdpClient) ListenUDP(network, addr string) (PacketListener, error) {
+	stream, err := c.newStream("listen-udp")
+	if err != nil {
+		return nil, err
+	}
+	msg := listenUdpMessage{
+		Net:  network,
+		Addr: addr,
+	}
+	if err := sendMessage(stream, &msg); err != nil {
+		_ = stream.Close()
+		return nil, fmt.Errorf("send listen udp message failed: %w", err)
+	}
+	if err := recvError(stream); err != nil {
+		_ = stream.Close()
+		return nil, err
+	}
+	c.exitWG.Add(1)
+	return &sshUdpPacketListener{client: c, stream: stream}, nil
 }
 
 // HandleChannelOpen returns a channel on which NewChannel requests
@@ -1247,5 +1269,45 @@ func (c *sshUdpPacketConn) Close() error {
 	}
 	err := c.packetConn.Close()
 	c.client.exitWG.Done()
+	return err
+}
+
+type sshUdpPacketListener struct {
+	client *SshUdpClient
+	stream Stream
+	closed atomic.Bool
+}
+
+func (l *sshUdpPacketListener) AcceptUDP() (PacketConn, error) {
+	var msg acceptUdpMessage
+	if err := recvMessage(l.stream, &msg); err != nil {
+		return nil, fmt.Errorf("recv accept udp message failed: %w", err)
+	}
+	stream, err := l.client.newStream("accept-udp")
+	if err != nil {
+		return nil, err
+	}
+
+	conn := newPacketConn(stream, msg.ID, l.client.protoClient.getUdpForwarder(), l.client.networkProxy.serverChecker)
+
+	if err := sendMessage(stream, &msg); err != nil {
+		_ = stream.Close()
+		return nil, fmt.Errorf("send accept udp message failed: %w", err)
+	}
+	if err := recvError(stream); err != nil {
+		_ = stream.Close()
+		return nil, err
+	}
+
+	l.client.exitWG.Add(1)
+	return &sshUdpPacketConn{packetConn: conn, client: l.client}, nil
+}
+
+func (l *sshUdpPacketListener) Close() error {
+	if !l.closed.CompareAndSwap(false, true) {
+		return nil
+	}
+	err := l.stream.Close()
+	l.client.exitWG.Done()
 	return err
 }

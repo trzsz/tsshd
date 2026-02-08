@@ -98,7 +98,7 @@ func newKcpDatagramConn(conn *kcp.UDPSession) datagramConn {
 	dc := &kcpDatagramConn{
 		conn,
 		make(chan []byte, 1024),
-		uint16(conn.GetOOBMaxSize()) - 8, // Reserve 8 bytes from the MTU for the channel ID
+		uint16(conn.GetOOBMaxSize()) - kUdpForwardChannelIdSize, // Reserve 8 bytes from the MTU for the channel ID
 	}
 	_ = conn.SetOOBHandler(dc.datagramHandler)
 	return dc
@@ -141,7 +141,7 @@ func newQuicDatagramConn(conn *quic.Conn) datagramConn {
 		conn,
 		// This depends on quicConfig.InitialPacketSize being properly clamped to the valid MTU range.
 		// See TestQUIC_InitialPacketSize for the test that ensures this behavior.
-		quicConfig.InitialPacketSize - kQuicShortHeaderSize - 8, // Reserve 8 bytes from the MTU for the channel ID
+		quicConfig.InitialPacketSize - kQuicShortHeaderSize - kUdpForwardChannelIdSize, // Reserve 8 bytes from the MTU for the channel ID
 	}
 }
 
@@ -242,6 +242,10 @@ func handleStream(stream Stream) {
 		handler = handleAcceptEvent
 	case "dial-udp":
 		handler = handleDialUdpEvent
+	case "listen-udp":
+		handler = handleListenUdpEvent
+	case "accept-udp":
+		handler = handleAcceptUdpEvent
 	default:
 		sendError(stream, fmt.Errorf("unknown stream command: %s", command))
 		return

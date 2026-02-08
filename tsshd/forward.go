@@ -135,7 +135,7 @@ func handleListenEvent(stream Stream) {
 	defer func() { _ = listener.Close() }()
 
 	if err := sendSuccess(stream); err != nil { // ack ok
-		warning("listen ack ok failed: %v", err)
+		warning("listener [%s] [%s] ack ok failed: %v", msg.Net, msg.Addr, err)
 		return
 	}
 
@@ -143,6 +143,7 @@ func handleListenEvent(stream Stream) {
 		conn, err := listener.Accept()
 		if err != nil {
 			if isClosedError(err) {
+				debug("listener [%s] [%s] closed: %v", msg.Net, msg.Addr, err)
 				break
 			}
 			warning("listener [%s] [%s] accept failed: %v", msg.Net, msg.Addr, err)
@@ -153,7 +154,11 @@ func handleListenEvent(stream Stream) {
 			if conn := getAcceptConn(id); conn != nil {
 				_ = conn.Close()
 			}
-			warning("send accept message failed: %v", err)
+			if isClosedError(err) {
+				debug("listener [%s] [%s] send accept message closed: %v", msg.Net, msg.Addr, err)
+				return
+			}
+			warning("listener [%s] [%s] send accept message failed: %v", msg.Net, msg.Addr, err)
 			return
 		}
 	}

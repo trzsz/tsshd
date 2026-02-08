@@ -199,6 +199,15 @@ type dialUdpResponse struct {
 	ID uint64 `json:",omitempty"`
 }
 
+type listenUdpMessage struct {
+	Net  string `json:",omitempty"`
+	Addr string `json:",omitempty"`
+}
+
+type acceptUdpMessage struct {
+	ID uint64 `json:",omitempty"`
+}
+
 func (d *dialUdpResponse) getErrorMessage() *errorMessage {
 	return &d.errorMessage
 }

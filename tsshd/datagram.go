@@ -36,6 +36,10 @@ import (
 	"sync/atomic"
 )
 
+const kMaxUdpForwardPendingPackets = 1024
+
+const kUdpForwardChannelIdSize = 8
+
 var udpForwardChannelID atomic.Uint64
 
 // PacketConn represents a connection capable of sending and receiving packet-based data.
@@ -54,6 +58,16 @@ type PacketConn interface {
 	// Consume repeatedly reads packets from the connection and passes each packet to the
 	// provided consumeFn callback until an error occurs.
 	Consume(consumeFn func([]byte) error) error
+}
+
+// PacketListener represents a remote UDP listening endpoint.
+type PacketListener interface {
+
+	// AcceptUDP waits for and returns the next incoming UDP forwarding session.
+	AcceptUDP() (PacketConn, error)
+
+	// Close closes the listener and releases any associated resources.
+	Close() error
 }
 
 type datagramConn interface {
@@ -94,7 +108,7 @@ func (f *udpForwarder) startWorker() {
 				return
 			}
 
-			if len(buf) < 8 {
+			if len(buf) < kUdpForwardChannelIdSize {
 				continue
 			}
 
@@ -110,7 +124,7 @@ func (f *udpForwarder) startWorker() {
 					return
 				}
 
-				id := binary.BigEndian.Uint64(buf[len(buf)-8:])
+				id := binary.BigEndian.Uint64(buf[len(buf)-kUdpForwardChannelIdSize:])
 				val, ok := f.channelMap.Load(id)
 				if !ok {
 					continue
@@ -118,7 +132,7 @@ func (f *udpForwarder) startWorker() {
 
 				if ch, ok := val.(chan []byte); ok {
 					select {
-					case ch <- buf[:len(buf)-8]:
+					case ch <- buf[:len(buf)-kUdpForwardChannelIdSize]:
 					default:
 					}
 				}
@@ -142,7 +156,7 @@ func (f *udpForwarder) sendDatagram(id uint64, buf []byte) bool {
 		return false
 	}
 
-	tag := make([]byte, 8)
+	tag := make([]byte, kUdpForwardChannelIdSize)
 	binary.BigEndian.PutUint64(tag, id)
 	if err := f.conn.SendDatagram(append(buf, tag...)); err != nil {
 		return false
@@ -299,13 +313,16 @@ func (c *packetConn) Close() error {
 		c.forwarder.removeChannel(c.channelID)
 	}
 
+	if c.stream == nil {
+		return nil
+	}
 	return c.stream.Close()
 }
 
 func handleDialUdpEvent(stream Stream) {
 	var msg dialUdpMessage
 	if err := recvMessage(stream, &msg); err != nil {
-		sendError(stream, fmt.Errorf("recv dial message failed: %v", err))
+		sendError(stream, fmt.Errorf("recv dial udp message failed: %v", err))
 		return
 	}
 
@@ -347,7 +364,7 @@ func handleDialUdpEvent(stream Stream) {
 		return
 	}
 
-	forwardUDP(pconn, conn)
+	forwardUDP(pconn, conn, &msg)
 }
 
 type unixgramConn struct {
@@ -402,7 +419,7 @@ func dialUDP(msg *dialUdpMessage) (io.ReadWriteCloser, error) {
 	return net.DialUDP(msg.Net, nil, addr)
 }
 
-func forwardUDP(pconn *packetConn, conn io.ReadWriteCloser) {
+func forwardUDP(pconn *packetConn, conn io.ReadWriteCloser, msg *dialUdpMessage) {
 	defer func() {
 		_ = conn.Close()
 		_ = pconn.Close()
@@ -413,9 +430,18 @@ func forwardUDP(pconn *packetConn, conn io.ReadWriteCloser) {
 
 	go func() {
 		defer close(done1)
+		var warnOnce sync.Once
 		_ = pconn.Consume(func(buf []byte) error {
-			_, err := conn.Write(buf)
-			return err
+			if _, err := conn.Write(buf); err != nil {
+				if isClosedError(err) {
+					debug("udp forwarding write to [%s] [%s] closed: %v", msg.Net, msg.Addr, err)
+					return err
+				}
+				warnOnce.Do(func() {
+					warning("udp forwarding write to [%s] [%s] failed: %v", msg.Net, msg.Addr, err)
+				})
+			}
+			return nil
 		})
 	}()
 
@@ -425,9 +451,19 @@ func forwardUDP(pconn *packetConn, conn io.ReadWriteCloser) {
 		for {
 			n, err := conn.Read(buffer)
 			if err != nil {
+				if isClosedError(err) {
+					debug("udp forwarding read from [%s] [%s] closed: %v", msg.Net, msg.Addr, err)
+					return
+				}
+				warning("udp forwarding read from [%s] [%s] failed: %v", msg.Net, msg.Addr, err)
 				return
 			}
 			if err := pconn.Write(buffer[:n]); err != nil {
+				if isClosedError(err) {
+					debug("udp forwarding [%s] [%s] write closed: %v", msg.Net, msg.Addr, err)
+					return
+				}
+				warning("udp forwarding [%s] [%s] write failed: %v", msg.Net, msg.Addr, err)
 				return
 			}
 		}
@@ -436,5 +472,279 @@ func forwardUDP(pconn *packetConn, conn io.ReadWriteCloser) {
 	select {
 	case <-done1:
 	case <-done2:
+	}
+}
+
+var udpListenerID atomic.Uint64
+
+type udpForwardSession struct {
+	sessionKey   string
+	listenerNet  string
+	listenerAddr string
+	listenerConn net.PacketConn
+	forwardConn  *packetConn
+	peerAddr     net.Addr
+	warnOnce     sync.Once
+	writeMu      sync.Mutex
+	pendingBuf   [][]byte
+	pendingFlag  bool
+}
+
+func (s *udpForwardSession) writePacket(data []byte) {
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+
+	if s.pendingFlag {
+		if len(s.pendingBuf) >= kMaxUdpForwardPendingPackets {
+			return
+		}
+		buf := make([]byte, len(data), len(data)+kUdpForwardChannelIdSize)
+		copy(buf, data)
+		s.pendingBuf = append(s.pendingBuf, buf)
+		return
+	}
+
+	s.doWrite(data)
+}
+
+func (s *udpForwardSession) doWrite(data []byte) {
+	if err := s.forwardConn.Write(data); err != nil {
+		if isClosedError(err) {
+			debug("udp forwarding [%s] [%s] write closed: %v", s.listenerNet, s.listenerAddr, err)
+			return
+		}
+		s.warnOnce.Do(func() {
+			warning("udp forwarding [%s] [%s] write failed: %v", s.listenerNet, s.listenerAddr, err)
+		})
+	}
+}
+
+func (s *udpForwardSession) attachStream(stream Stream) {
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+
+	s.forwardConn.stream = stream
+	s.pendingFlag = false
+
+	for _, data := range s.pendingBuf {
+		s.doWrite(data)
+	}
+	s.pendingBuf = nil
+}
+
+func (s *udpForwardSession) Close() {
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+	_ = s.forwardConn.Close()
+}
+
+func (s *udpForwardSession) getPeerAddr() string {
+	if s.peerAddr == nil {
+		return "nil"
+	}
+	return s.peerAddr.String()
+}
+
+var udpForwardSessionMu sync.Mutex
+var udpForwardSessionMap = make(map[string]*udpForwardSession)
+
+func acquireUdpForwardSession(sessionKey, listenerNet, listenerAddr string,
+	listenerConn net.PacketConn, peerAddr net.Addr) (*udpForwardSession, bool) {
+	udpForwardSessionMu.Lock()
+	defer udpForwardSessionMu.Unlock()
+	session, exists := udpForwardSessionMap[sessionKey]
+	if exists {
+		return session, true
+	}
+	id := udpForwardChannelID.Add(1)
+	forwardConn := newPacketConn(nil, id, globalProtoServer.getUdpForwarder(), globalServerProxy.clientChecker)
+	session = &udpForwardSession{
+		sessionKey:   sessionKey,
+		listenerNet:  listenerNet,
+		listenerAddr: listenerAddr,
+		listenerConn: listenerConn,
+		forwardConn:  forwardConn,
+		peerAddr:     cloneNetAddr(peerAddr),
+		pendingFlag:  true,
+	}
+	udpForwardSessionMap[sessionKey] = session
+	return session, false
+}
+
+func releaseUdpForwardSession(session *udpForwardSession) {
+	udpForwardSessionMu.Lock()
+	delete(udpForwardSessionMap, session.sessionKey)
+	udpForwardSessionMu.Unlock()
+	session.Close()
+}
+
+var udpForwardPendingMu sync.Mutex
+var udpForwardPendingMap = make(map[uint64]*udpForwardSession)
+
+func addUdpForwardPendingSession(id uint64, session *udpForwardSession) {
+	udpForwardPendingMu.Lock()
+	defer udpForwardPendingMu.Unlock()
+	udpForwardPendingMap[id] = session
+}
+
+func takeUdpForwardPendingSession(id uint64) *udpForwardSession {
+	udpForwardPendingMu.Lock()
+	defer udpForwardPendingMu.Unlock()
+	session, ok := udpForwardPendingMap[id]
+	if !ok {
+		return nil
+	}
+	delete(udpForwardPendingMap, id)
+	return session
+}
+
+func handleListenUdpEvent(stream Stream) {
+	var msg listenUdpMessage
+	if err := recvMessage(stream, &msg); err != nil {
+		sendError(stream, fmt.Errorf("recv listen udp message failed: %v", err))
+		return
+	}
+
+	if v := strings.ToLower(getSshdConfig("AllowTcpForwarding")); v == "no" || v == "local" {
+		sendProhibited(stream, "AllowTcpForwarding")
+		return
+	}
+
+	if msg.Net == "unixgram" {
+		if v := strings.ToLower(getSshdConfig("AllowStreamLocalForwarding")); v == "no" || v == "local" {
+			sendProhibited(stream, "AllowStreamLocalForwarding")
+			return
+		}
+	}
+
+	if v := strings.ToLower(getSshdConfig("DisableForwarding")); v == "yes" {
+		sendProhibited(stream, "DisableForwarding")
+		return
+	}
+
+	listenerConn, err := net.ListenPacket(msg.Net, msg.Addr)
+	if err != nil {
+		sendError(stream, err)
+		return
+	}
+
+	onExitFuncs = append(onExitFuncs, func() {
+		_ = listenerConn.Close()
+		if msg.Net == "unixgram" {
+			_ = os.Remove(msg.Addr)
+		}
+	})
+	defer func() { _ = listenerConn.Close() }()
+
+	if err := sendSuccess(stream); err != nil { // ack ok
+		warning("udp listener [%s] [%s] ack ok failed: %v", msg.Net, msg.Addr, err)
+		return
+	}
+
+	listenerID := udpListenerID.Add(1)
+	buf := make([]byte, 0xffff)
+	for {
+		n, addr, err := listenerConn.ReadFrom(buf)
+		if err != nil {
+			if isClosedError(err) {
+				debug("udp listener [%s] [%s] closed: %v", msg.Net, msg.Addr, err)
+				break
+			}
+			warning("udp listener [%s] [%s] read failed: %v", msg.Net, msg.Addr, err)
+			break
+		}
+
+		var sessionKey string
+		if addr != nil {
+			sessionKey = fmt.Sprintf("%d_%s", listenerID, addr.String())
+		} else {
+			sessionKey = fmt.Sprintf("%d_nil", listenerID)
+		}
+
+		session, exists := acquireUdpForwardSession(sessionKey, msg.Net, msg.Addr, listenerConn, addr)
+
+		session.writePacket(buf[:n])
+
+		if exists {
+			continue
+		}
+
+		id := session.forwardConn.channelID
+		addUdpForwardPendingSession(id, session)
+
+		if err := sendMessage(stream, acceptUdpMessage{id}); err != nil {
+			_ = takeUdpForwardPendingSession(id)
+			releaseUdpForwardSession(session)
+			if isClosedError(err) {
+				debug("udp listener [%s] [%s] send accept udp message closed: %v", msg.Net, msg.Addr, err)
+				return
+			}
+			warning("udp listener [%s] [%s] send accept udp message failed: %v", msg.Net, msg.Addr, err)
+			continue
+		}
+	}
+}
+
+func handleAcceptUdpEvent(stream Stream) {
+	var msg acceptUdpMessage
+	if err := recvMessage(stream, &msg); err != nil {
+		sendError(stream, fmt.Errorf("recv accept udp message failed: %v", err))
+		return
+	}
+
+	session := takeUdpForwardPendingSession(msg.ID)
+
+	if session == nil {
+		sendError(stream, fmt.Errorf("invalid accept udp id: %d", msg.ID))
+		return
+	}
+
+	if err := sendSuccess(stream); err != nil { // ack ok
+		warning("accept udp ack ok failed: %v", err)
+		return
+	}
+
+	session.attachStream(stream)
+	defer releaseUdpForwardSession(session)
+
+	var warnOnce sync.Once
+	_ = session.forwardConn.Consume(func(buf []byte) error {
+		if _, err := session.listenerConn.WriteTo(buf, session.peerAddr); err != nil {
+			if isClosedError(err) {
+				if enableDebugLogging {
+					debug("udp listener [%s] [%s] write to [%s] closed: %v", session.listenerNet, session.listenerAddr, session.getPeerAddr(), err)
+				}
+				return err
+			}
+			warnOnce.Do(func() {
+				if enableWarningLogging {
+					warning("udp listener [%s] [%s] write to [%s] failed: %v", session.listenerNet, session.listenerAddr, session.getPeerAddr(), err)
+				}
+			})
+		}
+		return nil
+	})
+}
+
+func cloneNetAddr(addr net.Addr) net.Addr {
+	switch v := addr.(type) {
+	case *net.UDPAddr:
+		return &net.UDPAddr{
+			IP:   append([]byte(nil), v.IP...),
+			Port: v.Port,
+			Zone: v.Zone,
+		}
+	case *net.IPAddr:
+		return &net.IPAddr{
+			IP:   append([]byte(nil), v.IP...),
+			Zone: v.Zone,
+		}
+	case *net.UnixAddr:
+		return &net.UnixAddr{
+			Name: v.Name,
+			Net:  v.Net,
+		}
+	default:
+		return addr
 	}
 }
