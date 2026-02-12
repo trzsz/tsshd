@@ -557,7 +557,7 @@ func acquireUdpForwardSession(sessionKey, listenerNet, listenerAddr string,
 		return session, true
 	}
 	id := udpForwardChannelID.Add(1)
-	forwardConn := newPacketConn(nil, id, globalProtoServer.getUdpForwarder(), globalServerProxy.clientChecker)
+	forwardConn := newPacketConn(nil, id, getActiveBusForwarder(), globalServerProxy.clientChecker)
 	session = &udpForwardSession{
 		sessionKey:   sessionKey,
 		listenerNet:  listenerNet,

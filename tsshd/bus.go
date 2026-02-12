@@ -104,6 +104,12 @@ func isActiveBusForwarder(forwarder *udpForwarder) bool {
 	return busStream != nil && activeBusForwarder == forwarder
 }
 
+func getActiveBusForwarder() *udpForwarder {
+	busMu.Lock()
+	defer busMu.Unlock()
+	return activeBusForwarder
+}
+
 func isBusStreamInited() bool {
 	busMu.Lock()
 	defer busMu.Unlock()

@@ -42,7 +42,7 @@ func TestKCP_PassSaltValidation(t *testing.T) {
 	defer func() { _ = udpConn.Close() }()
 
 	// Start KCP server
-	listener, err := listenKCP(udpConn, &info)
+	listener, err := listenKCP(udpConn, &info, &tsshdArgs{})
 	if err != nil {
 		t.Fatalf("listenKCP failed: %v", err)
 	}
@@ -173,7 +173,7 @@ func TestKCP_OOB(t *testing.T) {
 	defer func() { _ = udpConn.Close() }()
 
 	// Start KCP server
-	listener, err := listenKCP(udpConn, &info)
+	listener, err := listenKCP(udpConn, &info, &tsshdArgs{})
 	if err != nil {
 		t.Fatalf("listenKCP failed: %v", err)
 	}

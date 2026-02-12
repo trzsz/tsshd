@@ -76,6 +76,8 @@ func TestStartBusKeepAliveReplacesPrevious(t *testing.T) {
 }
 
 func TestActiveBusForwarderSwitch(t *testing.T) {
+	savedProxy := globalServerProxy
+	globalServerProxy = &serverProxy{args: &tsshdArgs{Reconnect: true}}
 	busMu.Lock()
 	savedStream := busStream
 	savedForwarder := activeBusForwarder
@@ -87,6 +89,7 @@ func TestActiveBusForwarderSwitch(t *testing.T) {
 		busStream = savedStream
 		activeBusForwarder = savedForwarder
 		busMu.Unlock()
+		globalServerProxy = savedProxy
 	}()
 
 	stream1 := &noopStream{}
