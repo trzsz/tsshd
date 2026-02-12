@@ -124,7 +124,7 @@ func initServer(args *tsshdArgs) (*kcp.Listener, *quic.Listener, error) {
 	var kcpListener *kcp.Listener
 	var quicListener *quic.Listener
 	if args.KCP {
-		kcpListener, err = listenKCP(udpConn, info)
+		kcpListener, err = listenKCP(udpConn, info, args)
 	} else {
 		quicListener, err = listenQUIC(udpConn, info, args.MTU)
 	}
@@ -367,7 +367,7 @@ func listenOnPort(args *tsshdArgs, udpAddr *net.UDPAddr, port int) (conn io.Clos
 	return conn, nil
 }
 
-func listenKCP(conn *net.UDPConn, info *ServerInfo) (*kcp.Listener, error) {
+func listenKCP(conn *net.UDPConn, info *ServerInfo, args *tsshdArgs) (*kcp.Listener, error) {
 	pass := make([]byte, 48)
 	if _, err := crypto_rand.Read(pass); err != nil {
 		return nil, fmt.Errorf("rand pass failed: %v", err)
@@ -381,7 +381,9 @@ func listenKCP(conn *net.UDPConn, info *ServerInfo) (*kcp.Listener, error) {
 	if err != nil {
 		return nil, fmt.Errorf("new rotating gcm failed: %w", err)
 	}
-	crypto.EnableKey0Retention()
+	if args.Reconnect {
+		crypto.EnableKey0Retention()
+	}
 	block := kcp.NewAEADCrypt(crypto)
 
 	globalProtoServer = &kcpServer{crypto: crypto}

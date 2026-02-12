@@ -64,6 +64,11 @@ func initBusStream(stream Stream, forwarder *udpForwarder) error {
 	busMu.Lock()
 	oldStream := busStream
 
+	if oldStream != nil && !globalServerProxy.args.Reconnect {
+		busMu.Unlock()
+		return fmt.Errorf("client reconnection not enabled (use --reconnect to allow)")
+	}
+
 	// Update clientAliveTime immediately to prevent the old keepAlive
 	// goroutine from timing out during reconnection handshake.
 	clientAliveTime.addMilli(time.Now().UnixMilli())

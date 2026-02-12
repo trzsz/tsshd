@@ -313,9 +313,11 @@ func (p *serverProxy) setClientConn(newClientConn *clientConnHolder) {
 
 	if oldClientConn != nil {
 		oldClientConn.Close()
-		enablePendingInputDiscard() // discard pending user input from previous connections
-		if globalProtoServer != nil {
-			globalProtoServer.markPendingReconnection()
+		if p.args.Reconnect {
+			enablePendingInputDiscard() // discard pending user input from previous connections
+			if globalProtoServer != nil {
+				globalProtoServer.markPendingReconnection()
+			}
 		}
 	}
 

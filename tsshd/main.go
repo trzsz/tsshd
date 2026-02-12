@@ -48,13 +48,14 @@ type tsshdArgs struct {
 	IPv4           bool
 	IPv6           bool
 	Debug          bool
+	Reconnect      bool
 	MTU            uint16
 	Port           string
 	ConnectTimeout time.Duration
 }
 
 func printHelp() int {
-	fmt.Printf("usage: tsshd [-h|-v|-V] [--kcp] [--tcp] [--ipv4] [--ipv6] [--debug] [--mtu N] [--port low-high] [--connect-timeout t]\n\n" +
+	fmt.Printf("usage: tsshd [-h|-v|-V] [--kcp] [--tcp] [--ipv4] [--ipv6] [--reconnect] [--debug] [--mtu N] [--port low-high] [--connect-timeout t]\n\n" +
 		"tsshd: trzsz-ssh(tssh) udp server that supports connection migration for roaming.\n\n" +
 		"optional arguments:\n" +
 		"  -h, --help             show this help message and exit\n" +
@@ -64,6 +65,7 @@ func printHelp() int {
 		"  --tcp                  Use UDP-over-TCP to bypass UDP blocking\n" +
 		"  --ipv4                 UDP only listens on IPv4, ignoring IPv6\n" +
 		"  --ipv6                 UDP only listens on IPv6, ignoring IPv4\n" +
+		"  --reconnect            Allow client to reconnect on a new connection\n" +
 		"  --debug                Send debugging messages to the client\n" +
 		"  --mtu N                Sets the Maximum Transmission Unit (MTU)\n" +
 		"  --port low-high        UDP port range that the tsshd listens on\n" +
@@ -91,6 +93,8 @@ func parseTsshdArgs() *tsshdArgs {
 			args.IPv6 = true
 		case "--debug":
 			args.Debug = true
+		case "--reconnect":
+			args.Reconnect = true
 		case "--mtu":
 			if i+1 < len(os.Args) && !strings.HasPrefix(os.Args[i+1], "-") {
 				if mtu, err := strconv.ParseUint(os.Args[i+1], 10, 16); err == nil {
