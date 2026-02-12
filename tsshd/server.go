@@ -76,6 +76,7 @@ var globalProtoServer protocolServer
 
 type protocolServer interface {
 	handleRekeyEvent(msg *rekeyMessage) error
+	markPendingReconnection()
 }
 
 type kcpServer struct {
@@ -89,11 +90,19 @@ func (s *kcpServer) handleRekeyEvent(msg *rekeyMessage) error {
 	return nil
 }
 
+func (s *kcpServer) markPendingReconnection() {
+	s.crypto.MarkPendingReconnection()
+}
+
 type quicServer struct{}
 
 func (s *quicServer) handleRekeyEvent(msg *rekeyMessage) error {
 	// rekey is handled by QUIC internally
 	return nil
+}
+
+func (s *quicServer) markPendingReconnection() {
+	// QUIC handles its own crypto; no key0 retention needed
 }
 
 func initServer(args *tsshdArgs) (*kcp.Listener, *quic.Listener, error) {
@@ -372,6 +381,7 @@ func listenKCP(conn *net.UDPConn, info *ServerInfo) (*kcp.Listener, error) {
 	if err != nil {
 		return nil, fmt.Errorf("new rotating gcm failed: %w", err)
 	}
+	crypto.EnableKey0Retention()
 	block := kcp.NewAEADCrypt(crypto)
 
 	globalProtoServer = &kcpServer{crypto: crypto}
