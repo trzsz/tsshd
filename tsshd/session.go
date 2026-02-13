@@ -45,11 +45,39 @@ import (
 )
 
 var maxPendingOutputLines = 1000
+var maxPendingResumeBytes = 4 * 1024 * 1024 // 4 MB cap for buffered resume output
 
 var discardPendingInputFlag atomic.Bool
 var discardPendingInputMarker []byte
+var discardMarkerMu sync.Mutex
 var discardMarkerCurrentIndex uint32
-var discardMarkerIndexMutex sync.Mutex
+var discardMarkerIndexMu sync.Mutex
+var discardGeneration atomic.Uint64
+
+func setDiscardPendingInputMarker(marker []byte) {
+	discardMarkerMu.Lock()
+	discardPendingInputMarker = append(discardPendingInputMarker[:0], marker...)
+	discardPendingInputFlag.Store(true)
+	discardMarkerMu.Unlock()
+}
+
+func getDiscardPendingInputMarker() []byte {
+	discardMarkerMu.Lock()
+	defer discardMarkerMu.Unlock()
+	if !discardPendingInputFlag.Load() || len(discardPendingInputMarker) == 0 {
+		return nil
+	}
+	marker := make([]byte, len(discardPendingInputMarker))
+	copy(marker, discardPendingInputMarker)
+	return marker
+}
+
+func clearDiscardPendingInputMarker() {
+	discardMarkerMu.Lock()
+	discardPendingInputMarker = nil
+	discardPendingInputFlag.Store(false)
+	discardMarkerMu.Unlock()
+}
 
 func enablePendingInputDiscard() {
 	if globalSetting.keepPendingInput.Load() {
@@ -57,20 +85,25 @@ func enablePendingInputDiscard() {
 	}
 
 	idx := getNextDiscardMarkerIndex()
-	discardPendingInputMarker = []byte{0xFF, 0xC0, 0xC1, 0xFF,
+	marker := []byte{0xFF, 0xC0, 0xC1, 0xFF,
 		byte(idx >> 24), byte(idx >> 16), byte(idx >> 8), byte(idx),
 	}
-	discardPendingInputFlag.Store(true)
+	setDiscardPendingInputMarker(marker)
+	discardGeneration.Add(1)
 
+	// Must use goroutine: this is called from udpFrontendToBackend via setClientConn.
+	// A synchronous sendBusMessage would block the packet forwarding goroutine if KCP's
+	// send buffer is full (no client ACKs during disconnection), causing a deadlock.
+	// Capture marker by value to avoid closure-by-reference race when called rapidly.
 	go func() {
-		debug("discard marker: %X", discardPendingInputMarker)
-		_ = sendBusMessage("discard", discardMessage{DiscardMarker: discardPendingInputMarker})
+		debug("discard marker: %X", marker)
+		_ = sendBusMessage("discard", discardMessage{DiscardMarker: marker})
 	}()
 }
 
 func getNextDiscardMarkerIndex() uint32 {
-	discardMarkerIndexMutex.Lock()
-	defer discardMarkerIndexMutex.Unlock()
+	discardMarkerIndexMu.Lock()
+	defer discardMarkerIndexMu.Unlock()
 
 	discardMarkerCurrentIndex++
 	for i := 3; i >= 0; i-- {
@@ -98,6 +131,144 @@ type sessionContext struct {
 	closed  atomic.Bool
 
 	discardedBuffer []byte
+
+	// Per-session discard state: each session independently tracks its discard marker
+	// to avoid cross-session interference when multiple sessions resume concurrently.
+	discarding     bool
+	discardMarker  []byte
+	lastDiscardGen uint64
+
+	// resumeChan signals I/O goroutines to stop when a resume takes over
+	resumeChan chan struct{}
+	resumeMu   sync.Mutex
+
+	// activeInputStream is the stream currently being read by forwardInput.
+	// Protected by resumeMu. Closed on resume to unblock a blocking Read.
+	activeInputStream Stream
+
+	// sizeMu protects cols, rows, and pty.Resize calls to prevent races
+	// between triggerRedraw and SetSize.
+	sizeMu sync.Mutex
+
+	// redrawDone is closed by forwardOutput after acquiring the stdout token,
+	// signaling the reattachIO redraw ticker goroutine to stop.
+	redrawDone chan struct{}
+
+	// stdoutForwardToken is a channel-based semaphore (capacity 1) that ensures only
+	// one stdout reader goroutine exists at a time. Uses a channel instead of sync.Mutex
+	// to support timeout and cancellation during resume handoff.
+	stdoutForwardToken chan struct{}
+	// pendingResumeOutput stores bytes read by a superseded stdout forwarder.
+	pendingResumeOutput []byte
+	pendingOutputMu     sync.Mutex
+}
+
+// signalResume closes the current resumeChan to signal old I/O goroutines to stop,
+// then creates a new one for the new connection. It also closes the old input
+// stream's read side to unblock any forwardInput goroutine stuck in stream.Read,
+// and sets a past read deadline on stdout to unblock non-PTY stdout forwarders.
+func (c *sessionContext) signalResume() {
+	c.resumeMu.Lock()
+	defer c.resumeMu.Unlock()
+	if c.resumeChan != nil {
+		close(c.resumeChan)
+	}
+	c.resumeChan = make(chan struct{})
+	if c.activeInputStream != nil {
+		_ = c.activeInputStream.CloseRead()
+		c.activeInputStream = nil
+	}
+	// For non-PTY sessions, interrupt blocking stdout reads by setting a past deadline.
+	// PTY sessions use SIGWINCH via triggerRedraw instead.
+	c.interruptStdoutRead()
+}
+
+// interruptStdoutRead sets a past read deadline on stdout for non-PTY sessions
+// to unblock a forwardOutput goroutine stuck in reader.Read(). This is the
+// non-PTY equivalent of triggerRedraw (which uses SIGWINCH for PTY sessions).
+func (c *sessionContext) interruptStdoutRead() {
+	if c.pty != nil || c.stdout == nil {
+		return
+	}
+	type deadliner interface {
+		SetReadDeadline(time.Time) error
+	}
+	if d, ok := c.stdout.(deadliner); ok {
+		_ = d.SetReadDeadline(time.Now())
+	}
+}
+
+// clearStdoutReadDeadline removes the read deadline set by interruptStdoutRead,
+// allowing the new forwarder to read from stdout normally.
+func (c *sessionContext) clearStdoutReadDeadline() {
+	if c.pty != nil || c.stdout == nil {
+		return
+	}
+	type deadliner interface {
+		SetReadDeadline(time.Time) error
+	}
+	if d, ok := c.stdout.(deadliner); ok {
+		_ = d.SetReadDeadline(time.Time{})
+	}
+}
+
+// triggerRedraw sends SIGWINCH to the shell to force a screen redraw.
+// Uses the cols+1 trick to ensure shells notice the change.
+func (c *sessionContext) triggerRedraw() {
+	if c.pty == nil {
+		return
+	}
+	c.sizeMu.Lock()
+	_ = c.pty.Resize(c.cols+1, c.rows)
+	c.sizeMu.Unlock()
+
+	time.Sleep(10 * time.Millisecond)
+
+	// Re-read cols/rows in case SetSize was called during the sleep.
+	c.sizeMu.Lock()
+	_ = c.pty.Resize(c.cols, c.rows)
+	c.sizeMu.Unlock()
+}
+
+// getResumeChan returns the current resume channel (for checking in I/O loops)
+func (c *sessionContext) getResumeChan() <-chan struct{} {
+	c.resumeMu.Lock()
+	defer c.resumeMu.Unlock()
+	return c.resumeChan
+}
+
+func (c *sessionContext) appendPendingResumeOutput(buf []byte) {
+	if len(buf) == 0 {
+		return
+	}
+	c.pendingOutputMu.Lock()
+	defer c.pendingOutputMu.Unlock()
+	if len(c.pendingResumeOutput)+len(buf) > maxPendingResumeBytes {
+		// Drop oldest data to stay within the cap.
+		overflow := len(c.pendingResumeOutput) + len(buf) - maxPendingResumeBytes
+		if overflow >= len(c.pendingResumeOutput) {
+			c.pendingResumeOutput = c.pendingResumeOutput[:0]
+		} else {
+			c.pendingResumeOutput = c.pendingResumeOutput[overflow:]
+		}
+		// If buf alone exceeds the cap, keep only its tail.
+		if len(buf) > maxPendingResumeBytes {
+			buf = buf[len(buf)-maxPendingResumeBytes:]
+		}
+	}
+	c.pendingResumeOutput = append(c.pendingResumeOutput, buf...)
+}
+
+func (c *sessionContext) takePendingResumeOutput() []byte {
+	c.pendingOutputMu.Lock()
+	defer c.pendingOutputMu.Unlock()
+	if len(c.pendingResumeOutput) == 0 {
+		return nil
+	}
+	buf := make([]byte, len(c.pendingResumeOutput))
+	copy(buf, c.pendingResumeOutput)
+	c.pendingResumeOutput = nil
+	return buf
 }
 
 type stderrStream struct {
@@ -106,10 +277,10 @@ type stderrStream struct {
 	stream Stream
 }
 
-var sessionMutex sync.Mutex
+var sessionMu sync.Mutex
 var sessionMap = make(map[uint64]*sessionContext)
 
-var stderrMutex sync.Mutex
+var stderrMu sync.Mutex
 var stderrMap = make(map[uint64]*stderrStream)
 
 func (c *sessionContext) StartPty() error {
@@ -177,12 +348,19 @@ func (c *sessionContext) showMotd(stream Stream) {
 
 func (c *sessionContext) discardPendingInput(buf []byte) error {
 	c.discardedBuffer = append(c.discardedBuffer, buf...)
-	pos := bytes.Index(c.discardedBuffer, discardPendingInputMarker)
+	if len(c.discardedBuffer) > maxPendingResumeBytes {
+		warning("discardedBuffer exceeded %d bytes, giving up on discard marker", maxPendingResumeBytes)
+		c.discardedBuffer = nil
+		c.discardMarker = nil
+		c.discarding = false
+		return nil
+	}
+	pos := bytes.Index(c.discardedBuffer, c.discardMarker)
 	if pos < 0 {
 		return nil
 	}
 
-	remainingBuffer := c.discardedBuffer[pos+len(discardPendingInputMarker):]
+	remainingBuffer := c.discardedBuffer[pos+len(c.discardMarker):]
 	if len(remainingBuffer) > 0 {
 		if err := writeAll(c.stdin, remainingBuffer); err != nil {
 			return err
@@ -198,22 +376,69 @@ func (c *sessionContext) discardPendingInput(buf []byte) error {
 		debug("no pending input to discard")
 	}
 	c.discardedBuffer = nil
+	c.discardMarker = nil
+	c.discarding = false
+	clearDiscardPendingInputMarker()
 
-	discardPendingInputFlag.Store(false)
 	debug("new transport path is now active")
 	return nil
 }
 
 func (c *sessionContext) forwardInput(stream Stream) {
+	c.resumeMu.Lock()
+	c.activeInputStream = stream
+	c.resumeMu.Unlock()
+
+	resumeCh := c.getResumeChan()
+	resumed := false
 	defer func() {
-		_ = c.stdin.Close()
+		c.resumeMu.Lock()
+		if c.activeInputStream == stream {
+			c.activeInputStream = nil
+		}
+		c.resumeMu.Unlock()
+		// For PTY sessions, never close stdin here - keep PTY alive for resume.
+		// For non-PTY sessions, close stdin to propagate EOF to the child process
+		// (commands like cat, filters, piped Run need EOF to terminate),
+		// unless exiting for a resume where the next forwardInput will take over.
+		if c.pty == nil && !resumed {
+			_ = c.stdin.Close()
+		}
 		_ = stream.CloseRead()
 	}()
 	buffer := make([]byte, 32*1024)
 	for {
+		// Check for resume signal before blocking read.
+		select {
+		case <-resumeCh:
+			resumed = true
+			return
+		default:
+		}
+
 		n, err := stream.Read(buffer)
+
+		// Check again after read returns.
+		select {
+		case <-resumeCh:
+			resumed = true
+			return
+		default:
+		}
+
 		if n > 0 {
-			if discardPendingInputFlag.Load() {
+			// Enter per-session discard mode when a new discard generation is detected.
+			// Each session independently tracks its marker to avoid cross-session interference.
+			if !c.discarding {
+				if gen := discardGeneration.Load(); gen > c.lastDiscardGen {
+					if marker := getDiscardPendingInputMarker(); len(marker) > 0 {
+						c.lastDiscardGen = gen
+						c.discarding = true
+						c.discardMarker = marker
+					}
+				}
+			}
+			if c.discarding {
 				if err := c.discardPendingInput(buffer[:n]); err != nil {
 					break
 				}
@@ -231,6 +456,29 @@ func (c *sessionContext) forwardInput(stream Stream) {
 }
 
 func (c *sessionContext) forwardOutput(name string, reader io.Reader, stream Stream) {
+	resumeCh := c.getResumeChan()
+
+	if name == "stdout" {
+		select {
+		case c.stdoutForwardToken <- struct{}{}:
+			defer func() { <-c.stdoutForwardToken }()
+		case <-resumeCh:
+			return
+		case <-time.After(30 * time.Second):
+			warning("session [%d] timed out waiting for previous stdout forwarder to exit", c.id)
+			return
+		}
+		// Old forwarder exited; stop the reattachIO redraw ticker.
+		c.resumeMu.Lock()
+		if c.redrawDone != nil {
+			close(c.redrawDone)
+			c.redrawDone = nil
+		}
+		c.resumeMu.Unlock()
+		// Clear any read deadline set by signalResume for non-PTY sessions.
+		c.clearStdoutReadDeadline()
+	}
+
 	var writeError atomic.Bool
 	done := make(chan struct{})
 	ch := make(chan []byte, 1)
@@ -245,6 +493,15 @@ func (c *sessionContext) forwardOutput(name string, reader io.Reader, stream Str
 			}
 		}
 	}()
+
+	if name == "stdout" {
+		if pending := c.takePendingResumeOutput(); len(pending) > 0 {
+			if err := writeAll(stream, pending); err != nil {
+				warning("write pending resume output failed: %v", err)
+				return
+			}
+		}
+	}
 
 	var cacheLines [][]byte
 	var tmuxOutputPrefix string
@@ -341,6 +598,14 @@ func (c *sessionContext) forwardOutput(name string, reader io.Reader, stream Str
 						discardLines, discardBytes = 0, 0
 					}
 					break out
+				case <-resumeCh:
+					if name == "stdout" {
+						c.appendPendingResumeOutput(line)
+						for j := i + 1; j < len(cacheLines); j++ {
+							c.appendPendingResumeOutput(cacheLines[j])
+						}
+					}
+					return
 				default:
 					if globalServerProxy.clientChecker.isTimeout() {
 						if i > 0 {
@@ -361,10 +626,32 @@ func (c *sessionContext) forwardOutput(name string, reader io.Reader, stream Str
 
 	buffer := make([]byte, 32*1024)
 	for {
+		// Check for resume signal before blocking read
+		select {
+		case <-resumeCh:
+			return
+		default:
+		}
+
 		n, err := reader.Read(buffer)
+
 		if n > 0 {
 			buf := make([]byte, n)
 			copy(buf, buffer[:n])
+			if name == "stdout" {
+				select {
+				case <-resumeCh:
+					c.appendPendingResumeOutput(buf)
+					return
+				default:
+				}
+			} else {
+				select {
+				case <-resumeCh:
+					return
+				default:
+				}
+			}
 
 			if chHasNewLine && globalServerProxy.clientChecker.isTimeout() && !globalSetting.keepPendingOutput.Load() {
 				cacheOutput(buf)
@@ -391,6 +678,11 @@ func (c *sessionContext) forwardOutput(name string, reader io.Reader, stream Str
 				select {
 				case ch <- buf:
 					break out
+				case <-resumeCh:
+					if name == "stdout" {
+						c.appendPendingResumeOutput(buf)
+					}
+					return
 				default:
 					if globalServerProxy.clientChecker.isTimeout() {
 						if globalSetting.keepPendingOutput.Load() {
@@ -432,6 +724,19 @@ func (c *sessionContext) forwardOutput(name string, reader io.Reader, stream Str
 		}
 
 		if err != nil {
+			// If the read error was caused by resume (e.g. SetReadDeadline for
+			// non-PTY sessions), save any cached output for the new forwarder
+			// instead of trying to flush to the dead stream.
+			select {
+			case <-resumeCh:
+				if name == "stdout" {
+					for _, line := range cacheLines {
+						c.appendPendingResumeOutput(line)
+					}
+				}
+				return
+			default:
+			}
 			for len(cacheLines) > 0 && !writeError.Load() {
 				if globalServerProxy.clientChecker.isTimeout() {
 					if globalServerProxy.clientChecker.waitUntilReconnected() != nil {
@@ -469,6 +774,74 @@ func (c *sessionContext) forwardIO(stream Stream) {
 		stderr.Close()
 		debug("session [%d] stderr closed", c.id)
 	}
+}
+
+// reattachIO forwards stdin/stdout for a resumed session and waits for completion.
+// It reuses the normal I/O forwarding paths to keep behavior consistent.
+func (c *sessionContext) reattachIO(stream Stream) {
+	// Trigger SIGWINCH to unblock the old stdout forwarder blocking on pty.Read().
+	// Retry every second until the new forwarder acquires the stdout token
+	// (signaled via redrawDone), meaning the old forwarder has exited.
+	c.resumeMu.Lock()
+	c.redrawDone = make(chan struct{})
+	redrawDone := c.redrawDone
+	c.resumeMu.Unlock()
+
+	go func() {
+		ticker := time.NewTicker(time.Second)
+		defer ticker.Stop()
+		c.triggerRedraw()
+		for {
+			select {
+			case <-redrawDone:
+				return
+			case <-ticker.C:
+				c.triggerRedraw()
+			}
+		}
+	}()
+
+	var wg sync.WaitGroup
+
+	if c.stdin != nil {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			c.forwardInput(stream)
+		}()
+	}
+
+	if c.stdout != nil {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			c.forwardOutput("stdout", c.stdout, stream)
+		}()
+	} else {
+		// No stdout — stop redraw ticker immediately.
+		c.resumeMu.Lock()
+		if c.redrawDone != nil {
+			close(c.redrawDone)
+			c.redrawDone = nil
+		}
+		c.resumeMu.Unlock()
+	}
+
+	// Re-forward stderr if the session has a separate stderr pipe (non-PTY sessions).
+	// PTY sessions merge stderr into stdout, so this only matters for plain commands.
+	if c.stderr != nil {
+		if stderr := getStderrStream(c.id); stderr != nil {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				c.forwardOutput("stderr", c.stderr, stderr.stream)
+				stderr.Close()
+			}()
+		}
+	}
+
+	wg.Wait()
+	debug("session [%d] resume I/O completed", c.id)
 }
 
 func (c *sessionContext) Wait() {
@@ -545,6 +918,8 @@ func (c *sessionContext) SetSize(cols, rows int, redraw bool) error {
 	if c.pty == nil {
 		return fmt.Errorf("session %d %v is not pty", c.id, c.cmd.Args)
 	}
+	c.sizeMu.Lock()
+	defer c.sizeMu.Unlock()
 	if redraw {
 		_ = c.pty.Resize(cols+1, rows)
 		time.Sleep(10 * time.Millisecond) // fix redraw issue in `screen`
@@ -566,11 +941,38 @@ func handleSessionEvent(stream Stream) {
 		return
 	}
 
+	// Check for existing session to resume before X11/Agent setup.
+	// This avoids creating duplicate X11 listeners and agent sockets on resume.
+	if ctx := tryResumeSession(msg.ID); ctx != nil {
+		// Update terminal size from the reconnecting client.
+		if msg.Cols > 0 && msg.Rows > 0 && ctx.pty != nil {
+			ctx.sizeMu.Lock()
+			ctx.cols = msg.Cols
+			ctx.rows = msg.Rows
+			_ = ctx.pty.Resize(msg.Cols, msg.Rows)
+			ctx.sizeMu.Unlock()
+		}
+
+		// Signal old I/O goroutines to stop so we can take over
+		ctx.signalResume()
+
+		if err := sendSuccess(stream); err != nil {
+			warning("session resume ack ok failed: %v", err)
+			return
+		}
+		// Reattach I/O to the new stream without duplicating forwarding logic.
+		ctx.reattachIO(stream)
+		// Don't close session - original handler manages lifecycle
+		return
+	}
+
+	// New session path - set up X11 and Agent before creating the session context,
+	// as these modify msg.Envs which is consumed by getSessionStartCmd.
 	handleX11Request(&msg)
 
 	handleAgentRequest(&msg)
 
-	ctx, err := newSessionContext(&msg)
+	ctx, err := createSessionContext(&msg)
 	if err != nil {
 		sendError(stream, err)
 		return
@@ -601,24 +1003,41 @@ func handleSessionEvent(stream Stream) {
 	ctx.Wait()
 }
 
-func newSessionContext(msg *startMessage) (*sessionContext, error) {
+// tryResumeSession returns an existing started session for the given ID, or nil.
+func tryResumeSession(id uint64) *sessionContext {
+	sessionMu.Lock()
+	defer sessionMu.Unlock()
+	if ctx, ok := sessionMap[id]; ok && ctx.started {
+		debug("resuming existing session %d", id)
+		return ctx
+	}
+	return nil
+}
+
+// createSessionContext creates a new session context. Returns an error if the
+// session ID already exists (whether started or not), preventing races between
+// session creation and the started flag being set.
+func createSessionContext(msg *startMessage) (*sessionContext, error) {
 	cmd, err := getSessionStartCmd(msg)
 	if err != nil {
 		return nil, fmt.Errorf("build start command failed: %v", err)
 	}
 
-	sessionMutex.Lock()
-	defer sessionMutex.Unlock()
+	sessionMu.Lock()
+	defer sessionMu.Unlock()
 
-	if ctx, ok := sessionMap[msg.ID]; ok {
-		return nil, fmt.Errorf("session id %d %v existed", msg.ID, ctx.cmd.Args)
+	if _, ok := sessionMap[msg.ID]; ok {
+		return nil, fmt.Errorf("session id %d already exists", msg.ID)
 	}
 
 	ctx := &sessionContext{
-		id:   msg.ID,
-		cmd:  cmd,
-		cols: msg.Cols,
-		rows: msg.Rows,
+		id:                 msg.ID,
+		cmd:                cmd,
+		cols:               msg.Cols,
+		rows:               msg.Rows,
+		lastDiscardGen:     discardGeneration.Load(),
+		resumeChan:         make(chan struct{}),
+		stdoutForwardToken: make(chan struct{}, 1),
 	}
 	sessionMap[ctx.id] = ctx
 	return ctx, nil
@@ -630,14 +1049,14 @@ func (c *stderrStream) Wait() {
 
 func (c *stderrStream) Close() {
 	c.wg.Done()
-	stderrMutex.Lock()
-	defer stderrMutex.Unlock()
+	stderrMu.Lock()
+	defer stderrMu.Unlock()
 	delete(stderrMap, c.id)
 }
 
 func newStderrStream(id uint64, stream Stream) (*stderrStream, error) {
-	stderrMutex.Lock()
-	defer stderrMutex.Unlock()
+	stderrMu.Lock()
+	defer stderrMu.Unlock()
 	if _, ok := stderrMap[id]; ok {
 		return nil, fmt.Errorf("session %d stderr already set", id)
 	}
@@ -648,8 +1067,8 @@ func newStderrStream(id uint64, stream Stream) (*stderrStream, error) {
 }
 
 func getStderrStream(id uint64) *stderrStream {
-	stderrMutex.Lock()
-	defer stderrMutex.Unlock()
+	stderrMu.Lock()
+	defer stderrMu.Unlock()
 	if errStream, ok := stderrMap[id]; ok {
 		return errStream
 	}
@@ -770,8 +1189,8 @@ func handleResizeEvent(stream Stream) error {
 	if msg.Cols <= 0 || msg.Rows <= 0 {
 		return fmt.Errorf("resize message invalid: %#v", msg)
 	}
-	sessionMutex.Lock()
-	defer sessionMutex.Unlock()
+	sessionMu.Lock()
+	defer sessionMu.Unlock()
 	if ctx, ok := sessionMap[msg.ID]; ok {
 		return ctx.SetSize(msg.Cols, msg.Rows, msg.Redraw)
 	}
@@ -805,7 +1224,7 @@ func handleX11Request(msg *startMessage) {
 		warning("X11 forwarding listen failed: %v", err)
 		return
 	}
-	onExitFuncs = append(onExitFuncs, func() {
+	addOnExitFunc(func() {
 		for _, listener := range listeners {
 			_ = listener.Close()
 		}
@@ -824,7 +1243,7 @@ func handleX11Request(msg *startMessage) {
 	if err := writeXauthData(xauthPath, xauthInput); err != nil {
 		warning("write xauth data failed: %v", err)
 	}
-	onExitFuncs = append(onExitFuncs, func() {
+	addOnExitFunc(func() {
 		_ = writeXauthData(xauthPath, fmt.Sprintf("remove %s\n", authDisplay))
 	})
 
@@ -997,8 +1416,8 @@ func handleChannelAccept(listener net.Listener, channelType string) {
 }
 
 func closeSession(id uint64) {
-	sessionMutex.Lock()
-	defer sessionMutex.Unlock()
+	sessionMu.Lock()
+	defer sessionMu.Unlock()
 	if ctx, ok := sessionMap[id]; ok {
 		debug("closing the session [%d]", id)
 		ctx.Close()
@@ -1007,13 +1426,13 @@ func closeSession(id uint64) {
 }
 
 func closeAllSessions() {
-	sessionMutex.Lock()
+	sessionMu.Lock()
 	var sessions []*sessionContext
 	for _, session := range sessionMap {
 		sessions = append(sessions, session)
 	}
 	sessionMap = make(map[uint64]*sessionContext)
-	sessionMutex.Unlock()
+	sessionMu.Unlock()
 
 	debug("closing all the sessions")
 	for _, session := range sessions {
