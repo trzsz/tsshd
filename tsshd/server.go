@@ -117,6 +117,7 @@ func initServer(args *tsshdArgs) (*kcp.Listener, *quic.Listener, error) {
 	info := &ServerInfo{
 		ServerVer: kTsshdVersion,
 		Port:      port,
+		MTU:       args.MTU,
 	}
 
 	udpConn, err := startServerProxy(args, info, connList)

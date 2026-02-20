@@ -90,6 +90,7 @@ type ServerInfo struct {
 	ClientID   uint64 `json:",omitempty"`
 	ServerID   uint64 `json:",omitempty"`
 	ProxyMode  string `json:",omitempty"`
+	MTU        uint16 `json:",omitempty"`
 }
 
 type errorMessage struct {
@@ -472,7 +473,9 @@ func newKcpClient(client *SshUdpClient, opts *UdpClientOptions, addr string) (pr
 	conn.SetNoDelay(1, 10, 2, 1)
 	conn.SetWriteDelay(false)
 
-	if opts.ProxyClient != nil {
+	if opts.ServerInfo.MTU != 0 {
+		conn.SetMtu(int(opts.ServerInfo.MTU))
+	} else if opts.ProxyClient != nil {
 		conn.SetMtu(int(opts.ProxyClient.GetMaxDatagramSize()))
 	} else {
 		conn.SetMtu(kDefaultMTU)
@@ -511,7 +514,10 @@ func newQuicClient(opts *UdpClientOptions, addr string) (protocolClient, error) 
 		ServerName:   "tsshd",
 	}
 
-	if opts.ProxyClient != nil {
+	if opts.ServerInfo.MTU != 0 {
+		quicConfig.InitialPacketSize = opts.ServerInfo.MTU
+		quicConfig.DisablePathMTUDiscovery = true
+	} else if opts.ProxyClient != nil {
 		quicConfig.InitialPacketSize = opts.ProxyClient.GetMaxDatagramSize()
 		quicConfig.DisablePathMTUDiscovery = true
 	} else {
