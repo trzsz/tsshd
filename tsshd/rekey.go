@@ -44,16 +44,19 @@ const kRekeyTimeThreshold = time.Hour
 const kRekeyBytesThreshold = 1024 * 1024 * 1024 // 1G
 
 type rotatingCrypto struct {
-	mutex          sync.Mutex
-	client         *SshUdpClient
-	keySalt        []byte
-	gcmList        []cipher.AEAD
-	activeIdx      int
-	bytesConsumed  uint64
-	bytesThreshold uint64
-	bytesTriggered bool
-	rekeyInFlight  atomic.Bool
-	clientPriKey   *ecdh.PrivateKey
+	mutex                    sync.Mutex
+	client                   *SshUdpClient
+	keySalt                  []byte
+	gcmList                  []cipher.AEAD
+	key0                     cipher.AEAD
+	retainKey0               bool
+	pendingReconnectionReset atomic.Bool
+	activeIdx                int
+	bytesConsumed            uint64
+	bytesThreshold           uint64
+	bytesTriggered           bool
+	rekeyInFlight            atomic.Bool
+	clientPriKey             *ecdh.PrivateKey
 }
 
 func (r *rotatingCrypto) NonceSize() int {
@@ -94,6 +97,22 @@ func (r *rotatingCrypto) Open(dst, nonce, ciphertext, additionalData []byte) (pl
 			r.debug("gcm [%d/%d] open failed: %v", i+1, len(gcmList), err)
 			continue
 		}
+		// After auth-layer reconnection detection (MarkPendingReconnection),
+		// if the first packet decrypts with key0 while rekeyed keys exist,
+		// the client restarted with original credentials. Reset crypto so
+		// Seal() also uses key0 for responses. The flag is consumed on any
+		// successful decryption to prevent late/replayed packets from
+		// triggering a downgrade outside the reconnection window.
+		if r.pendingReconnectionReset.Swap(false) && gcm == r.key0 && len(gcmList) > 1 {
+			r.resetToKey0()
+			return plaintext, nil
+		}
+		// Retained key0 at the tail is a read-only fallback for reconnection
+		// detection. Don't promote it — that would drop the active rekeyed key
+		// and effectively reset crypto without the auth-layer signal.
+		if r.retainKey0 && gcm == r.key0 && i > 0 {
+			return plaintext, nil
+		}
 		if i > 0 {
 			r.promoteKey(i)
 		} else {
@@ -114,6 +133,32 @@ func (r *rotatingCrypto) debug(format string, a ...any) {
 	} else {
 		debug(format, a...)
 	}
+}
+
+func (r *rotatingCrypto) resetToKey0() {
+	r.mutex.Lock()
+	defer r.mutex.Unlock()
+	r.debug("reconnection detected: resetting crypto to initial key (had %d keys)", len(r.gcmList))
+	r.gcmList = []cipher.AEAD{r.key0}
+	r.activeIdx = 0
+	r.rekeyInFlight.Store(false)
+}
+
+// EnableKey0Retention opts this crypto into preserving key0 across promotions.
+// Only the server side needs this — it allows reconnecting clients that were
+// restarted (and only have the original pass/salt credentials) to be decrypted.
+func (r *rotatingCrypto) EnableKey0Retention() {
+	r.retainKey0 = true
+}
+
+// MarkPendingReconnection signals that the auth layer detected a new client
+// connection. The next successful Open() call checks whether the packet was
+// encrypted with key0; if so (and rekeyed keys exist), crypto resets to key0
+// so Seal() responses are also decryptable by the reconnecting client.
+// If the first packet uses a rekeyed key instead (network-change reconnection),
+// the flag is consumed harmlessly.
+func (r *rotatingCrypto) MarkPendingReconnection() {
+	r.pendingReconnectionReset.Store(true)
 }
 
 func (r *rotatingCrypto) consumeBytes(n uint64) {
@@ -175,11 +220,28 @@ func (r *rotatingCrypto) promoteKey(idx int) {
 
 	r.debug("traffic key promoted: key count [%d] promote index [%d]", len(r.gcmList), idx)
 
-	newLen := len(r.gcmList) - idx
-	newList := make([]cipher.AEAD, newLen)
-	copy(newList, r.gcmList[idx:])
+	promoted := r.gcmList[idx:]
 
-	r.gcmList = newList
+	if r.retainKey0 && r.key0 != nil {
+		newList := make([]cipher.AEAD, 0, len(promoted)+1)
+		newList = append(newList, promoted...)
+		hasKey0 := false
+		for _, g := range newList {
+			if g == r.key0 {
+				hasKey0 = true
+				break
+			}
+		}
+		if !hasKey0 {
+			newList = append(newList, r.key0)
+		}
+		r.gcmList = newList
+	} else {
+		newList := make([]cipher.AEAD, len(promoted))
+		copy(newList, promoted)
+		r.gcmList = newList
+	}
+
 	r.activeIdx = 0
 }
 
@@ -262,6 +324,7 @@ func newRotatingCrypto(client *SshUdpClient, secret, salt []byte, bytesThreshold
 	if err := r.installKey(secret, true); err != nil {
 		return nil, err
 	}
+	r.key0 = r.gcmList[0]
 
 	if timeThreshold > 0 {
 		ticker := time.NewTicker(timeThreshold)

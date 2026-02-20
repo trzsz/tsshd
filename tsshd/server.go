@@ -75,17 +75,12 @@ var quicConfig = quic.Config{
 var globalProtoServer protocolServer
 
 type protocolServer interface {
-	getUdpForwarder() *udpForwarder
 	handleRekeyEvent(msg *rekeyMessage) error
+	markPendingReconnection()
 }
 
 type kcpServer struct {
-	crypto    *rotatingCrypto
-	forwarder *udpForwarder
-}
-
-func (s *kcpServer) getUdpForwarder() *udpForwarder {
-	return s.forwarder
+	crypto *rotatingCrypto
 }
 
 func (s *kcpServer) handleRekeyEvent(msg *rekeyMessage) error {
@@ -95,17 +90,19 @@ func (s *kcpServer) handleRekeyEvent(msg *rekeyMessage) error {
 	return nil
 }
 
-type quicServer struct {
-	forwarder *udpForwarder
+func (s *kcpServer) markPendingReconnection() {
+	s.crypto.MarkPendingReconnection()
 }
 
-func (s *quicServer) getUdpForwarder() *udpForwarder {
-	return s.forwarder
-}
+type quicServer struct{}
 
 func (s *quicServer) handleRekeyEvent(msg *rekeyMessage) error {
 	// rekey is handled by QUIC internally
 	return nil
+}
+
+func (s *quicServer) markPendingReconnection() {
+	// QUIC handles its own crypto; no key0 retention needed
 }
 
 func initServer(args *tsshdArgs) (*kcp.Listener, *quic.Listener, error) {
@@ -128,7 +125,7 @@ func initServer(args *tsshdArgs) (*kcp.Listener, *quic.Listener, error) {
 	var kcpListener *kcp.Listener
 	var quicListener *quic.Listener
 	if args.KCP {
-		kcpListener, err = listenKCP(udpConn, info)
+		kcpListener, err = listenKCP(udpConn, info, args)
 	} else {
 		quicListener, err = listenQUIC(udpConn, info, args.MTU)
 	}
@@ -371,7 +368,7 @@ func listenOnPort(args *tsshdArgs, udpAddr *net.UDPAddr, port int) (conn io.Clos
 	return conn, nil
 }
 
-func listenKCP(conn *net.UDPConn, info *ServerInfo) (*kcp.Listener, error) {
+func listenKCP(conn *net.UDPConn, info *ServerInfo, args *tsshdArgs) (*kcp.Listener, error) {
 	pass := make([]byte, 48)
 	if _, err := crypto_rand.Read(pass); err != nil {
 		return nil, fmt.Errorf("rand pass failed: %v", err)
@@ -384,6 +381,9 @@ func listenKCP(conn *net.UDPConn, info *ServerInfo) (*kcp.Listener, error) {
 	crypto, err := newRotatingCrypto(nil, pass, salt, 0, 0)
 	if err != nil {
 		return nil, fmt.Errorf("new rotating gcm failed: %w", err)
+	}
+	if args.Reconnect {
+		crypto.EnableKey0Retention()
 	}
 	block := kcp.NewAEADCrypt(crypto)
 
@@ -434,6 +434,8 @@ func listenQUIC(conn net.PacketConn, info *ServerInfo, mtu uint16) (*quic.Listen
 	if err != nil {
 		return nil, fmt.Errorf("quic listen failed: %v", err)
 	}
+
+	globalProtoServer = &quicServer{}
 
 	info.Mode = kUdpModeQUIC
 	info.ServerCert = fmt.Sprintf("%x", serverCertPEM)

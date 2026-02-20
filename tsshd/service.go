@@ -29,6 +29,8 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"sync"
+	"sync/atomic"
 
 	"github.com/quic-go/quic-go"
 	"github.com/trzsz/smux"
@@ -41,6 +43,56 @@ var smuxConfig = smux.Config{
 	MaxFrameSize:      48 * 1024,
 	MaxStreamBuffer:   10 * 1024 * 1024,
 	MaxReceiveBuffer:  20 * 1024 * 1024,
+}
+
+var transportConnMu sync.Mutex
+var transportConnID atomic.Uint64
+var transportConnMap = make(map[uint64]func())
+var transportCleanupOnce sync.Once
+
+func registerTransportConn(closeFn func()) uint64 {
+	if closeFn == nil {
+		return 0
+	}
+	transportCleanupOnce.Do(func() {
+		addOnExitFunc(closeAllTransportConns)
+	})
+	id := transportConnID.Add(1)
+	transportConnMu.Lock()
+	transportConnMap[id] = closeFn
+	transportConnMu.Unlock()
+	return id
+}
+
+func unregisterTransportConn(id uint64) {
+	if id == 0 {
+		return
+	}
+	transportConnMu.Lock()
+	delete(transportConnMap, id)
+	transportConnMu.Unlock()
+}
+
+func closeAllTransportConns() {
+	transportConnMu.Lock()
+	closeFns := make([]func(), 0, len(transportConnMap))
+	for id, closeFn := range transportConnMap {
+		delete(transportConnMap, id)
+		closeFns = append(closeFns, closeFn)
+	}
+	transportConnMu.Unlock()
+	for _, closeFn := range closeFns {
+		closeFn()
+	}
+}
+
+// Only the connection that owns the active bus may open non-bus streams.
+// This prevents unauthenticated replacement transports from hijacking sessions.
+func isStreamCommandAuthorized(command string, forwarder *udpForwarder) bool {
+	if command == "bus" {
+		return true
+	}
+	return isActiveBusForwarder(forwarder)
 }
 
 // Stream extends net.Conn by adding support for half-close operations
@@ -150,16 +202,29 @@ func (c *quicDatagramConn) GetMaxDatagramSize() uint16 {
 }
 
 func serveKCP(listener *kcp.Listener, mtu uint16) {
-	conn, err := listener.AcceptKCP()
-	if err != nil {
-		warning("kcp accept failed: %v", err)
-		return
+	for {
+		conn, err := listener.AcceptKCP()
+		if err != nil {
+			warning("kcp accept failed: %v", err)
+			return
+		}
+		debug("kcp accepted new connection from %v", conn.RemoteAddr())
+		if busClosing.Load() {
+			_ = conn.Close()
+			return
+		}
+		// Handle connections asynchronously so roaming reconnects don't block accept.
+		// Bus ownership is still established by the bus stream handshake, not by accept.
+		go handleKcpConn(conn, mtu)
 	}
-	handleKcpConn(conn, mtu)
 }
 
 func handleKcpConn(conn *kcp.UDPSession, mtu uint16) {
-	onExitFuncs = append(onExitFuncs, func() { _ = conn.Close() })
+	var closeOnce sync.Once
+	closeConn := func() { closeOnce.Do(func() { _ = conn.Close() }) }
+	connID := registerTransportConn(closeConn)
+	defer unregisterTransportConn(connID)
+	defer closeConn()
 
 	conn.SetWindowSize(1024, 1024)
 	conn.SetNoDelay(1, 10, 2, 1)
@@ -170,7 +235,7 @@ func handleKcpConn(conn *kcp.UDPSession, mtu uint16) {
 		conn.SetMtu(kDefaultMTU)
 	}
 
-	globalProtoServer.(*kcpServer).forwarder = &udpForwarder{conn: newKcpDatagramConn(conn)}
+	forwarder := &udpForwarder{conn: newKcpDatagramConn(conn)}
 
 	session, err := smux.Server(conn, &smuxConfig)
 	if err != nil {
@@ -186,23 +251,40 @@ func handleKcpConn(conn *kcp.UDPSession, mtu uint16) {
 			}
 			return
 		}
-		go handleStream(&smuxStream{stream})
+		if busClosing.Load() {
+			_ = stream.Close()
+			return
+		}
+		go handleStream(&smuxStream{stream}, forwarder)
 	}
 }
 
 func serveQUIC(listener *quic.Listener) {
-	conn, err := listener.Accept(context.Background())
-	if err != nil {
-		warning("quic accept conn failed: %v", err)
-		return
+	for {
+		conn, err := listener.Accept(context.Background())
+		if err != nil {
+			warning("quic accept conn failed: %v", err)
+			return
+		}
+		debug("quic accepted new connection from %v", conn.RemoteAddr())
+		if busClosing.Load() {
+			_ = conn.CloseWithError(0, "")
+			return
+		}
+		// Handle connections asynchronously so roaming reconnects don't block accept.
+		// Bus ownership is still established by the bus stream handshake, not by accept.
+		go handleQuicConn(conn)
 	}
-	handleQuicConn(conn)
 }
 
 func handleQuicConn(conn *quic.Conn) {
-	onExitFuncs = append(onExitFuncs, func() { _ = conn.CloseWithError(0, "") })
+	var closeOnce sync.Once
+	closeConn := func() { closeOnce.Do(func() { _ = conn.CloseWithError(0, "") }) }
+	connID := registerTransportConn(closeConn)
+	defer unregisterTransportConn(connID)
+	defer closeConn()
 
-	globalProtoServer = &quicServer{&udpForwarder{conn: newQuicDatagramConn(conn)}}
+	forwarder := &udpForwarder{conn: newQuicDatagramConn(conn)}
 
 	for {
 		stream, err := conn.AcceptStream(context.Background())
@@ -212,11 +294,15 @@ func handleQuicConn(conn *quic.Conn) {
 			}
 			return
 		}
-		go handleStream(&quicStream{stream, conn})
+		if busClosing.Load() {
+			_ = stream.Close()
+			return
+		}
+		go handleStream(&quicStream{stream, conn}, forwarder)
 	}
 }
 
-func handleStream(stream Stream) {
+func handleStream(stream Stream, forwarder *udpForwarder) {
 	defer func() { _ = stream.Close() }()
 
 	command, err := recvCommand(stream)
@@ -229,7 +315,7 @@ func handleStream(stream Stream) {
 
 	switch command {
 	case "bus":
-		handler = handleBusEvent
+		handler = func(stream Stream) { handleBusEvent(stream, forwarder) }
 	case "session":
 		handler = handleSessionEvent
 	case "stderr":
@@ -241,13 +327,18 @@ func handleStream(stream Stream) {
 	case "accept":
 		handler = handleAcceptEvent
 	case "dial-udp":
-		handler = handleDialUdpEvent
+		handler = func(stream Stream) { handleDialUdpEvent(stream, forwarder) }
 	case "listen-udp":
 		handler = handleListenUdpEvent
 	case "accept-udp":
 		handler = handleAcceptUdpEvent
 	default:
 		sendError(stream, fmt.Errorf("unknown stream command: %s", command))
+		return
+	}
+
+	if !isStreamCommandAuthorized(command, forwarder) {
+		sendError(stream, fmt.Errorf("command [%s] requires an active bus connection", command))
 		return
 	}
 

@@ -319,7 +319,7 @@ func (c *packetConn) Close() error {
 	return c.stream.Close()
 }
 
-func handleDialUdpEvent(stream Stream) {
+func handleDialUdpEvent(stream Stream, forwarder *udpForwarder) {
 	var msg dialUdpMessage
 	if err := recvMessage(stream, &msg); err != nil {
 		sendError(stream, fmt.Errorf("recv dial udp message failed: %v", err))
@@ -350,7 +350,7 @@ func handleDialUdpEvent(stream Stream) {
 	}
 
 	id := udpForwardChannelID.Add(1)
-	pconn := newPacketConn(stream, id, globalProtoServer.getUdpForwarder(), globalServerProxy.clientChecker)
+	pconn := newPacketConn(stream, id, forwarder, globalServerProxy.clientChecker)
 
 	resp := dialUdpResponse{ID: id}
 	if err := sendResponse(stream, &resp); err != nil { // ack ok
@@ -557,7 +557,7 @@ func acquireUdpForwardSession(sessionKey, listenerNet, listenerAddr string,
 		return session, true
 	}
 	id := udpForwardChannelID.Add(1)
-	forwardConn := newPacketConn(nil, id, globalProtoServer.getUdpForwarder(), globalServerProxy.clientChecker)
+	forwardConn := newPacketConn(nil, id, getActiveBusForwarder(), globalServerProxy.clientChecker)
 	session = &udpForwardSession{
 		sessionKey:   sessionKey,
 		listenerNet:  listenerNet,

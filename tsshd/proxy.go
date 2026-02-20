@@ -313,7 +313,12 @@ func (p *serverProxy) setClientConn(newClientConn *clientConnHolder) {
 
 	if oldClientConn != nil {
 		oldClientConn.Close()
-		enablePendingInputDiscard() // discard pending user input from previous connections
+		if p.args.Reconnect {
+			enablePendingInputDiscard() // discard pending user input from previous connections
+			if globalProtoServer != nil {
+				globalProtoServer.markPendingReconnection()
+			}
+		}
 	}
 
 	flushSize, flushCount := p.pktCache.sendCache(newClientConn.Write)
@@ -989,6 +994,7 @@ func startClientProxy(client *SshUdpClient, opts *UdpClientOptions) (string, *cl
 		cipherBlock:   &cipherBlock,
 		clientID:      opts.ServerInfo.ClientID,
 		serverID:      opts.ServerInfo.ServerID,
+		serialNumber:  opts.InitialSerialNumber,
 		serverChecker: newTimeoutChecker(opts.HeartbeatTimeout),
 	}
 
