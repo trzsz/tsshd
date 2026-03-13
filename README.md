@@ -132,6 +132,17 @@ Host xxx
 
 ### Installation
 
+- Install with Homebrew on macOS
+
+  <details><summary><code>brew install tsshd</code></summary>
+
+  ```sh
+  brew update
+  brew install tsshd
+  ```
+
+  </details>
+
 - Install with apt on Ubuntu
 
   <details><summary><code>sudo apt install tsshd</code></summary>
