@@ -241,10 +241,21 @@ func (c *sessionContext) isKeepPendingOutput() bool {
 }
 
 func (c *sessionContext) forwardOutput(name string, reader io.Reader, stream Stream) {
+	var returned bool
+	var handleMutex sync.Mutex
 	var writeError atomic.Bool
 	done := make(chan struct{})
 	ch := make(chan []byte, 1)
-	defer func() { close(ch); <-done }()
+
+	defer func() {
+		handleMutex.Lock()
+		returned = true
+		close(ch)
+		handleMutex.Unlock()
+
+		<-done
+	}()
+
 	go func() {
 		defer func() { _ = stream.CloseWrite(); close(done) }()
 		for buf := range ch {
@@ -263,6 +274,9 @@ func (c *sessionContext) forwardOutput(name string, reader io.Reader, stream Str
 	cacheOutput := func(buf []byte) {
 		for len(buf) > 0 {
 			pos := bytes.IndexByte(buf, '\n')
+			if pos < 0 {
+				pos = bytes.IndexByte(buf, '\r')
+			}
 
 			var line []byte
 			if pos >= 0 {
@@ -278,7 +292,7 @@ func (c *sessionContext) forwardOutput(name string, reader io.Reader, stream Str
 				continue
 			}
 			last := cacheLines[len(cacheLines)-1]
-			if last[len(last)-1] != '\n' {
+			if b := last[len(last)-1]; b != '\n' && (b != '\r' || line[0] == '\n') && len(last) < 1000 {
 				cacheLines[len(cacheLines)-1] = append(last, line...)
 				continue
 			}
@@ -311,12 +325,14 @@ func (c *sessionContext) forwardOutput(name string, reader io.Reader, stream Str
 	// chHasNewLine ensures the client receives a complete line before further output is cached.
 	var chHasNewLine bool
 
-	var flushMutex sync.Mutex
-	flushOutput := func() {
-		flushMutex.Lock()
-		defer flushMutex.Unlock()
+	// noNewLineCount records consecutive reads that contain no '\n'.
+	// After 3 consecutive reads without newline, output will start being cached.
+	// This helps handle cases where some programs may output progress bars or status
+	// lines by repeatedly using carriage return ('\r') without emitting newline characters.
+	var noNewLineCount int
 
-		if len(cacheLines) == 0 {
+	flushOutput := func() {
+		if len(cacheLines) == 0 || c.clientChecker.isTimeout() {
 			return
 		}
 
@@ -335,9 +351,13 @@ func (c *sessionContext) forwardOutput(name string, reader io.Reader, stream Str
 				if discardLines == 0 {
 					continue
 				}
+				newline := "\r\n"
+				if len(cacheLines) > 0 && len(cacheLines[0]) > 0 && cacheLines[0][len(cacheLines[0])-1] == '\r' {
+					newline = "\r"
+				}
 				line = fmt.Appendf(nil,
-					"\r\033[0;33mWarning: tsshd discarded %d lines %d bytes of output during client disconnection at this point!\033[0m\033[K\r\n",
-					discardLines, discardBytes)
+					"\r\033[0;33mWarning: tsshd discarded %d lines %d bytes of output during client disconnection at this point!\033[0m\033[K%s",
+					discardLines, discardBytes, newline)
 				if len(tmuxOutputPrefix) > 0 {
 					line = encodeTmuxOutput(tmuxOutputPrefix, line)
 				}
@@ -375,10 +395,116 @@ func (c *sessionContext) forwardOutput(name string, reader io.Reader, stream Str
 			}
 		}
 
-		cacheLines, chHasNewLine = nil, false
+		cacheLines, chHasNewLine, noNewLineCount = nil, false, 0
 	}
 
-	c.clientChecker.onReconnected(flushOutput)
+	c.clientChecker.onReconnected(func() {
+		handleMutex.Lock()
+		defer handleMutex.Unlock()
+
+		if returned {
+			return // do not flush after forwardoutput has returned
+		}
+
+		flushOutput()
+	})
+
+	handleBuffer := func(buf []byte) {
+		handleMutex.Lock()
+		defer handleMutex.Unlock()
+
+		if chHasNewLine && c.clientChecker.isTimeout() && !c.isKeepPendingOutput() {
+			cacheOutput(buf)
+			return
+		}
+
+		if len(cacheLines) > 0 {
+			cacheOutput(buf)
+			flushOutput()
+			return
+		}
+
+		var remaining []byte
+		if c.clientChecker.isTimeout() && !c.isKeepPendingOutput() {
+			pos := bytes.IndexByte(buf, '\n')
+			if pos >= 0 {
+				remaining = buf[pos+1:]
+				buf = buf[:pos+1]
+				chHasNewLine = true
+			} else {
+				if noNewLineCount < 3 {
+					noNewLineCount++
+				} else {
+					chHasNewLine = true
+					cacheOutput(buf)
+					return
+				}
+			}
+		}
+
+	out:
+		for {
+			select {
+			case ch <- buf:
+				break out
+			default:
+				if c.clientChecker.isTimeout() {
+					if c.isKeepPendingOutput() {
+						if c.clientChecker.waitUntilReconnected() != nil {
+							return
+						}
+						continue
+					}
+					select {
+					case b := <-ch:
+						buf = append(b, buf...)
+					default:
+					}
+					pos := bytes.IndexByte(buf, '\n')
+					if pos < 0 && noNewLineCount < 3 {
+						ch <- buf
+						noNewLineCount++
+						break out
+					}
+
+					if pos < 0 {
+						ch <- buf
+					} else {
+						ch <- buf[:pos+1]
+						left := buf[pos+1:]
+						if len(left) > 0 {
+							cacheOutput(left)
+						}
+					}
+
+					chHasNewLine = true
+					break out
+				}
+				if writeError.Load() {
+					return
+				}
+				time.Sleep(10 * time.Millisecond)
+			}
+		}
+
+		if len(remaining) > 0 {
+			cacheOutput(remaining)
+		}
+	}
+
+	handleError := func() {
+		handleMutex.Lock()
+		defer handleMutex.Unlock()
+
+		for len(cacheLines) > 0 && !writeError.Load() {
+			if c.clientChecker.isTimeout() {
+				if c.clientChecker.waitUntilReconnected() != nil {
+					break
+				}
+			}
+			flushOutput()
+		}
+	}
 
 	buffer := make([]byte, 32*1024)
 	for {
@@ -386,84 +512,14 @@ func (c *sessionContext) forwardOutput(name string, reader io.Reader, stream Str
 		if n > 0 {
 			buf := make([]byte, n)
 			copy(buf, buffer[:n])
-
-			if chHasNewLine && c.clientChecker.isTimeout() && !c.isKeepPendingOutput() {
-				cacheOutput(buf)
-				continue
-			}
-
-			if len(cacheLines) > 0 {
-				cacheOutput(buf)
-				flushOutput()
-				continue
-			}
-
-			var remaining []byte
-			if c.clientChecker.isTimeout() && !c.isKeepPendingOutput() {
-				if pos := bytes.IndexByte(buf, '\n'); pos >= 0 {
-					remaining = buf[pos+1:]
-					buf = buf[:pos+1]
-					chHasNewLine = true
-				}
-			}
-
-		out:
-			for {
-				select {
-				case ch <- buf:
-					break out
-				default:
-					if c.clientChecker.isTimeout() {
-						if c.isKeepPendingOutput() {
-							if c.clientChecker.waitUntilReconnected() != nil {
-								return
-							}
-							continue
-						}
-						select {
-						case b := <-ch:
-							buf = append(b, buf...)
-						default:
-						}
-						pos := bytes.IndexByte(buf, '\n')
-						if pos < 0 {
-							ch <- buf
-							break out
-						}
-
-						ch <- buf[:pos+1]
-						chHasNewLine = true
-
-						left := buf[pos+1:]
-						if len(left) > 0 {
-							cacheOutput(left)
-						}
-						break out
-					}
-					if writeError.Load() {
-						return
-					}
-					time.Sleep(10 * time.Millisecond)
-				}
-			}
-
-			if len(remaining) > 0 {
-				cacheOutput(remaining)
-			}
+			handleBuffer(buf)
 		}
-
 		if err != nil {
-			for len(cacheLines) > 0 && !writeError.Load() {
-				if c.clientChecker.isTimeout() {
-					if c.clientChecker.waitUntilReconnected() != nil {
-						break
-					}
-				}
-				flushOutput()
-			}
+			handleError()
 			break
 		}
 	}
+
 	debug("session [%d] %s completed", c.id, name)
 }
 

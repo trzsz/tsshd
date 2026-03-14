@@ -31,6 +31,7 @@ import (
 	"io"
 	"net"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -141,8 +142,20 @@ func newTestSessionContext(keepPending, timeout bool, maxLines int) (*sessionCon
 	oriMaxLines := maxPendingOutputLines
 	maxPendingOutputLines = maxLines
 
-	clientChecker := newTimeoutChecker(0)
-	clientChecker.timeoutFlag.Store(timeout)
+	var clientChecker *timeoutChecker
+	if timeout {
+		clientChecker = newTimeoutChecker(time.Minute)
+		clientChecker.lastAliveTime.Store(time.Now().UnixMilli() - 61*1000)
+		select {
+		case clientChecker.timeoutEventChan <- struct{}{}:
+		default:
+		}
+		for !clientChecker.isTimeout() {
+			time.Sleep(time.Millisecond)
+		}
+	} else {
+		clientChecker = newTimeoutChecker(0)
+	}
 
 	server := &sshUdpServer{}
 	server.keepPendingOutput.Store(keepPending)
@@ -151,6 +164,25 @@ func newTestSessionContext(keepPending, timeout bool, maxLines int) (*sessionCon
 	sess.server.Store(server)
 
 	return sess, func() { maxPendingOutputLines = oriMaxLines }
+}
+
+func runForwardOutputAndReconnect(s *sessionContext, reader *chunkReader, stream *mockStream, callback func()) {
+	var wg sync.WaitGroup
+
+	wg.Go(func() {
+		s.forwardOutput("stdout", reader, stream)
+	})
+
+	go func() {
+		if callback != nil {
+			time.Sleep(50 * time.Millisecond)
+			callback()
+		}
+		time.Sleep(50 * time.Millisecond)
+		s.clientChecker.checker.updateNow()
+	}()
+
+	wg.Wait()
 }
 
 func TestForwardOutput_Normal(t *testing.T) {
@@ -174,7 +206,7 @@ func TestForwardOutput_TimeoutDiscard(t *testing.T) {
 	stream := newMockStream()
 	reader := &chunkReader{data: [][]byte{[]byte("a\nb\nc\nd\n")}, chunk: 1}
 
-	s.forwardOutput("stdout", reader, stream)
+	runForwardOutputAndReconnect(s, reader, stream, nil)
 
 	output := stream.String()
 	assert.True(strings.HasPrefix(output, "a\n"), output)
@@ -205,7 +237,7 @@ func TestForwardOutput_TimeoutAndEOF(t *testing.T) {
 	stream := newMockStream()
 	reader := &chunkReader{data: [][]byte{[]byte("A1\nB2\nC3\nD4\nE5\n")}, chunk: 1}
 
-	s.forwardOutput("stdout", reader, stream)
+	runForwardOutputAndReconnect(s, reader, stream, nil)
 
 	output := stream.String()
 	assert.True(strings.HasPrefix(output, "A1\n"), output)
@@ -225,18 +257,18 @@ func TestForwardOutput_VoidedCapacity(t *testing.T) {
 
 	var buf bytes.Buffer
 	for i := range 1000 {
-		buf.WriteString(fmt.Sprintf("|%d\r\n", i))
+		buf.WriteString(fmt.Sprintf("|%d\n", i))
 	}
 	reader := &chunkReader{data: [][]byte{buf.Bytes()}, chunk: 1}
 
-	s.forwardOutput("stdout", reader, stream)
+	runForwardOutputAndReconnect(s, reader, stream, nil)
 
 	output := stream.String()
-	assert.True(strings.HasPrefix(output, "|0\r\n"), output)
+	assert.True(strings.HasPrefix(output, "|0\n"), output)
 	assert.Contains(output, "Warning: tsshd discarded")
-	assert.True(strings.HasSuffix(output, "|998\r\n|999\r\n"), output)
+	assert.True(strings.HasSuffix(output, "|998\n|999\n"), output)
 	for i := 1; i < 998; i++ {
-		require.NotContains(output, fmt.Sprintf("|%d\r\n", i))
+		require.NotContains(output, fmt.Sprintf("|%d\n", i))
 	}
 }
 
@@ -257,13 +289,7 @@ func TestForwardOutput_FlushCacheBranch(t *testing.T) {
 		chunk:  1,
 	}
 
-	go func() {
-		time.Sleep(100 * time.Millisecond)
-		s.clientChecker.checker.timeoutFlag.Store(false)
-		close(signal)
-	}()
-
-	s.forwardOutput("stdout", reader, stream)
+	runForwardOutputAndReconnect(s, reader, stream, func() { close(signal) })
 
 	output := stream.String()
 	assert.True(strings.HasPrefix(output, "a\n"), output)
@@ -271,7 +297,7 @@ func TestForwardOutput_FlushCacheBranch(t *testing.T) {
 	assert.NotContains(output, "b\n")
 	assert.NotContains(output, "c\n")
 	assert.NotContains(output, "d\n")
-	assert.True(strings.HasSuffix(output, "e\nf\n1\r\n2\r\n"), output)
+	assert.True(strings.HasSuffix(output, "f\n1\r\n2\r\n"), output)
 }
 
 func TestForwardOutput_FlushWriteError(t *testing.T) {
@@ -291,14 +317,10 @@ func TestForwardOutput_FlushWriteError(t *testing.T) {
 		chunk:  1,
 	}
 
-	go func() {
-		time.Sleep(100 * time.Millisecond)
-		s.clientChecker.checker.timeoutFlag.Store(false)
+	runForwardOutputAndReconnect(s, reader, stream, func() {
 		stream.err = errors.New("mock write error")
 		close(signal)
-	}()
-
-	s.forwardOutput("stdout", reader, stream)
+	})
 
 	assert.Equal("a\n", stream.String())
 }
@@ -311,7 +333,7 @@ func TestForwardOutput_TimeoutCacheLeft(t *testing.T) {
 	stream := newMockStream()
 	reader := &chunkReader{data: [][]byte{[]byte("123a\nb\nc\nd\n1\r\n2\r\n3\r\n")}, chunk: 3}
 
-	s.forwardOutput("stdout", reader, stream)
+	runForwardOutputAndReconnect(s, reader, stream, nil)
 
 	output := stream.String()
 	assert.True(strings.HasPrefix(output, "123a\n"), output)
@@ -331,7 +353,7 @@ func TestForwardOutput_KeepPendingOutput(t *testing.T) {
 	stream := newMockStream()
 	reader := &chunkReader{data: [][]byte{[]byte("a\nb\nc\nd\n")}, chunk: 1}
 
-	s.forwardOutput("stdout", reader, stream)
+	runForwardOutputAndReconnect(s, reader, stream, nil)
 
 	assert.Equal("a\nb\nc\nd\n", stream.String())
 }
@@ -341,13 +363,12 @@ func TestForwardOutput_KeepPendingWaitFail(t *testing.T) {
 	s, reset := newTestSessionContext(true, true, 2)
 	defer reset()
 
-	s.clientChecker.checker.reconnectedCh = make(chan struct{})
 	s.clientChecker.checker.Close()
 
 	stream := newMockStream()
 	reader := &chunkReader{data: [][]byte{[]byte("a\nb\nc\nd\n")}, chunk: 1}
 
-	s.forwardOutput("stdout", reader, stream)
+	runForwardOutputAndReconnect(s, reader, stream, nil)
 
 	output := stream.String()
 	assert.True(strings.HasPrefix(output, "a"), output)
@@ -358,13 +379,12 @@ func TestForwardOutput_WaitFailAfterEOF(t *testing.T) {
 	s, reset := newTestSessionContext(false, true, 2)
 	defer reset()
 
-	s.clientChecker.checker.reconnectedCh = make(chan struct{})
 	s.clientChecker.checker.Close()
 
 	stream := newMockStream()
 	reader := &chunkReader{data: [][]byte{[]byte("a\nb\nc\nd\n")}, chunk: 1}
 
-	s.forwardOutput("stdout", reader, stream)
+	runForwardOutputAndReconnect(s, reader, stream, nil)
 
 	output := stream.String()
 	assert.True(strings.HasPrefix(output, "a"), output)
@@ -382,7 +402,7 @@ func TestForwardOutput_DiscardTmuxOutput(t *testing.T) {
 	}
 	reader := &chunkReader{data: [][]byte{buf.Bytes()}, chunk: 10}
 
-	s.forwardOutput("stdout", reader, stream)
+	runForwardOutputAndReconnect(s, reader, stream, nil)
 
 	output := stream.String()
 	assert.True(strings.HasPrefix(output, "%output %56 0\r\n"), output)
@@ -403,7 +423,7 @@ func TestForwardOutput_DiscardExtendedOutput(t *testing.T) {
 	}
 	reader := &chunkReader{data: [][]byte{buf.Bytes()}, chunk: 10}
 
-	s.forwardOutput("stdout", reader, stream)
+	runForwardOutputAndReconnect(s, reader, stream, nil)
 
 	output := stream.String()
 	assert.True(strings.HasPrefix(output, "%extended-output %123 0 : 0\r\n"), output)
@@ -424,7 +444,7 @@ func TestForwardOutput_FilterAllESC6n(t *testing.T) {
 		chunk: 1,
 	}
 
-	s.forwardOutput("stdout", reader, stream)
+	runForwardOutputAndReconnect(s, reader, stream, nil)
 
 	assert.Equal("X\nY\nZ", stream.String())
 }
@@ -442,7 +462,7 @@ func TestForwardOutput_KeepPendingESC6n(t *testing.T) {
 		chunk: 1,
 	}
 
-	s.forwardOutput("stdout", reader, stream)
+	runForwardOutputAndReconnect(s, reader, stream, nil)
 
 	assert.Equal("X\n\x1b[6nY\n\x1b[6nZ\x1b[6n", stream.String())
 }
@@ -466,11 +486,10 @@ func TestForwardOutput_KeepESC6nAfterReconnect(t *testing.T) {
 
 	go func() {
 		time.Sleep(100 * time.Millisecond)
-		s.clientChecker.checker.timeoutFlag.Store(false)
 		close(signal)
 	}()
 
-	s.forwardOutput("stdout", reader, stream)
+	runForwardOutputAndReconnect(s, reader, stream, nil)
 
 	assert.Equal("X\nY\nZ1\x1b[6n\n\x1b[6n", stream.String())
 }
@@ -488,7 +507,7 @@ func TestForwardOutput_MultiLinesAtOnce(t *testing.T) {
 		chunk: 100,
 	}
 
-	s.forwardOutput("stdout", reader, stream)
+	runForwardOutputAndReconnect(s, reader, stream, nil)
 
 	output := stream.String()
 	assert.True(strings.HasPrefix(output, "1\n"), output)
@@ -511,7 +530,7 @@ func TestForwardOutput_KeepMultiLines(t *testing.T) {
 		chunk: 100,
 	}
 
-	s.forwardOutput("stdout", reader, stream)
+	runForwardOutputAndReconnect(s, reader, stream, nil)
 
 	assert.Equal("1\n2\n3\n4\n5\n", stream.String())
 }
@@ -553,23 +572,32 @@ func TestForwardOutput_ReconnectWhileReadBlocked(t *testing.T) {
 		chunk:  1,
 	}
 
-	done := make(chan struct{})
 	go func() {
-		s.forwardOutput("stdout", reader, stream)
-		close(done)
+		runForwardOutputAndReconnect(s, reader, stream, nil)
 	}()
 
 	time.Sleep(100 * time.Millisecond)
-
-	s.clientChecker.checker.timeoutFlag.Store(false)
-	s.clientChecker.checker.notifyReconnected()
-
-	time.Sleep(100 * time.Millisecond)
-
 	assert.Equal("a\nb\nc\n", stream.String())
 
 	close(block)
-	<-done
+}
+
+func TestForwardOutput_TimeoutWithoutNewLine(t *testing.T) {
+	assert := assert.New(t)
+	s, reset := newTestSessionContext(false, true, 2)
+	defer reset()
+
+	stream := newMockStream()
+	reader := &chunkReader{data: [][]byte{[]byte("a\rb\rc\rd\re\rf\r")}, chunk: 1}
+
+	runForwardOutputAndReconnect(s, reader, stream, nil)
+
+	output := stream.String()
+	assert.True(strings.HasPrefix(output, "a\r"), output)
+	assert.Contains(output, "Warning: tsshd discarded")
+	assert.NotContains(output, "\r\n")
+	assert.NotContains(output, "c\r")
+	assert.True(strings.HasSuffix(output, "e\rf\r"), output)
 }
 
 func TestParsePortRanges(t *testing.T) {

@@ -220,7 +220,7 @@ type timeoutChecker struct {
 	timeoutFlag          atomic.Bool
 	timeoutMilli         atomic.Int64
 	lastAliveTime        atomic.Int64
-	reconnectedCh        chan struct{}
+	reconnectedCh        atomic.Pointer[chan struct{}]
 	updateNowChan        chan struct{}
 	updateTimeChan       chan int64
 	timeoutEventChan     chan struct{}
@@ -231,14 +231,12 @@ type timeoutChecker struct {
 func newTimeoutChecker(timeout time.Duration) *timeoutChecker {
 	tc := &timeoutChecker{
 		closeChan:        make(chan struct{}),
-		reconnectedCh:    make(chan struct{}),
 		updateNowChan:    make(chan struct{}, 1),
 		updateTimeChan:   make(chan int64, 2),
 		timeoutEventChan: make(chan struct{}),
 	}
 	tc.timeoutMilli.Store(int64(timeout / time.Millisecond))
 	tc.lastAliveTime.Store(time.Now().UnixMilli())
-	close(tc.reconnectedCh)
 
 	go tc.handleEvent()
 	if tc.timeoutMilli.Load() > 0 {
@@ -253,15 +251,26 @@ func (tc *timeoutChecker) isTimeout() bool {
 }
 
 func (tc *timeoutChecker) waitUntilReconnected() error {
-	if !tc.isTimeout() {
-		return nil
-	}
-	ch := tc.reconnectedCh
-	select {
-	case <-ch:
-		return nil
-	case <-tc.closeChan:
-		return fmt.Errorf("timeout closed")
+	for {
+		if !tc.isTimeout() {
+			return nil
+		}
+
+		ch := tc.reconnectedCh.Load()
+		for ch == nil {
+			time.Sleep(10 * time.Millisecond)
+			ch = tc.reconnectedCh.Load()
+			if !tc.isTimeout() {
+				return nil
+			}
+		}
+
+		select {
+		case <-*ch:
+			continue
+		case <-tc.closeChan:
+			return fmt.Errorf("timeout closed")
+		}
 	}
 }
 
@@ -342,7 +351,9 @@ func (tc *timeoutChecker) handleEvent() {
 	setReconnected := func() {
 		if tc.timeoutFlag.Load() {
 			tc.timeoutFlag.Store(false)
-			close(tc.reconnectedCh)
+			if ch := tc.reconnectedCh.Swap(nil); ch != nil && *ch != nil {
+				close(*ch)
+			}
 			go tc.notifyReconnected()
 		}
 	}
@@ -362,7 +373,10 @@ func (tc *timeoutChecker) handleEvent() {
 		case <-tc.timeoutEventChan:
 			if tc.lastAliveTime.Load()+tc.timeoutMilli.Load() <= time.Now().UnixMilli() {
 				if !tc.timeoutFlag.Load() {
-					tc.reconnectedCh = make(chan struct{})
+					newCh := make(chan struct{})
+					if oldCh := tc.reconnectedCh.Swap(&newCh); oldCh != nil && *oldCh != nil {
+						close(*oldCh)
+					}
 					tc.timeoutFlag.Store(true)
 					go tc.notifyTimeout()
 				}
