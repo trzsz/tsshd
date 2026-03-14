@@ -48,9 +48,7 @@ func listenForAgent() (net.Listener, string, error) {
 		return nil, "", fmt.Errorf("listen on [%s] failed: %v", pipePath, err)
 	}
 
-	onExitFuncs = append(onExitFuncs, func() {
-		_ = listener.Close()
-	})
+	addOnExitFunc(func() { _ = listener.Close() })
 
 	return listener, pipePath, nil
 }

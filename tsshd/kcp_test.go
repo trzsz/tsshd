@@ -28,21 +28,24 @@ import (
 	"bytes"
 	"fmt"
 	"io"
+	"net"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/trzsz/smux"
+	"github.com/xtaci/kcp-go/v5"
 )
 
 func TestKCP_PassSaltValidation(t *testing.T) {
 	info := ServerInfo{}
-	udpConn := listenRandomUDP(t)
-	defer func() { _ = udpConn.Close() }()
+	svrConn := listenRandomUDP(t)
+	defer func() { _ = svrConn.Close() }()
 
 	// Start KCP server
-	listener, err := listenKCP(udpConn, &info)
+	listener, _, err := listenKCP(svrConn, &info)
 	if err != nil {
 		t.Fatalf("listenKCP failed: %v", err)
 	}
@@ -62,6 +65,16 @@ func TestKCP_PassSaltValidation(t *testing.T) {
 			return
 		}
 		defer func() { _ = conn.Close() }()
+
+		// Immediately close any additional accepted connections so that
+		// only the intended connection is used in this test.
+		go func() {
+			for {
+				if conn, err := listener.AcceptKCP(); err == nil {
+					_ = conn.Close()
+				}
+			}
+		}()
 
 		// build smux server
 		session, err := smux.Server(conn, &smuxConfig)
@@ -106,19 +119,23 @@ func TestKCP_PassSaltValidation(t *testing.T) {
 
 		// The client may believe it has connected successfully.
 		// We intentionally do NOT assert failure here.
-		illegalClient, err := newKcpClient(nil, &UdpClientOptions{ServerInfo: &illegalInfo}, udpConn.LocalAddr().String())
+		cliConn1 := listenRandomUDP(t)
+		defer func() { _ = cliConn1.Close() }()
+		illegalClient, err := newKcpClient(nil, &UdpClientOptions{ServerInfo: &illegalInfo}, cliConn1, svrConn.LocalAddr())
 		if err == nil {
 			defer func() { _ = illegalClient.closeClient() }()
 			// Try to open a smux stream with a short timeout.
 			// If this unexpectedly succeeds, it will consume the server's
 			// single Accept slot and cause Case 2 to fail, exposing a bug.
 			_, _ = doWithTimeout(func() (*smux.Stream, error) {
-				return illegalClient.(*kcpClient).session.OpenStream()
+				return illegalClient.session.OpenStream()
 			}, 200*time.Millisecond)
 		}
 
 		// ---------- Case 2: valid pass/salt ----------
-		client, err := newKcpClient(nil, &UdpClientOptions{ServerInfo: &info}, udpConn.LocalAddr().String())
+		cliConn2 := listenRandomUDP(t)
+		defer func() { _ = cliConn2.Close() }()
+		client, err := newKcpClient(nil, &UdpClientOptions{ServerInfo: &info}, cliConn2, svrConn.LocalAddr())
 		if err != nil {
 			clientErrCh <- fmt.Errorf("valid pass/salt should succeed: %v", err)
 			return
@@ -127,7 +144,7 @@ func TestKCP_PassSaltValidation(t *testing.T) {
 
 		// open stream and verify echo
 		stream, err := doWithTimeout(func() (*smux.Stream, error) {
-			return client.(*kcpClient).session.OpenStream()
+			return client.session.OpenStream()
 		}, 200*time.Millisecond)
 		if err != nil {
 			clientErrCh <- fmt.Errorf("client open stream failed: %v", err)
@@ -169,11 +186,11 @@ func TestKCP_PassSaltValidation(t *testing.T) {
 
 func TestKCP_OOB(t *testing.T) {
 	info := ServerInfo{}
-	udpConn := listenRandomUDP(t)
-	defer func() { _ = udpConn.Close() }()
+	svrConn := listenRandomUDP(t)
+	defer func() { _ = svrConn.Close() }()
 
 	// Start KCP server
-	listener, err := listenKCP(udpConn, &info)
+	listener, _, err := listenKCP(svrConn, &info)
 	if err != nil {
 		t.Fatalf("listenKCP failed: %v", err)
 	}
@@ -238,15 +255,16 @@ func TestKCP_OOB(t *testing.T) {
 	}()
 
 	var wg sync.WaitGroup
-	client, err := newKcpClient(nil, &UdpClientOptions{ServerInfo: &info}, udpConn.LocalAddr().String())
+	cliConn := listenRandomUDP(t)
+	defer func() { _ = cliConn.Close() }()
+	client, err := newKcpClient(nil, &UdpClientOptions{ServerInfo: &info}, cliConn, svrConn.LocalAddr())
 	if err != nil {
 		t.Fatalf("new kcp client failed: %v", err)
 	}
 
-	client.(*kcpClient).crypto.bytesThreshold = 0
+	client.crypto.bytesThreshold = 0
 
-	conn := client.(*kcpClient).conn
-	size := conn.GetOOBMaxSize()
+	size := client.conn.GetOOBMaxSize()
 	if size < 1000 {
 		t.Fatalf("unexpectedly small max OOB size: %d", size)
 	}
@@ -255,7 +273,7 @@ func TestKCP_OOB(t *testing.T) {
 	counts := make([]atomic.Int32, sizePlus1)
 
 	// registers OOB callback to validate echoed OOB data content and length
-	err = conn.SetOOBHandler(func(buf []byte) {
+	err = client.conn.SetOOBHandler(func(buf []byte) {
 		for i, b := range buf {
 			if b != byte(i) {
 				t.Fatalf(
@@ -280,7 +298,7 @@ func TestKCP_OOB(t *testing.T) {
 
 	wg.Go(func() {
 		// stress test for normal data channel to ensure main channel does not affect OOB
-		stream, err := client.(*kcpClient).session.OpenStream()
+		stream, err := client.session.OpenStream()
 		if err != nil {
 			t.Fatalf("client open stream failed: %v", err)
 		}
@@ -304,7 +322,7 @@ func TestKCP_OOB(t *testing.T) {
 	wg.Go(func() {
 		// send OOB data of varying lengths in a loop, content is [0,1,2,...]
 		for i := range 5 << 20 {
-			if err := conn.SendOOB(data[:i%sizePlus1]); err != nil {
+			if err := client.conn.SendOOB(data[:i%sizePlus1]); err != nil {
 				t.Errorf("client failed to send OOB payload: %v", err)
 			}
 		}
@@ -327,5 +345,208 @@ func TestKCP_OOB(t *testing.T) {
 		if counts[i].Load() == 0 {
 			t.Errorf("missing OOB echo for payload length %d", i)
 		}
+	}
+}
+
+func runKcpEchoTest(t *testing.T, listener *kcp.Listener, client *kcpClient) {
+	const kTestSize = 100
+	serverErrCh := make(chan error, 1)
+	clientErrCh := make(chan error, 1)
+
+	// ---------- server ----------
+	go func() {
+		defer close(serverErrCh)
+
+		conn, err := listener.AcceptKCP()
+		if err != nil {
+			serverErrCh <- err
+			return
+		}
+		defer func() { _ = conn.Close() }()
+
+		session, err := smux.Server(conn, &smuxConfig)
+		if err != nil {
+			serverErrCh <- err
+			return
+		}
+		defer func() { _ = session.Close() }()
+
+		stream, err := session.AcceptStream()
+		if err != nil {
+			serverErrCh <- err
+			return
+		}
+		defer func() { _ = stream.Close() }()
+
+		buf := make([]byte, 1024)
+
+		for i := 1; i <= kTestSize; i++ {
+			n, err := stream.Read(buf)
+			if err != nil {
+				serverErrCh <- err
+				return
+			}
+
+			if _, err := stream.Write(buf[:n]); err != nil {
+				serverErrCh <- err
+				return
+			}
+		}
+	}()
+
+	// ---------- client ----------
+	go func() {
+		defer close(clientErrCh)
+
+		session := client.session
+
+		stream, err := session.OpenStream()
+		if err != nil {
+			clientErrCh <- err
+			return
+		}
+		defer func() { _ = stream.Close() }()
+
+		for size := 1; size <= kTestSize; size++ {
+			msg := make([]byte, size)
+			for i := range msg {
+				msg[i] = byte(i % 256)
+			}
+
+			if _, err := stream.Write(msg); err != nil {
+				clientErrCh <- err
+				return
+			}
+
+			buf := make([]byte, size)
+			if _, err := io.ReadFull(stream, buf); err != nil {
+				clientErrCh <- err
+				return
+			}
+
+			if !bytes.Equal(msg, buf) {
+				clientErrCh <- fmt.Errorf("echo mismatch size=%d", size)
+				return
+			}
+		}
+	}()
+
+	select {
+	case err := <-serverErrCh:
+		if err != nil {
+			t.Fatalf("server error: %v", err)
+		}
+	case err := <-clientErrCh:
+		if err != nil {
+			t.Fatalf("client error: %v", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatalf("kcp echo test timeout")
+	}
+}
+
+func TestKCP_EchoBasic(t *testing.T) {
+	info := ServerInfo{}
+
+	svrConn := listenRandomUDP(t)
+	defer func() { _ = svrConn.Close() }()
+
+	listener, _, err := listenKCP(svrConn, &info)
+	if err != nil {
+		t.Fatalf("listenKCP failed: %v", err)
+	}
+	defer func() { _ = listener.Close() }()
+
+	cliConn := listenRandomUDP(t)
+	defer func() { _ = cliConn.Close() }()
+
+	client, err := newKcpClient(nil, &UdpClientOptions{ServerInfo: &info}, cliConn, svrConn.LocalAddr())
+	if err != nil {
+		t.Fatalf("newKcpClient failed: %v", err)
+	}
+	defer func() { _ = client.closeClient() }()
+
+	runKcpEchoTest(t, listener, client)
+}
+
+type proxyWithCrypto struct {
+	t      *testing.T
+	conn   net.PacketConn
+	crypto *rotatingCrypto
+}
+
+func (p *proxyWithCrypto) ReadFrom(buf []byte) (n int, addr net.Addr, err error) {
+	n, addr, err = p.conn.ReadFrom(buf)
+	if err != nil {
+		return
+	}
+	n, err = p.crypto.openPacket(buf[:n])
+	return
+}
+
+func (p *proxyWithCrypto) WriteTo(buf []byte, addr net.Addr) (n int, err error) {
+	buf, err = p.crypto.sealPacket(buf)
+	if err != nil {
+		return 0, err
+	}
+	return p.conn.WriteTo(buf, addr)
+}
+
+func (p *proxyWithCrypto) Close() error                       { return p.conn.Close() }
+func (p *proxyWithCrypto) LocalAddr() net.Addr                { return p.conn.LocalAddr() }
+func (p *proxyWithCrypto) SetDeadline(t time.Time) error      { return p.conn.SetDeadline(t) }
+func (p *proxyWithCrypto) SetReadDeadline(t time.Time) error  { return p.conn.SetReadDeadline(t) }
+func (p *proxyWithCrypto) SetWriteDeadline(t time.Time) error { return p.conn.SetWriteDeadline(t) }
+
+func TestKCP_DelegatedCrypto(t *testing.T) {
+	info := ServerInfo{}
+
+	svrConn := listenRandomUDP(t)
+	defer func() { _ = svrConn.Close() }()
+
+	proxy := &proxyWithCrypto{t: t, conn: svrConn}
+
+	listener, crypto, err := listenKCP(proxy, &info)
+	if err != nil {
+		t.Fatalf("listenKCP failed: %v", err)
+	}
+	defer func() { _ = listener.Close() }()
+
+	crypto.delegatedToProxy = true
+	proxy.crypto, err = newRotatingCrypto(nil, crypto.keyPass, crypto.keySalt, 0, 0)
+	if err != nil {
+		t.Fatalf("newRotatingCrypto failed: %v", err)
+	}
+
+	oriClientDebugFn, oriEnableDebugLogging := clientDebugFn, enableDebugLogging
+	defer func() { clientDebugFn, enableDebugLogging = oriClientDebugFn, oriEnableDebugLogging }()
+
+	var debugCalled, kcpMemUnexpected atomic.Bool
+	clientDebugFn = func(_ int64, msg string) {
+		debugCalled.Store(true)
+		if strings.Contains(msg, kcpMemLayoutUnexpected) {
+			kcpMemUnexpected.Store(true)
+		}
+	}
+
+	enableDebugLogging = true
+	debug("call clientDebugFn")
+	if !debugCalled.Load() {
+		t.Fatalf("expected clientDebugFn to be called but it was not")
+	}
+
+	cliConn := listenRandomUDP(t)
+	defer func() { _ = cliConn.Close() }()
+
+	client, err := newKcpClient(nil, &UdpClientOptions{ServerInfo: &info}, cliConn, svrConn.LocalAddr())
+	if err != nil {
+		t.Fatalf("newKcpClient failed: %v", err)
+	}
+	defer func() { _ = client.closeClient() }()
+
+	runKcpEchoTest(t, listener, client)
+
+	if kcpMemUnexpected.Load() {
+		t.Fatalf("unexpected KCP crypto memory layout detected")
 	}
 }

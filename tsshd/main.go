@@ -29,14 +29,34 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"os/signal"
 	"strconv"
 	"strings"
+	"sync"
+	"syscall"
 	"time"
 )
 
-var kDefaultConnectTimeout = 10 * time.Second
+const kDefaultConnectTimeout = 10 * time.Second
+
+const (
+	kExitCodeNormal       = 0
+	kExitCodeBackground   = 91
+	kExitCodeOutputFail   = 92
+	kExitCodeInitServer   = 93
+	kExitCodeConnTimeout  = 94
+	kExitCodeAliveTimeout = 95
+	kExitCodeSignalKill   = 96
+)
 
 var exitChan = make(chan int, 1)
+
+func exitWithCode(code int) {
+	select {
+	case exitChan <- code:
+	default:
+	}
+}
 
 type tsshdArgs struct {
 	Help           bool
@@ -47,14 +67,15 @@ type tsshdArgs struct {
 	IPv4           bool
 	IPv6           bool
 	Debug          bool
+	Attachable     bool
 	MTU            uint16
 	Port           string
 	ConnectTimeout time.Duration
 }
 
 func printHelp() int {
-	fmt.Printf("usage: tsshd [-h|-v|-V] [--kcp] [--tcp] [--ipv4] [--ipv6] [--debug] [--mtu N] [--port low-high] [--connect-timeout t]\n\n" +
-		"tsshd: trzsz-ssh(tssh) udp server that supports connection migration for roaming.\n\n" +
+	fmt.Printf("usage: tsshd [-h|-v|-V] [--kcp] [--tcp] [--ipv4] [--ipv6] [--debug] [--attachable] [--mtu N] [--port low-high] [--connect-timeout t]\n\n" +
+		"tsshd: UDP-based SSH server with roaming support.\n\n" +
 		"optional arguments:\n" +
 		"  -h, --help             show this help message and exit\n" +
 		"  -v                     show short version number and exit\n" +
@@ -64,6 +85,7 @@ func printHelp() int {
 		"  --ipv4                 UDP only listens on IPv4, ignoring IPv6\n" +
 		"  --ipv6                 UDP only listens on IPv6, ignoring IPv4\n" +
 		"  --debug                Send debugging messages to the client\n" +
+		"  --attachable           Allow another client to attach to server\n" +
 		"  --mtu N                Sets the Maximum Transmission Unit (MTU)\n" +
 		"  --port low-high        UDP port range that the tsshd listens on\n" +
 		"  --connect-timeout t    The timeout for tssh connecting to tsshd\n")
@@ -90,6 +112,8 @@ func parseTsshdArgs() *tsshdArgs {
 			args.IPv6 = true
 		case "--debug":
 			args.Debug = true
+		case "--attachable":
+			args.Attachable = true
 		case "--mtu":
 			if i+1 < len(os.Args) && !strings.HasPrefix(os.Args[i+1], "-") {
 				if mtu, err := strconv.ParseUint(os.Args[i+1], 10, 16); err == nil {
@@ -133,11 +157,23 @@ func background() (bool, io.ReadCloser, error) {
 }
 
 var onExitFuncs []func()
+var onExitMutex sync.Mutex
 
 func cleanupOnExit() {
-	for i := len(onExitFuncs) - 1; i >= 0; i-- {
-		onExitFuncs[i]()
+	onExitMutex.Lock()
+	funcs := append([]func(){}, onExitFuncs...)
+	onExitFuncs = nil
+	onExitMutex.Unlock()
+
+	for i := len(funcs) - 1; i >= 0; i-- {
+		funcs[i]()
 	}
+}
+
+func addOnExitFunc(fn func()) {
+	onExitMutex.Lock()
+	defer onExitMutex.Unlock()
+	onExitFuncs = append(onExitFuncs, fn)
 }
 
 // TsshdMain is the main function of `tsshd` binary.
@@ -156,14 +192,14 @@ func TsshdMain() int {
 	parent, stdout, err := background()
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "run in background failed: %v\n", err)
-		return 1
+		return kExitCodeBackground
 	}
 
 	if parent {
 		defer func() { _ = stdout.Close() }()
 		if _, err := io.Copy(os.Stdout, stdout); err != nil {
 			fmt.Fprintf(os.Stderr, "copy stdout failed: %v\n", err)
-			return 2
+			return kExitCodeOutputFail
 		}
 		return 0
 	}
@@ -175,9 +211,6 @@ func TsshdMain() int {
 	if args.ConnectTimeout <= 0 {
 		args.ConnectTimeout = kDefaultConnectTimeout
 	}
-
-	// handle exit signals
-	handleExitSignals()
 
 	// init sshd_config
 	initSshdConfig()
@@ -194,31 +227,86 @@ func TsshdMain() int {
 	}
 
 	// init tsshd server
-	kcpListener, quicListener, err := initServer(args)
+	info, err := initServer(args)
 	if err != nil {
 		fmt.Println(err)
 		_ = os.Stdout.Close()
-		return 3
+		return kExitCodeInitServer
 	}
+
+	fmt.Printf("\a%s\r\n", info)
+
+	addOnExitFunc(func() {
+		if server := activeSshUdpServer.Load(); server != nil {
+			server.Close()
+		}
+	})
 
 	_ = os.Stdout.Close()
 
-	if kcpListener != nil {
-		defer func() { _ = kcpListener.Close() }()
-		go serveKCP(kcpListener, args.MTU)
-	}
-	if quicListener != nil {
-		defer func() { _ = quicListener.Close() }()
-		go serveQUIC(quicListener)
-	}
+	// start background liveness watchdog
+	go monitorServerLiveness(args)
 
-	go func() {
-		// should be connected in time
-		time.Sleep(args.ConnectTimeout)
-		if !serving.Load() {
-			exitChan <- 1
-		}
-	}()
+	// start signal listener (SIGTERM/SIGHUP/Interrupt)
+	go handleExitSignals()
 
+	// wait for exit
 	return <-exitChan
+}
+
+func monitorServerLiveness(args *tsshdArgs) {
+	beginTime := time.Now()
+
+	for {
+		server := activeSshUdpServer.Load()
+		if server == nil {
+			// NOTE: Do not check server.serving.Load() here. In attachable mode,
+			// there is a brief window where the server may not be marked as serving,
+			// which could cause the process to exit unexpectedly.
+
+			// The client is expected to connect within ConnectTimeout (default: 10s).
+			// Otherwise, it is considered a network issue and the process exits.
+			if time.Since(beginTime) > args.ConnectTimeout {
+				exitWithCode(kExitCodeConnTimeout)
+				return
+			}
+			time.Sleep(time.Second)
+			continue
+		}
+
+		// Skip liveness check if aliveTimeout is zero.
+		// NOTE: In attachable mode, a new server may set a different aliveTimeout.
+		if server.aliveTimeout == 0 {
+			time.Sleep(time.Second)
+			continue
+		}
+
+		// Check the last received client heartbeat. Exit if it exceeds aliveTimeout.
+		if time.Since(time.UnixMilli(server.clientAliveTime.latest())) > server.aliveTimeout {
+			warning("tsshd keep alive timeout")
+			exitWithCode(kExitCodeAliveTimeout)
+			return
+		}
+
+		time.Sleep(max(server.intervalTime, time.Second))
+	}
+}
+
+func handleExitSignals() {
+	sigChan := make(chan os.Signal, 1)
+	signal.Notify(sigChan,
+		syscall.SIGTERM, // Default signal for the kill command
+		syscall.SIGHUP,  // Terminal closed (System reboot/shutdown)
+		os.Interrupt,    // Ctrl+C signal
+	)
+
+	sig := <-sigChan
+	if s := activeSshUdpServer.Load(); s != nil {
+		_ = s.sendBusMessage("quit", quitMessage{fmt.Sprintf("receiving signal [%v] from the operating system", sig)})
+	}
+	go func() {
+		time.Sleep(time.Second) // give udp some time
+		debug("quit by signal wait timeout")
+		exitWithCode(kExitCodeSignalKill)
+	}()
 }

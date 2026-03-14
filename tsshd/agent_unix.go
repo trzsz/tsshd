@@ -38,9 +38,7 @@ func listenForAgent() (net.Listener, string, error) {
 	if err != nil {
 		return nil, "", fmt.Errorf("mkdir temp failed: %v", err)
 	}
-	onExitFuncs = append(onExitFuncs, func() {
-		_ = os.RemoveAll(tempDir)
-	})
+	addOnExitFunc(func() { _ = os.RemoveAll(tempDir) })
 
 	agentPath := filepath.Join(tempDir, fmt.Sprintf("agent.%d", os.Getpid()))
 
@@ -53,7 +51,7 @@ func listenForAgent() (net.Listener, string, error) {
 		warning("agent forwarding chmod [%s] failed: %v", agentPath, err)
 	}
 
-	onExitFuncs = append(onExitFuncs, func() {
+	addOnExitFunc(func() {
 		_ = listener.Close()
 		_ = os.Remove(agentPath)
 	})

@@ -12,4 +12,4 @@ Vcs-Git: https://github.com/trzsz/tsshd.git
 Package: tsshd
 Architecture: any
 Depends: ${shlibs:Depends}, ${misc:Depends}
-Description: The tsshd works like mosh-server, while the 'tssh --udp' works like mosh.
+Description: tsshd: UDP-based SSH server with roaming support.

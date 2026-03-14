@@ -44,73 +44,69 @@ import (
 	"github.com/trzsz/shellescape"
 )
 
+var maxSessionID atomic.Uint64
 var maxPendingOutputLines = 1000
 
-var discardPendingInputFlag atomic.Bool
-var discardPendingInputMarker []byte
-var discardMarkerCurrentIndex uint32
-var discardMarkerIndexMutex sync.Mutex
-
-func enablePendingInputDiscard() {
-	if globalSetting.keepPendingInput.Load() {
+func (s *sshUdpServer) enablePendingInputDiscard() {
+	if s.keepPendingInput.Load() {
 		return
 	}
 
-	idx := getNextDiscardMarkerIndex()
-	discardPendingInputMarker = []byte{0xFF, 0xC0, 0xC1, 0xFF,
+	idx := s.getNextDiscardMarkerIndex()
+	s.discardPendingInputMarker = []byte{0xFF, 0xC0, 0xC1, 0xFF,
 		byte(idx >> 24), byte(idx >> 16), byte(idx >> 8), byte(idx),
 	}
-	discardPendingInputFlag.Store(true)
+	s.discardPendingInputFlag.Store(true)
 
 	go func() {
-		debug("discard marker: %X", discardPendingInputMarker)
-		_ = sendBusMessage("discard", discardMessage{DiscardMarker: discardPendingInputMarker})
+		debug("discard marker: %X", s.discardPendingInputMarker)
+		if err := s.sendBusMessage("discard", discardMessage{DiscardMarker: s.discardPendingInputMarker}); err != nil {
+			warning("send discard marker [%X] failed: %v", s.discardPendingInputMarker, err)
+		}
 	}()
 }
 
-func getNextDiscardMarkerIndex() uint32 {
-	discardMarkerIndexMutex.Lock()
-	defer discardMarkerIndexMutex.Unlock()
+func (s *sshUdpServer) getNextDiscardMarkerIndex() uint32 {
+	s.discardMarkerIndexMutex.Lock()
+	defer s.discardMarkerIndexMutex.Unlock()
 
-	discardMarkerCurrentIndex++
+	s.discardMarkerCurrentIndex++
 	for i := 3; i >= 0; i-- {
 		shift := i * 8
-		b := (discardMarkerCurrentIndex >> shift) & 0xFF
+		b := (s.discardMarkerCurrentIndex >> shift) & 0xFF
 		if b == ';' || b == '\r' { // skip ; and \r for tmux
-			discardMarkerCurrentIndex = ((discardMarkerCurrentIndex >> shift) + 1) << shift
-			return discardMarkerCurrentIndex
+			s.discardMarkerCurrentIndex = ((s.discardMarkerCurrentIndex >> shift) + 1) << shift
+			return s.discardMarkerCurrentIndex
 		}
 	}
-	return discardMarkerCurrentIndex
+	return s.discardMarkerCurrentIndex
 }
 
 type sessionContext struct {
-	id      uint64
-	cols    int
-	rows    int
-	cmd     *exec.Cmd
-	pty     *tsshdPty
-	outWG   sync.WaitGroup
-	stdin   io.WriteCloser
-	stdout  io.ReadCloser
-	stderr  io.ReadCloser
-	started bool
-	closed  atomic.Bool
-
+	id              uint64
+	cols            int
+	rows            int
+	cmd             *exec.Cmd
+	pty             *tsshdPty
+	outWG           sync.WaitGroup
+	stdin           io.WriteCloser
+	stdout          io.ReadCloser
+	stderr          io.ReadCloser
+	started         bool
+	closed          atomic.Bool
+	waitDone        chan struct{}
+	waitCancel      chan struct{}
+	waitMutex       sync.Mutex
+	resizeMutex     sync.Mutex
+	server          atomic.Pointer[sshUdpServer]
+	ioStream        *replaceableStream
+	errStream       *replaceableStream
+	clientChecker   *replaceableTimeoutChecker
 	discardedBuffer []byte
 }
 
-type stderrStream struct {
-	id     uint64
-	wg     sync.WaitGroup
-	stream Stream
-}
-
 var sessionMutex sync.Mutex
-var sessionMap = make(map[uint64]*sessionContext)
-
-var stderrMutex sync.Mutex
-var stderrMap = make(map[uint64]*stderrStream)
+var sessionMap map[uint64]*sessionContext
 
 func (c *sessionContext) StartPty() error {
 	var err error
@@ -175,14 +171,14 @@ func (c *sessionContext) showMotd(stream Stream) {
 	printMotd([]string{"/etc/motd"}) // always print traditional /etc/motd.
 }
 
-func (c *sessionContext) discardPendingInput(buf []byte) error {
+func (c *sessionContext) discardPendingInput(server *sshUdpServer, buf []byte) error {
 	c.discardedBuffer = append(c.discardedBuffer, buf...)
-	pos := bytes.Index(c.discardedBuffer, discardPendingInputMarker)
+	pos := bytes.Index(c.discardedBuffer, server.discardPendingInputMarker)
 	if pos < 0 {
 		return nil
 	}
 
-	remainingBuffer := c.discardedBuffer[pos+len(discardPendingInputMarker):]
+	remainingBuffer := c.discardedBuffer[pos+len(server.discardPendingInputMarker):]
 	if len(remainingBuffer) > 0 {
 		if err := writeAll(c.stdin, remainingBuffer); err != nil {
 			return err
@@ -193,13 +189,15 @@ func (c *sessionContext) discardPendingInput(buf []byte) error {
 		if enableDebugLogging {
 			debug("discard input: %s", strconv.QuoteToASCII(string(c.discardedBuffer[:pos])))
 		}
-		_ = sendBusMessage("discard", discardMessage{DiscardedInput: c.discardedBuffer[:pos]})
+		if server := c.server.Load(); server != nil {
+			_ = server.sendBusMessage("discard", discardMessage{DiscardedInput: c.discardedBuffer[:pos]})
+		}
 	} else if enableDebugLogging {
 		debug("no pending input to discard")
 	}
 	c.discardedBuffer = nil
 
-	discardPendingInputFlag.Store(false)
+	server.discardPendingInputFlag.Store(false)
 	debug("new transport path is now active")
 	return nil
 }
@@ -213,8 +211,13 @@ func (c *sessionContext) forwardInput(stream Stream) {
 	for {
 		n, err := stream.Read(buffer)
 		if n > 0 {
-			if discardPendingInputFlag.Load() {
-				if err := c.discardPendingInput(buffer[:n]); err != nil {
+			server := c.server.Load()
+			if server == nil {
+				// nil indicates the session has been detached, input from the old client should be discarded.
+				continue
+			}
+			if server.discardPendingInputFlag.Load() {
+				if err := c.discardPendingInput(server, buffer[:n]); err != nil {
 					break
 				}
 			} else {
@@ -228,6 +231,13 @@ func (c *sessionContext) forwardInput(stream Stream) {
 		}
 	}
 	debug("session [%d] stdin completed", c.id)
+}
+
+func (c *sessionContext) isKeepPendingOutput() bool {
+	if server := c.server.Load(); server != nil {
+		return server.keepPendingOutput.Load()
+	}
+	return false
 }
 
 func (c *sessionContext) forwardOutput(name string, reader io.Reader, stream Stream) {
@@ -301,7 +311,15 @@ func (c *sessionContext) forwardOutput(name string, reader io.Reader, stream Str
 	// chHasNewLine ensures the client receives a complete line before further output is cached.
 	var chHasNewLine bool
 
+	var flushMutex sync.Mutex
 	flushOutput := func() {
+		flushMutex.Lock()
+		defer flushMutex.Unlock()
+
+		if len(cacheLines) == 0 {
+			return
+		}
+
 		filteredCount := 0
 		if enableDebugLogging {
 			defer func() {
@@ -310,6 +328,7 @@ func (c *sessionContext) forwardOutput(name string, reader io.Reader, stream Str
 				}
 			}()
 		}
+
 		for i := -1; i < len(cacheLines); i++ {
 			var line []byte
 			if i < 0 {
@@ -342,7 +361,7 @@ func (c *sessionContext) forwardOutput(name string, reader io.Reader, stream Str
 					}
 					break out
 				default:
-					if globalServerProxy.clientChecker.isTimeout() {
+					if c.clientChecker.isTimeout() {
 						if i > 0 {
 							cacheLines = cacheLines[i:]
 						}
@@ -359,6 +378,8 @@ func (c *sessionContext) forwardOutput(name string, reader io.Reader, stream Str
 		cacheLines, chHasNewLine = nil, false
 	}
 
+	c.clientChecker.onReconnected(flushOutput)
+
 	buffer := make([]byte, 32*1024)
 	for {
 		n, err := reader.Read(buffer)
@@ -366,7 +387,7 @@ func (c *sessionContext) forwardOutput(name string, reader io.Reader, stream Str
 			buf := make([]byte, n)
 			copy(buf, buffer[:n])
 
-			if chHasNewLine && globalServerProxy.clientChecker.isTimeout() && !globalSetting.keepPendingOutput.Load() {
+			if chHasNewLine && c.clientChecker.isTimeout() && !c.isKeepPendingOutput() {
 				cacheOutput(buf)
 				continue
 			}
@@ -378,7 +399,7 @@ func (c *sessionContext) forwardOutput(name string, reader io.Reader, stream Str
 			}
 
 			var remaining []byte
-			if globalServerProxy.clientChecker.isTimeout() && !globalSetting.keepPendingOutput.Load() {
+			if c.clientChecker.isTimeout() && !c.isKeepPendingOutput() {
 				if pos := bytes.IndexByte(buf, '\n'); pos >= 0 {
 					remaining = buf[pos+1:]
 					buf = buf[:pos+1]
@@ -392,9 +413,9 @@ func (c *sessionContext) forwardOutput(name string, reader io.Reader, stream Str
 				case ch <- buf:
 					break out
 				default:
-					if globalServerProxy.clientChecker.isTimeout() {
-						if globalSetting.keepPendingOutput.Load() {
-							if globalServerProxy.clientChecker.waitUntilReconnected() != nil {
+					if c.clientChecker.isTimeout() {
+						if c.isKeepPendingOutput() {
+							if c.clientChecker.waitUntilReconnected() != nil {
 								return
 							}
 							continue
@@ -433,8 +454,8 @@ func (c *sessionContext) forwardOutput(name string, reader io.Reader, stream Str
 
 		if err != nil {
 			for len(cacheLines) > 0 && !writeError.Load() {
-				if globalServerProxy.clientChecker.isTimeout() {
-					if globalServerProxy.clientChecker.waitUntilReconnected() != nil {
+				if c.clientChecker.isTimeout() {
+					if c.clientChecker.waitUntilReconnected() != nil {
 						break
 					}
 				}
@@ -446,27 +467,39 @@ func (c *sessionContext) forwardOutput(name string, reader io.Reader, stream Str
 	debug("session [%d] %s completed", c.id, name)
 }
 
-func (c *sessionContext) forwardIO(stream Stream) {
+func (c *sessionContext) forwardIO(server *sshUdpServer, stream Stream) {
+	ioStream := stream
+	if server.args.Attachable {
+		c.ioStream = newReplaceableStream(ioStream)
+		ioStream = c.ioStream
+	}
+
 	if c.stdin != nil {
-		go c.forwardInput(stream)
+		go c.forwardInput(ioStream)
 	}
 
 	if c.stdout != nil {
-		c.outWG.Go(func() { c.forwardOutput("stdout", c.stdout, stream) })
+		c.outWG.Go(func() { c.forwardOutput("stdout", c.stdout, ioStream) })
+	}
+
+	var errStream Stream
+	if s := server.getStderrStream(c.id); s != nil {
+		errStream = s
+	} else {
+		errStream = &discardStream{}
+	}
+	if server.args.Attachable {
+		c.errStream = newReplaceableStream(errStream)
+		errStream = c.errStream
 	}
 
 	if c.stderr != nil {
 		c.outWG.Go(func() {
-			if stderr := getStderrStream(c.id); stderr != nil {
-				c.forwardOutput("stderr", c.stderr, stderr.stream)
-				stderr.Close()
-			} else {
-				_, _ = io.Copy(io.Discard, c.stderr)
-				debug("session [%d] stderr completed", c.id)
-			}
+			c.forwardOutput("stderr", c.stderr, errStream)
+			_ = errStream.Close()
 		})
-	} else if stderr := getStderrStream(c.id); stderr != nil {
-		stderr.Close()
+	} else {
+		_ = errStream.Close()
 		debug("session [%d] stderr closed", c.id)
 	}
 }
@@ -519,11 +552,10 @@ func (c *sessionContext) Close() {
 	}
 	debug("session [%d] exiting with code: %d", c.id, code)
 
-	if err := sendBusMessage("exit", exitMessage{
-		ID:       c.id,
-		ExitCode: code,
-	}); err != nil {
-		warning("send exit message failed: %v", err)
+	if server := c.server.Load(); server != nil {
+		if err := server.sendBusMessage("exit", exitMessage{c.id, code}); err != nil {
+			warning("send exit message failed: %v", err)
+		}
 	}
 	debug("session [%d] exit completed", c.id)
 
@@ -545,6 +577,10 @@ func (c *sessionContext) SetSize(cols, rows int, redraw bool) error {
 	if c.pty == nil {
 		return fmt.Errorf("session %d %v is not pty", c.id, c.cmd.Args)
 	}
+
+	c.resizeMutex.Lock()
+	defer c.resizeMutex.Unlock()
+
 	if redraw {
 		_ = c.pty.Resize(cols+1, rows)
 		time.Sleep(10 * time.Millisecond) // fix redraw issue in `screen`
@@ -552,56 +588,107 @@ func (c *sessionContext) SetSize(cols, rows int, redraw bool) error {
 	} else {
 		debug("session [%d] resize: %d, %d", c.id, cols, rows)
 	}
+
 	if err := c.pty.Resize(cols, rows); err != nil {
 		return fmt.Errorf("pty set size failed: %v", err)
 	}
+
 	c.cols, c.rows = cols, rows
 	return nil
 }
 
-func handleSessionEvent(stream Stream) {
+func (c *sessionContext) cancellableWait() {
+	newCancel := make(chan struct{})
+
+	c.waitMutex.Lock()
+	if cancel := c.waitCancel; cancel != nil {
+		close(cancel)
+	}
+	c.waitCancel = newCancel
+	c.waitMutex.Unlock()
+
+	select {
+	case <-newCancel:
+		return
+	case <-c.waitDone:
+		return
+	}
+}
+
+func (s *sshUdpServer) handleSessionEvent(stream Stream) {
+	if enableDebugLogging {
+		debug("session goroutine for client [%x] started", s.client.proxyAddr.clientID)
+		defer debug("session goroutine for client [%x] returned", s.client.proxyAddr.clientID)
+	}
+
 	var msg startMessage
 	if err := recvMessage(stream, &msg); err != nil {
 		sendError(stream, fmt.Errorf("recv start message failed: %v", err))
 		return
 	}
 
-	handleX11Request(&msg)
+	if msg.Attach {
+		sess, err := s.attachSession(stream, &msg)
+		if err != nil {
+			sendError(stream, fmt.Errorf("attach to session [%d] failed: %v", msg.ID, err))
+			return
+		}
 
-	handleAgentRequest(&msg)
+		sess.cancellableWait()
+		return
+	}
 
-	ctx, err := newSessionContext(&msg)
+	sess, err := newSessionContext(s, &msg)
 	if err != nil {
 		sendError(stream, err)
 		return
 	}
-	defer ctx.Close()
+
+	sess.handleX11Request(&msg)
+
+	sess.handleAgentRequest(&msg)
 
 	if msg.Pty {
-		err = ctx.StartPty()
+		err = sess.StartPty()
 	} else {
-		err = ctx.StartCmd()
+		err = sess.StartCmd()
 	}
 	if err != nil {
 		sendError(stream, err)
+		sess.Close()
 		return
 	}
 
 	if err := sendSuccess(stream); err != nil { // ack ok
-		warning("session ack ok failed: %v", err)
+		warning("start session ack ok failed: %v", err)
+		sess.Close()
 		return
 	}
 
 	if msg.Shell {
-		ctx.showMotd(stream)
+		sess.showMotd(stream)
 	}
 
-	ctx.forwardIO(stream)
+	sess.forwardIO(s, stream)
 
-	ctx.Wait()
+	if s.args.Attachable {
+		// Each session is started only once since duplicate session IDs are rejected,
+		// ensuring this block executes a single time without concurrency.
+		sess.waitDone = make(chan struct{})
+		go func() {
+			sess.Wait()
+			sess.Close()
+			close(sess.waitDone)
+		}()
+		sess.cancellableWait()
+		return
+	}
+
+	sess.Wait()
+	sess.Close()
 }
 
-func newSessionContext(msg *startMessage) (*sessionContext, error) {
+func newSessionContext(server *sshUdpServer, msg *startMessage) (*sessionContext, error) {
 	cmd, err := getSessionStartCmd(msg)
 	if err != nil {
 		return nil, fmt.Errorf("build start command failed: %v", err)
@@ -610,49 +697,83 @@ func newSessionContext(msg *startMessage) (*sessionContext, error) {
 	sessionMutex.Lock()
 	defer sessionMutex.Unlock()
 
-	if ctx, ok := sessionMap[msg.ID]; ok {
-		return nil, fmt.Errorf("session id %d %v existed", msg.ID, ctx.cmd.Args)
+	if sess, ok := sessionMap[msg.ID]; ok {
+		return nil, fmt.Errorf("session id %d %v existed", msg.ID, sess.cmd.Args)
 	}
 
-	ctx := &sessionContext{
-		id:   msg.ID,
-		cmd:  cmd,
-		cols: msg.Cols,
-		rows: msg.Rows,
+	if msg.ID > maxSessionID.Load() {
+		maxSessionID.Store(msg.ID)
 	}
-	sessionMap[ctx.id] = ctx
-	return ctx, nil
+
+	sess := &sessionContext{
+		id:            msg.ID,
+		cmd:           cmd,
+		cols:          msg.Cols,
+		rows:          msg.Rows,
+		clientChecker: newReplaceableTimeoutChecker(server.clientChecker),
+	}
+	sess.server.Store(server)
+
+	if sessionMap == nil {
+		sessionMap = make(map[uint64]*sessionContext)
+	}
+	sessionMap[sess.id] = sess
+	return sess, nil
+}
+
+type stderrStream struct {
+	Stream
+	id     uint64
+	wg     sync.WaitGroup
+	server *sshUdpServer
+	closed atomic.Bool
 }
 
 func (c *stderrStream) Wait() {
 	c.wg.Wait()
 }
 
-func (c *stderrStream) Close() {
+func (c *stderrStream) Close() error {
+	if !c.closed.CompareAndSwap(false, true) {
+		return nil
+	}
+
 	c.wg.Done()
-	stderrMutex.Lock()
-	defer stderrMutex.Unlock()
-	delete(stderrMap, c.id)
+
+	c.server.stderrMutex.Lock()
+	delete(c.server.stderrMap, c.id)
+	c.server.stderrMutex.Unlock()
+
+	return c.Stream.Close()
 }
 
-func newStderrStream(id uint64, stream Stream) (*stderrStream, error) {
-	stderrMutex.Lock()
-	defer stderrMutex.Unlock()
-	if _, ok := stderrMap[id]; ok {
+func (s *sshUdpServer) newStderrStream(id uint64, stream Stream) (*stderrStream, error) {
+	s.stderrMutex.Lock()
+	defer s.stderrMutex.Unlock()
+
+	if _, ok := s.stderrMap[id]; ok {
 		return nil, fmt.Errorf("session %d stderr already set", id)
 	}
-	errStream := &stderrStream{id: id, stream: stream}
+
+	errStream := &stderrStream{server: s, id: id, Stream: stream}
 	errStream.wg.Add(1)
-	stderrMap[id] = errStream
+
+	if s.stderrMap == nil {
+		s.stderrMap = make(map[uint64]*stderrStream)
+	}
+	s.stderrMap[id] = errStream
+
 	return errStream, nil
 }
 
-func getStderrStream(id uint64) *stderrStream {
-	stderrMutex.Lock()
-	defer stderrMutex.Unlock()
-	if errStream, ok := stderrMap[id]; ok {
+func (s *sshUdpServer) getStderrStream(id uint64) *stderrStream {
+	s.stderrMutex.Lock()
+	defer s.stderrMutex.Unlock()
+
+	if errStream, ok := s.stderrMap[id]; ok {
 		return errStream
 	}
+
 	return nil
 }
 
@@ -741,14 +862,19 @@ func getSubsystemCmd(name string) (*exec.Cmd, error) {
 	return exec.Command(args[0], args[1:]...), nil
 }
 
-func handleStderrEvent(stream Stream) {
+func (s *sshUdpServer) handleStderrEvent(stream Stream) {
+	if enableDebugLogging {
+		debug("stderr goroutine for client [%x] started", s.client.proxyAddr.clientID)
+		defer debug("stderr goroutine for client [%x] returned", s.client.proxyAddr.clientID)
+	}
+
 	var msg stderrMessage
 	if err := recvMessage(stream, &msg); err != nil {
 		sendError(stream, fmt.Errorf("recv stderr message failed: %v", err))
 		return
 	}
 
-	errStream, err := newStderrStream(msg.ID, stream)
+	errStream, err := s.newStderrStream(msg.ID, stream)
 	if err != nil {
 		sendError(stream, err)
 		return
@@ -762,7 +888,7 @@ func handleStderrEvent(stream Stream) {
 	errStream.Wait()
 }
 
-func handleResizeEvent(stream Stream) error {
+func (s *sshUdpServer) handleResizeEvent(stream Stream) error {
 	var msg resizeMessage
 	if err := recvMessage(stream, &msg); err != nil {
 		return fmt.Errorf("recv resize message failed: %v", err)
@@ -772,13 +898,13 @@ func handleResizeEvent(stream Stream) error {
 	}
 	sessionMutex.Lock()
 	defer sessionMutex.Unlock()
-	if ctx, ok := sessionMap[msg.ID]; ok {
-		return ctx.SetSize(msg.Cols, msg.Rows, msg.Redraw)
+	if sess, ok := sessionMap[msg.ID]; ok {
+		return sess.SetSize(msg.Cols, msg.Rows, msg.Redraw)
 	}
 	return fmt.Errorf("invalid session id: %d", msg.ID)
 }
 
-func handleX11Request(msg *startMessage) {
+func (c *sessionContext) handleX11Request(msg *startMessage) {
 	if msg.X11 == nil {
 		return
 	}
@@ -805,7 +931,7 @@ func handleX11Request(msg *startMessage) {
 		warning("X11 forwarding listen failed: %v", err)
 		return
 	}
-	onExitFuncs = append(onExitFuncs, func() {
+	addOnExitFunc(func() {
 		for _, listener := range listeners {
 			_ = listener.Close()
 		}
@@ -824,12 +950,10 @@ func handleX11Request(msg *startMessage) {
 	if err := writeXauthData(xauthPath, xauthInput); err != nil {
 		warning("write xauth data failed: %v", err)
 	}
-	onExitFuncs = append(onExitFuncs, func() {
-		_ = writeXauthData(xauthPath, fmt.Sprintf("remove %s\n", authDisplay))
-	})
+	addOnExitFunc(func() { _ = writeXauthData(xauthPath, fmt.Sprintf("remove %s\n", authDisplay)) })
 
 	for _, listener := range listeners {
-		go handleChannelAccept(listener, msg.X11.ChannelType)
+		go c.handleChannelAccept(listener, msg.X11.ChannelType)
 	}
 
 	if msg.Envs == nil {
@@ -948,7 +1072,7 @@ func writeXauthData(xauthPath, xauthInput string) error {
 	return err
 }
 
-func handleAgentRequest(msg *startMessage) {
+func (c *sessionContext) handleAgentRequest(msg *startMessage) {
 	if msg.Agent == nil {
 		return
 	}
@@ -968,7 +1092,7 @@ func handleAgentRequest(msg *startMessage) {
 		return
 	}
 
-	go handleChannelAccept(listener, msg.Agent.ChannelType)
+	go c.handleChannelAccept(listener, msg.Agent.ChannelType)
 
 	if msg.Envs == nil {
 		msg.Envs = make(map[string]string)
@@ -976,7 +1100,7 @@ func handleAgentRequest(msg *startMessage) {
 	msg.Envs["SSH_AUTH_SOCK"] = agentPath
 }
 
-func handleChannelAccept(listener net.Listener, channelType string) {
+func (c *sessionContext) handleChannelAccept(listener net.Listener, channelType string) {
 	for {
 		conn, err := listener.Accept()
 		if err != nil {
@@ -988,8 +1112,13 @@ func handleChannelAccept(listener net.Listener, channelType string) {
 			break
 		}
 		go func(conn net.Conn) {
-			id := addAcceptConn(conn)
-			if err := sendBusMessage("channel", &channelMessage{ChannelType: channelType, ID: id}); err != nil {
+			server := c.server.Load()
+			if server == nil {
+				_ = conn.Close()
+				return
+			}
+			id := server.addAcceptConn(conn)
+			if err := server.sendBusMessage("channel", &channelMessage{ChannelType: channelType, ID: id}); err != nil {
 				warning("send channel message failed: %v", err)
 			}
 		}(conn)
@@ -998,12 +1127,18 @@ func handleChannelAccept(listener net.Listener, channelType string) {
 
 func closeSession(id uint64) {
 	sessionMutex.Lock()
-	defer sessionMutex.Unlock()
-	if ctx, ok := sessionMap[id]; ok {
-		debug("closing the session [%d]", id)
-		ctx.Close()
-		delete(sessionMap, id)
+
+	sess, ok := sessionMap[id]
+	if !ok {
+		sessionMutex.Unlock()
+		return
 	}
+
+	delete(sessionMap, id)
+	sessionMutex.Unlock()
+
+	debug("closing the session [%d]", id)
+	sess.Close()
 }
 
 func closeAllSessions() {
@@ -1012,7 +1147,7 @@ func closeAllSessions() {
 	for _, session := range sessionMap {
 		sessions = append(sessions, session)
 	}
-	sessionMap = make(map[uint64]*sessionContext)
+	sessionMap = nil
 	sessionMutex.Unlock()
 
 	debug("closing all the sessions")

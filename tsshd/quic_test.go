@@ -39,9 +39,47 @@ import (
 //go:linkname estimateMaxPayloadSize github.com/quic-go/quic-go.estimateMaxPayloadSize
 func estimateMaxPayloadSize(mtu int64) int64
 
-func listenRandomUDP(t *testing.T) *net.UDPConn {
-	t.Helper()
+type udpPacketConn struct {
+	conn net.PacketConn
+}
 
+func (c *udpPacketConn) ReadFrom(buf []byte) (int, net.Addr, error) {
+	return c.conn.ReadFrom(buf)
+}
+
+func (c *udpPacketConn) WriteTo(buf []byte, addr net.Addr) (int, error) {
+	return c.conn.WriteTo(buf, addr)
+}
+
+func (c *udpPacketConn) Close() error {
+	return c.conn.Close()
+}
+
+func (c *udpPacketConn) LocalAddr() net.Addr {
+	return c.conn.LocalAddr()
+}
+
+func (c *udpPacketConn) SetDeadline(t time.Time) error {
+	return c.conn.SetDeadline(t)
+}
+
+func (c *udpPacketConn) SetReadDeadline(t time.Time) error {
+	return c.conn.SetReadDeadline(t)
+}
+
+func (c *udpPacketConn) SetWriteDeadline(t time.Time) error {
+	return c.conn.SetWriteDeadline(t)
+}
+
+func (c *udpPacketConn) SetReadBuffer(bytes int) error {
+	return nil
+}
+
+func (c *udpPacketConn) SetWriteBuffer(bytes int) error {
+	return nil
+}
+
+func listenRandomUDP(t *testing.T) *udpPacketConn {
 	const addr = "127.0.0.1:0"
 
 	udpAddr, err := net.ResolveUDPAddr("udp", addr)
@@ -54,7 +92,7 @@ func listenRandomUDP(t *testing.T) *net.UDPConn {
 		t.Fatalf("failed to listen on UDP address %q: %v", addr, err)
 	}
 
-	return conn
+	return &udpPacketConn{conn}
 }
 
 // TestQUIC_InitialPacketSize verifies that listenQUIC clamps
@@ -65,15 +103,15 @@ func listenRandomUDP(t *testing.T) *net.UDPConn {
 // this adjustment, newQuicDatagramConn must be updated accordingly.
 func TestQUIC_InitialPacketSize(t *testing.T) {
 	verifyInitialPacketSize := func(requestedMTU, expectedMTU uint16) {
-		t.Helper()
-
-		info := &ServerInfo{}
-		conn := listenRandomUDP(t)
-		defer func() { _ = conn.Close() }()
+		info := &ServerInfo{MTU: requestedMTU}
+		svrConn := listenRandomUDP(t)
+		defer func() { _ = svrConn.Close() }()
+		cliConn := listenRandomUDP(t)
+		defer func() { _ = cliConn.Close() }()
 
 		// Server
 		quicConfig.InitialPacketSize = 0
-		listener, err := listenQUIC(conn, info, requestedMTU)
+		listener, err := listenQUIC(svrConn, info, requestedMTU)
 		if err != nil {
 			t.Fatalf("listenQUIC failed (mtu=%d): %v", requestedMTU, err)
 		}
@@ -97,18 +135,13 @@ func TestQUIC_InitialPacketSize(t *testing.T) {
 			close(acceptDone)
 		}()
 
-		// mock GetMaxDatagramSize
-		old := getMaxDatagramSizeFunc
-		defer func() { getMaxDatagramSizeFunc = old }()
-		getMaxDatagramSizeFunc = func(c *SshUdpClient) uint16 { return requestedMTU }
-
 		// Client
 		quicConfig.InitialPacketSize = 0
 		client, err := newQuicClient(&UdpClientOptions{
 			ServerInfo:     info,
 			ProxyClient:    &SshUdpClient{},
 			ConnectTimeout: 3 * time.Second,
-		}, conn.LocalAddr().String())
+		}, cliConn, svrConn.LocalAddr())
 		if err != nil {
 			t.Fatalf("newQuicClient failed (mtu=%d): %v", requestedMTU, err)
 		}
@@ -121,14 +154,14 @@ func TestQUIC_InitialPacketSize(t *testing.T) {
 		}
 	}
 
+	// MTU below min
+	verifyInitialPacketSize(kQuicMinMTU-1, kQuicMinMTU)
+
 	// Default MTU
 	verifyInitialPacketSize(kDefaultMTU, kDefaultMTU)
 
 	// MTU above max
 	verifyInitialPacketSize(kQuicMaxMTU+1, kQuicMaxMTU)
-
-	// MTU below min
-	verifyInitialPacketSize(kQuicMinMTU-1, kQuicMinMTU)
 }
 
 // TestQUIC_ShortHeaderSize ensures that the constant kQuicShortHeaderSize
@@ -151,50 +184,42 @@ func TestQUIC_ShortHeaderSize(t *testing.T) {
 	}
 }
 
-type udpTestConn struct {
-	t    *testing.T
-	conn net.PacketConn
-	mtu  int
-	cnt  atomic.Int32
+type mtuTestConn struct {
+	*udpPacketConn
+	t   *testing.T
+	mtu int
+	cnt atomic.Int32
 }
 
-func (u *udpTestConn) ReadFrom(p []byte) (n int, addr net.Addr, err error) {
-	n, addr, err = u.conn.ReadFrom(p)
+func (c *mtuTestConn) ReadFrom(buf []byte) (n int, addr net.Addr, err error) {
+	n, addr, err = c.conn.ReadFrom(buf)
 	if err != nil {
 		return
 	}
-	if n > u.mtu {
-		u.t.Fatalf("received datagram size %d exceeds MTU %d", n, u.mtu)
+	if n > c.mtu {
+		c.t.Fatalf("received datagram size %d exceeds MTU %d", n, c.mtu)
 	}
-	u.cnt.Add(1)
+	c.cnt.Add(1)
 	return
 }
 
-func (u *udpTestConn) WriteTo(p []byte, addr net.Addr) (n int, err error) {
-	if len(p) > u.mtu {
-		u.t.Fatalf("datagram size %d exceeds MTU %d", len(p), u.mtu)
+func (c *mtuTestConn) WriteTo(buf []byte, addr net.Addr) (int, error) {
+	if len(buf) > c.mtu {
+		c.t.Fatalf("datagram size %d exceeds MTU %d", len(buf), c.mtu)
 	}
-	u.cnt.Add(1)
-	return u.conn.WriteTo(p, addr)
+	c.cnt.Add(1)
+	return c.conn.WriteTo(buf, addr)
 }
-
-func (u *udpTestConn) Close() error                       { return u.conn.Close() }
-func (u *udpTestConn) LocalAddr() net.Addr                { return u.conn.LocalAddr() }
-func (u *udpTestConn) SetDeadline(t time.Time) error      { return u.conn.SetDeadline(t) }
-func (u *udpTestConn) SetReadDeadline(t time.Time) error  { return u.conn.SetReadDeadline(t) }
-func (u *udpTestConn) SetWriteDeadline(t time.Time) error { return u.conn.SetWriteDeadline(t) }
-func (c *udpTestConn) SetReadBuffer(bytes int) error      { return nil }
-func (c *udpTestConn) SetWriteBuffer(bytes int) error     { return nil }
 
 func TestQUIC_RespectMTU(t *testing.T) {
 	const mtu = 1400
 	const streamSize = mtu * 5
 
-	info := &ServerInfo{}
-	conn := &udpTestConn{t: t, conn: listenRandomUDP(t), mtu: mtu}
-	defer func() { _ = conn.Close() }()
+	info := &ServerInfo{MTU: mtu}
+	svrConn := &mtuTestConn{udpPacketConn: listenRandomUDP(t), t: t, mtu: mtu}
+	defer func() { _ = svrConn.Close() }()
 
-	listener, err := listenQUIC(conn, info, mtu)
+	listener, err := listenQUIC(svrConn, info, mtu)
 	if err != nil {
 		t.Fatalf("listenQUIC failed: %v", err)
 	}
@@ -285,22 +310,19 @@ func TestQUIC_RespectMTU(t *testing.T) {
 	// ----------------- client -----------------
 	go func() {
 		defer close(clientErrCh)
-		// mock GetMaxDatagramSize
-		old := getMaxDatagramSizeFunc
-		defer func() { getMaxDatagramSizeFunc = old }()
-		getMaxDatagramSizeFunc = func(c *SshUdpClient) uint16 { return mtu }
 
+		cliConn := listenRandomUDP(t)
+		defer func() { _ = cliConn.Close() }()
 		client, err := newQuicClient(&UdpClientOptions{
 			ServerInfo:     info,
 			ProxyClient:    &SshUdpClient{},
 			ConnectTimeout: 3 * time.Second,
-		}, conn.LocalAddr().String())
+		}, cliConn, svrConn.LocalAddr())
 		if err != nil {
 			clientErrCh <- fmt.Errorf("client failed to dial QUIC server: %w", err)
 			return
 		}
 		defer func() { _ = client.closeClient() }()
-		c := client.(*quicClient).conn
 
 		data := make([]byte, streamSize)
 		for i := range data {
@@ -311,7 +333,7 @@ func TestQUIC_RespectMTU(t *testing.T) {
 		streamErrCh := make(chan error, 1)
 		go func() {
 			defer close(streamErrCh)
-			stream, err := c.OpenStreamSync(ctx)
+			stream, err := client.conn.OpenStreamSync(ctx)
 			if err != nil {
 				streamErrCh <- fmt.Errorf("client failed to open stream: %w", err)
 				return
@@ -338,7 +360,7 @@ func TestQUIC_RespectMTU(t *testing.T) {
 		size := mtu - kQuicShortHeaderSize
 
 		// oversized datagram must be rejected by QUIC
-		if err := c.SendDatagram(data[:size+1]); err == nil {
+		if err := client.conn.SendDatagram(data[:size+1]); err == nil {
 			clientErrCh <- fmt.Errorf("expected oversized datagram to be rejected, but send succeeded")
 			return
 		}
@@ -346,11 +368,11 @@ func TestQUIC_RespectMTU(t *testing.T) {
 		// valid datagrams must be echoed correctly
 		for range 100 {
 			packet := data[:size]
-			if err := c.SendDatagram(packet); err != nil {
+			if err := client.conn.SendDatagram(packet); err != nil {
 				clientErrCh <- fmt.Errorf("client datagram send error: %w", err)
 				return
 			}
-			resp, err := c.ReceiveDatagram(ctx)
+			resp, err := client.conn.ReceiveDatagram(ctx)
 			if err != nil {
 				clientErrCh <- fmt.Errorf("client datagram receive error: %w", err)
 				return
@@ -385,18 +407,18 @@ func TestQUIC_RespectMTU(t *testing.T) {
 	}
 
 	// sanity check: ensure UDP layer was exercised sufficiently.
-	if got := conn.cnt.Load(); got < 300 {
+	if got := svrConn.cnt.Load(); got < 300 {
 		t.Fatalf("insufficient UDP traffic observed: cnt=%d", got)
 	}
 }
 
 func TestQUIC_CertValidation(t *testing.T) {
 	info := ServerInfo{}
-	conn := listenRandomUDP(t)
-	defer func() { _ = conn.Close() }()
+	svrConn := listenRandomUDP(t)
+	defer func() { _ = svrConn.Close() }()
 
 	// Start QUIC server
-	listener, err := listenQUIC(conn, &info, 0)
+	listener, err := listenQUIC(svrConn, &info, 0)
 	if err != nil {
 		t.Fatalf("listenQUIC failed: %v", err)
 	}
@@ -416,6 +438,16 @@ func TestQUIC_CertValidation(t *testing.T) {
 			return
 		}
 		defer func() { _ = conn.CloseWithError(0, "") }()
+
+		// Immediately close any additional accepted connections so that
+		// only the intended connection is used in this test.
+		go func() {
+			for {
+				if conn, err := listener.Accept(context.Background()); err == nil {
+					_ = conn.CloseWithError(0, "")
+				}
+			}
+		}()
 
 		// accept one stream
 		stream, err := conn.AcceptStream(ctx)
@@ -453,18 +485,24 @@ func TestQUIC_CertValidation(t *testing.T) {
 	illegalInfo.ClientKey = fmt.Sprintf("%x", illegalKeyPEM)
 	// The client does not know whether it failed, so we don't assert here.
 	// If it happens to succeed, case 3 (valid certificates) will fail later.
-	_, _ = newQuicClient(&UdpClientOptions{ServerInfo: &illegalInfo, ConnectTimeout: 3 * time.Second}, conn.LocalAddr().String())
+	cliConn1 := listenRandomUDP(t)
+	defer func() { _ = cliConn1.Close() }()
+	_, _ = newQuicClient(&UdpClientOptions{ServerInfo: &illegalInfo, ConnectTimeout: 3 * time.Second}, cliConn1, svrConn.LocalAddr())
 
 	// Case 2: Invalid server certificate
 	illegalInfo = info
 	illegalInfo.ServerCert = fmt.Sprintf("%x", illegalCertPEM)
-	_, err = newQuicClient(&UdpClientOptions{ServerInfo: &illegalInfo, ConnectTimeout: 3 * time.Second}, conn.LocalAddr().String())
+	cliConn2 := listenRandomUDP(t)
+	defer func() { _ = cliConn2.Close() }()
+	_, err = newQuicClient(&UdpClientOptions{ServerInfo: &illegalInfo, ConnectTimeout: 3 * time.Second}, cliConn2, svrConn.LocalAddr())
 	if err == nil {
 		t.Fatalf("Client should not succeed with invalid server certificate")
 	}
 
 	// Case 3: Valid client and server certificates
-	client, err := newQuicClient(&UdpClientOptions{ServerInfo: &info, ConnectTimeout: 3 * time.Second}, conn.LocalAddr().String())
+	cliConn3 := listenRandomUDP(t)
+	defer func() { _ = cliConn3.Close() }()
+	client, err := newQuicClient(&UdpClientOptions{ServerInfo: &info, ConnectTimeout: 3 * time.Second}, cliConn3, svrConn.LocalAddr())
 	if err != nil {
 		// If this fails, it could be because case 1 succeeded with an invalid client certificate.
 		t.Fatalf("Valid client certificate should succeed: %v", err)
@@ -478,7 +516,7 @@ func TestQUIC_CertValidation(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	stream, err := client.(*quicClient).conn.OpenStreamSync(ctx)
+	stream, err := client.conn.OpenStreamSync(ctx)
 	if err != nil {
 		t.Fatalf("client failed to open stream: %v", err)
 	}

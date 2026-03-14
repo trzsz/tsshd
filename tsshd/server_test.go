@@ -25,41 +25,56 @@ SOFTWARE.
 package tsshd
 
 import (
+	"net"
+	dbg "runtime/debug"
 	"testing"
-
-	"github.com/stretchr/testify/assert"
 )
 
-func TestParsePortRanges(t *testing.T) {
-	enableWarning := enableWarningLogging
-	enableWarningLogging = false
-	defer func() { enableWarningLogging = enableWarning }()
+func TestServerLazyMap(t *testing.T) {
+	defer func() {
+		if r := recover(); r != nil {
+			t.Fatalf("panic: %v\n%s", r, dbg.Stack())
+		}
+	}()
 
-	assert := assert.New(t)
-	assert.Equal([][2]uint16{{22, 22}}, parsePortRanges("22"))
-	assert.Equal([][2]uint16{{100, 102}}, parsePortRanges("100-102"))
-	assert.Equal([][2]uint16{{200, 202}}, parsePortRanges("200 - 202"))
-	assert.Equal([][2]uint16{{10, 10}, {20, 20}, {30, 30}}, parsePortRanges("10 20 30"))
-	assert.Equal([][2]uint16{{1, 3}, {5, 5}, {7, 9}, {11, 11}}, parsePortRanges("1-3 5,7 - 9 11"))
-	assert.Equal([][2]uint16{{1, 2}, {3, 4}, {5, 5}}, parsePortRanges("1-2,3-4 5"))
-	assert.Equal([][2]uint16{{10, 12}, {15, 15}}, parsePortRanges("  10\t-\t12  , 15 "))
-	assert.Equal([][2]uint16{{50, 50}}, parsePortRanges("50-50"))
-	assert.Equal([][2]uint16{{10, 10}, {20, 20}}, parsePortRanges("10,,20"))
-	assert.Equal([][2]uint16(nil), parsePortRanges("0,70000,abc"))
-	assert.Equal([][2]uint16(nil), parsePortRanges("100-50"))
-	assert.Equal([][2]uint16(nil), parsePortRanges("-"))
-	assert.Equal([][2]uint16(nil), parsePortRanges("- 10"))
-	assert.Equal([][2]uint16(nil), parsePortRanges("10 -"))
-	assert.Equal([][2]uint16{{1, 3}, {7, 7}}, parsePortRanges("1-3,abc,5 - 4,7"))
-	assert.Equal([][2]uint16(nil), parsePortRanges(""))
-	assert.Equal([][2]uint16(nil), parsePortRanges("8000-9000-10000"))
-	assert.Equal([][2]uint16(nil), parsePortRanges("8000-"))
-	assert.Equal([][2]uint16(nil), parsePortRanges("-9000"))
-	assert.Equal([][2]uint16{{10, 12}}, parsePortRanges("10 - 12 - 15"))
-	assert.Equal([][2]uint16{{1, 65535}}, parsePortRanges("1-65535"))
-	assert.Equal([][2]uint16{{10, 10}, {10, 10}, {10, 10}}, parsePortRanges("10 10 10"))
-	assert.Equal([][2]uint16{{20, 25}, {22, 23}}, parsePortRanges("20-25 22-23"))
-	assert.Equal([][2]uint16(nil), parsePortRanges("10 - 0"))
-	assert.Equal([][2]uint16(nil), parsePortRanges("10 - - 11"))
-	assert.Equal([][2]uint16{{10, 11}}, parsePortRanges("10 - 11 -"))
+	server := &sshUdpServer{}
+
+	if conn := server.takeAcceptConn(123); conn != nil {
+		t.Fatalf("accept conn expected nil, got %v", conn)
+	}
+
+	if sess := server.takeUdpFwdPendingSession(789); sess != nil {
+		t.Fatalf("pending session expected nil, got %v", sess)
+	}
+
+	server.releaseUdpForwardSession(&udpForwardSession{}) // should not panic
+
+	dummyConn := &net.TCPConn{}
+	id := server.addAcceptConn(dummyConn)
+	if conn := server.takeAcceptConn(id); conn != dummyConn {
+		t.Fatalf("accept conn mismatch, expected ptr %p, got %v", dummyConn, conn)
+	}
+
+	dummySess := &udpForwardSession{}
+	server.addUdpFwdPendingSession(100, dummySess)
+	if sess := server.takeUdpFwdPendingSession(100); sess != dummySess {
+		t.Fatalf("pending session mismatch, expected ptr %p, got %v", dummySess, sess)
+	}
+
+	server.proto = &kcpServer{}
+	sess, exists := server.acquireUdpForwardSession("key", "udp", "", nil, nil)
+	if exists {
+		t.Fatalf("expected new session, got exists=true")
+	}
+	if sess == nil {
+		t.Fatalf("acquired session is nil")
+	}
+	if size := len(server.udpFwdSessionMap); size != 1 {
+		t.Fatalf("expected session map size 1, got %d", size)
+	}
+
+	server.releaseUdpForwardSession(sess)
+	if size := len(server.udpFwdSessionMap); size != 0 {
+		t.Fatalf("expected session map size 0 after release, got %d", size)
+	}
 }

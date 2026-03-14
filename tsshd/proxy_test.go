@@ -25,7 +25,15 @@ SOFTWARE.
 package tsshd
 
 import (
+	"bytes"
+	"encoding/json"
+	"io"
+	"net"
+	"os"
+	"strconv"
+	"sync"
 	"testing"
+	"time"
 )
 
 func TestPacketCache_Basic(t *testing.T) {
@@ -137,4 +145,217 @@ func TestPacketCache_ClearAndReuse(t *testing.T) {
 			t.Fatalf("reuse mismatch at %d, got %d", i, got[i])
 		}
 	}
+}
+
+type echoServer struct {
+	t *testing.T
+}
+
+func (m *echoServer) handleStream(stream Stream) {
+	buf := make([]byte, 4096)
+	for {
+		n, err := stream.Read(buf)
+		if err != nil {
+			if !isClosedError(err) {
+				m.t.Fatalf("server read failed: %v", err)
+			}
+			return
+		}
+		if _, err := stream.Write(buf[:n]); err != nil {
+			m.t.Fatalf("server write failed: %v", err)
+			return
+		}
+	}
+}
+
+func runStreamEchoTest(t *testing.T, stream Stream) {
+	for size := 1; size <= 2000; size += 3 {
+
+		send := make([]byte, size)
+		for i := range send {
+			send[i] = byte(i)
+		}
+
+		_, err := stream.Write(send)
+		if err != nil {
+			t.Fatalf("client write failed: %v", err)
+		}
+
+		recv := make([]byte, size)
+
+		_, err = io.ReadFull(stream, recv)
+		if err != nil {
+			t.Fatalf("client read failed: %v", err)
+		}
+
+		if !bytes.Equal(send, recv) {
+			t.Fatalf("echo mismatch size=%d", size)
+		}
+	}
+}
+
+func runProxyEchoTest(t *testing.T, args *tsshdArgs) {
+	oriNew := newSshUdpServer
+	defer func() {
+		newSshUdpServer = oriNew
+		cleanupOnExit()
+	}()
+
+	server := &echoServer{t}
+	newSshUdpServer = func(args *tsshdArgs, proxy *serverProxy, addr net.Addr, proto protocolServer) streamHandler {
+		return server
+	}
+
+	if args.KCP && args.Attachable || !args.KCP && !args.Attachable {
+		_ = os.Unsetenv("SSH_CONNECTION")
+		if v := os.Getenv("SSH_CONNECTION"); v != "" {
+			t.Fatalf("SSH_CONNECTION should be unset, got %q", v)
+		}
+	} else {
+		const kSshConn = "127.0.0.1 50818 127.0.0.1 22"
+		_ = os.Setenv("SSH_CONNECTION", kSshConn)
+		if v := os.Getenv("SSH_CONNECTION"); v != kSshConn {
+			t.Fatalf("SSH_CONNECTION mismatch: want %q, got %q", kSshConn, v)
+		}
+	}
+
+	output, err := initServer(args)
+	if err != nil {
+		t.Fatalf("init server failed: %v", err)
+	}
+
+	var info ServerInfo
+	if err := json.Unmarshal([]byte(output), &info); err != nil {
+		t.Fatalf("json unmarshal failed: %v", err)
+	}
+
+	opts := &UdpClientOptions{
+		TsshdAddr:        net.JoinHostPort("127.0.0.1", strconv.Itoa(info.Port)),
+		ServerInfo:       &info,
+		ConnectTimeout:   args.ConnectTimeout,
+		HeartbeatTimeout: 3 * time.Second,
+	}
+
+	clientCount := 1
+	if args.Attachable {
+		clientCount = 3
+	}
+
+	var wg sync.WaitGroup
+
+	for range clientCount {
+		wg.Go(func() {
+			proxy, err := startClientProxy(&SshUdpClient{}, opts)
+			if err != nil {
+				t.Fatalf("start client proxy failed: %v", err)
+			}
+			defer func() { _ = proxy.Close() }()
+
+			if err := proxy.renewTransportPath(nil, opts.ConnectTimeout); err != nil {
+				t.Fatalf("renew transport path failed: %v", err)
+			}
+
+			proto, err := newProtoClient(nil, opts, proxy, proxy.remoteAddr)
+			if err != nil {
+				t.Fatalf("new proto client failed: %v", err)
+			}
+			defer func() { _ = proto.closeClient() }()
+
+			stream, err := proto.newStream(time.Second)
+			if err != nil {
+				t.Fatalf("proto new stream failed: %v", err)
+			}
+			defer func() { _ = stream.Close() }()
+
+			runStreamEchoTest(t, stream)
+
+			if err := proxy.renewTransportPath(nil, opts.ConnectTimeout); err != nil {
+				t.Fatalf("renew transport path failed: %v", err)
+			}
+
+			runStreamEchoTest(t, stream)
+		})
+	}
+
+	wg.Wait()
+}
+
+func TestProxy_QUIC(t *testing.T) {
+	runProxyEchoTest(t, &tsshdArgs{
+		KCP:            false,
+		TCP:            false,
+		Attachable:     false,
+		Port:           "31000-65000",
+		ConnectTimeout: 3 * time.Second,
+	})
+}
+
+func TestProxy_QUIC_TCP(t *testing.T) {
+	runProxyEchoTest(t, &tsshdArgs{
+		KCP:            false,
+		TCP:            true,
+		Attachable:     false,
+		Port:           "31000-65000",
+		ConnectTimeout: 3 * time.Second,
+	})
+}
+
+func TestProxy_QUIC_Attachable(t *testing.T) {
+	runProxyEchoTest(t, &tsshdArgs{
+		KCP:            false,
+		TCP:            false,
+		Attachable:     true,
+		Port:           "31000-65000",
+		ConnectTimeout: 3 * time.Second,
+	})
+}
+
+func TestProxy_QUIC_TCP_Attachable(t *testing.T) {
+	runProxyEchoTest(t, &tsshdArgs{
+		KCP:            false,
+		TCP:            true,
+		Attachable:     true,
+		Port:           "31000-65000",
+		ConnectTimeout: 3 * time.Second,
+	})
+}
+
+func TestProxy_KCP(t *testing.T) {
+	runProxyEchoTest(t, &tsshdArgs{
+		KCP:            true,
+		TCP:            false,
+		Attachable:     false,
+		Port:           "31000-65000",
+		ConnectTimeout: 3 * time.Second,
+	})
+}
+
+func TestProxy_KCP_TCP(t *testing.T) {
+	runProxyEchoTest(t, &tsshdArgs{
+		KCP:            true,
+		TCP:            true,
+		Attachable:     false,
+		Port:           "31000-65000",
+		ConnectTimeout: 3 * time.Second,
+	})
+}
+
+func TestProxy_KCP_Attachable(t *testing.T) {
+	runProxyEchoTest(t, &tsshdArgs{
+		KCP:            true,
+		TCP:            false,
+		Attachable:     true,
+		Port:           "31000-65000",
+		ConnectTimeout: 3 * time.Second,
+	})
+}
+
+func TestProxy_KCP_TCP_Attachable(t *testing.T) {
+	runProxyEchoTest(t, &tsshdArgs{
+		KCP:            true,
+		TCP:            true,
+		Attachable:     true,
+		Port:           "31000-65000",
+		ConnectTimeout: 3 * time.Second,
+	})
 }

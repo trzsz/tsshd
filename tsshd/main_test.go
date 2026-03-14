@@ -25,47 +25,44 @@ SOFTWARE.
 package tsshd
 
 import (
-	"bytes"
-	"fmt"
+	"sync"
+	"sync/atomic"
+	"testing"
 )
 
-func extractTmuxOutputPrefix(cacheLines [][]byte) string {
-	tmuxOutputCount := 0
-	for _, line := range cacheLines {
-		if len(line) == 0 || line[0] != '%' {
-			continue
-		}
-		var idx int
-		if bytes.HasPrefix(line, []byte("%output %")) {
-			idx = 8
-		} else if bytes.HasPrefix(line, []byte("%extended-output %")) {
-			idx = 17
-		}
-		if idx > 0 {
-			tmuxOutputCount++
-			// In tmux Control Mode, a large number of output messages are expected.
-			// Extract the pane ID once enough output lines are observed.
-			if tmuxOutputCount >= min(10, maxPendingOutputLines) {
-				rest := line[idx:]
-				if pos := bytes.IndexByte(rest, ' '); pos > 0 {
-					return "%output " + string(rest[:pos+1])
-				}
-			}
-		}
-	}
-	return ""
-}
+func TestAddOnExitFunc_Concurrent(t *testing.T) {
+	onExitMutex.Lock()
+	saved := append([]func(){}, onExitFuncs...)
+	onExitFuncs = nil
+	onExitMutex.Unlock()
+	defer func() {
+		onExitMutex.Lock()
+		onExitFuncs = saved
+		onExitMutex.Unlock()
+	}()
 
-func encodeTmuxOutput(prefix string, output []byte) []byte {
-	buffer := bytes.NewBuffer(make([]byte, 0, len(prefix)+len(output)<<2+2))
-	buffer.Write([]byte(prefix))
-	for _, b := range output {
-		if b < ' ' || b == '\\' || b > '~' {
-			fmt.Fprintf(buffer, "\\%03o", b)
-		} else {
-			buffer.WriteByte(b)
-		}
+	var executed atomic.Int32
+	const total = 200
+	var wg sync.WaitGroup
+	wg.Add(total)
+	for range total {
+		go func() {
+			defer wg.Done()
+			addOnExitFunc(func() {
+				executed.Add(1)
+			})
+		}()
 	}
-	buffer.Write([]byte("\r\n"))
-	return buffer.Bytes()
+	wg.Wait()
+
+	cleanupOnExit()
+
+	if got := executed.Load(); got != total {
+		t.Fatalf("cleanupOnExit executed %d handlers, want %d", got, total)
+	}
+	onExitMutex.Lock()
+	defer onExitMutex.Unlock()
+	if len(onExitFuncs) != 0 {
+		t.Fatalf("cleanupOnExit should drain handlers, got %d remaining", len(onExitFuncs))
+	}
 }

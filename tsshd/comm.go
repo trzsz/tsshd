@@ -39,18 +39,11 @@ import (
 	"github.com/quic-go/quic-go"
 )
 
-type globalSettings struct {
-	keepPendingInput  atomic.Bool
-	keepPendingOutput atomic.Bool
-}
-
-var globalSetting = &globalSettings{}
-
 var enableDebugLogging bool = false
 var enableWarningLogging bool = false
 
-var clientDebug func(int64, string)
-var clientWarningFunc func(string)
+var clientDebugFn func(int64, string)
+var clientWarningFn func(string)
 
 var debugMsgChan chan *debugMessage
 var initDebugSenderOnce sync.Once
@@ -65,20 +58,22 @@ func debug(format string, a ...any) {
 
 	msg := fmt.Sprintf(format, a...)
 
-	if clientDebug != nil {
+	if clientDebugFn != nil {
 		// should not reach here
-		clientDebug(time.Now().UnixMilli(), fmt.Sprintf("[fix_me] %s", msg))
+		clientDebugFn(time.Now().UnixMilli(), fmt.Sprintf("[fix_me] %s", msg))
 		return
 	}
 
 	initDebugSenderOnce.Do(func() {
 		debugMsgChan = make(chan *debugMessage, 100)
 		busClosingWG.Go(func() {
-			for !isBusStreamInited() {
-				time.Sleep(10 * time.Millisecond)
-			}
 			for msg := range debugMsgChan {
-				_ = sendBusMessage("debug", msg)
+				server := activeSshUdpServer.Load()
+				for server == nil {
+					time.Sleep(100 * time.Millisecond)
+					server = activeSshUdpServer.Load()
+				}
+				_ = server.sendBusMessage("debug", msg)
 			}
 		})
 	})
@@ -105,20 +100,22 @@ func warning(format string, a ...any) {
 
 	msg := fmt.Sprintf(format, a...)
 
-	if clientWarningFunc != nil {
+	if clientWarningFn != nil {
 		// should not reach here
-		clientWarningFunc(fmt.Sprintf("[fix_me] %s", msg))
+		clientWarningFn(fmt.Sprintf("[fix_me] %s", msg))
 		return
 	}
 
 	initWarningSenderOnce.Do(func() {
 		warningMsgChan = make(chan string, 10)
 		busClosingWG.Go(func() {
-			for !isBusStreamInited() {
-				time.Sleep(10 * time.Millisecond)
-			}
 			for msg := range warningMsgChan {
-				_ = sendBusMessage("error", errorMessage{Msg: msg})
+				server := activeSshUdpServer.Load()
+				for server == nil {
+					time.Sleep(100 * time.Millisecond)
+					server = activeSshUdpServer.Load()
+				}
+				_ = server.sendBusMessage("error", errorMessage{Msg: msg})
 			}
 		})
 	})

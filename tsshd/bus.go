@@ -26,55 +26,38 @@ package tsshd
 
 import (
 	"fmt"
-	"os"
-	"os/signal"
 	"sync"
 	"sync/atomic"
-	"syscall"
 	"time"
 )
-
-var serving atomic.Bool
-
-var busStream Stream
-var busMutex sync.Mutex
 
 var busClosing atomic.Bool
 var busClosingMu sync.Mutex
 var busClosingWG sync.WaitGroup
 
-var clientAliveTime aliveTime
-var pendingClearPktCache bool
-
-func sendBusMessage(command string, msg any) error {
-	busMutex.Lock()
-	defer busMutex.Unlock()
-	if busStream == nil {
+func (s *sshUdpServer) sendBusMessage(command string, msg any) error {
+	s.busMutex.Lock()
+	defer s.busMutex.Unlock()
+	if s.busStream == nil {
 		return fmt.Errorf("bus stream is nil")
 	}
-	return sendCommandAndMessage(busStream, command, msg)
+	return sendCommandAndMessage(s.busStream, command, msg)
 }
 
-func initBusStream(stream Stream) error {
-	busMutex.Lock()
-	defer busMutex.Unlock()
+func (s *sshUdpServer) initBusStream(stream Stream) error {
+	s.busMutex.Lock()
+	defer s.busMutex.Unlock()
 
 	// only one bus
-	if busStream != nil {
+	if s.busStream != nil {
 		return fmt.Errorf("bus has been initialized")
 	}
 
-	busStream = stream
+	s.busStream = stream
 	return nil
 }
 
-func isBusStreamInited() bool {
-	busMutex.Lock()
-	defer busMutex.Unlock()
-	return busStream != nil
-}
-
-func handleBusEvent(stream Stream) {
+func (s *sshUdpServer) handleBusEvent(stream Stream) {
 	var msg busMessage
 	if err := recvMessage(stream, &msg); err != nil {
 		sendError(stream, fmt.Errorf("recv bus message failed: %v", err))
@@ -91,50 +74,59 @@ func handleBusEvent(stream Stream) {
 		return
 	}
 
-	if err := initBusStream(stream); err != nil {
+	if err := s.initBusStream(stream); err != nil {
 		sendError(stream, err)
 		return
 	}
 
-	if err := sendSuccess(stream); err != nil { // ack ok
-		warning("bus ack ok failed: %v", err)
+	s.initClientChecker(msg.HeartbeatTimeout)
+	s.clientAliveTime.addMilli(time.Now().UnixMilli())
+	s.aliveTimeout, s.intervalTime = msg.AliveTimeout, msg.IntervalTime
+
+	if err := s.activateServer(); err != nil {
+		sendError(stream, err)
 		return
 	}
 
-	serving.Store(true)
+	if err := sendResponse(stream, &busResponse{NextSessionID: maxSessionID.Load() + 1}); err != nil { // ack ok
+		warning("send bus response failed: %v", err)
+		return
+	}
 
-	intervalTime := int64(msg.IntervalTime / time.Millisecond)
-	heartbeatTimeout := int64(msg.HeartbeatTimeout / time.Millisecond)
-
-	globalServerProxy.clientChecker.timeoutMilli.Store(heartbeatTimeout)
-
-	clientAliveTime.addMilli(time.Now().UnixMilli())
-	go keepAlive(msg.AliveTimeout, msg.IntervalTime)
+	intervalTimeMilli := int64(msg.IntervalTime / time.Millisecond)
+	heartbeatTimeoutMilli := int64(msg.HeartbeatTimeout / time.Millisecond)
 
 	for {
 		command, err := recvCommand(stream)
 		if err != nil {
 			if isClosedError(err) {
-				break
+				return
 			}
 			warning("recv bus command failed: %v", err)
-			break
+			return
+		}
+
+		if server := activeSshUdpServer.Load(); server != s {
+			if enableDebugLogging {
+				_ = s.sendBusMessage("debug", debugMessage{Msg: "server instance is no longer active", Time: time.Now().UnixMilli()})
+			}
+			return
 		}
 
 		switch command {
-		case "exit":
-			err = handleExitEvent(stream)
-		case "resize":
-			err = handleResizeEvent(stream)
-		case "close":
-			handleCloseEvent()
+		case "exit": // close a session
+			err = s.handleExitEvent(stream)
+		case "resize": // resize a session
+			err = s.handleResizeEvent(stream)
+		case "close": // close bus and exit tsshd
+			s.handleCloseEvent()
 			return // return will close the bus stream
 		case "alive":
-			err = handleAliveEvent(stream, heartbeatTimeout, intervalTime)
+			err = s.handleAliveEvent(stream, heartbeatTimeoutMilli, intervalTimeMilli)
 		case "setting":
-			err = handleSettingEvent(stream)
+			err = s.handleSettingEvent(stream)
 		case "rekey":
-			err = handleRekeyEvent(stream)
+			err = s.handleRekeyEvent(stream)
 		default:
 			if err := handleUnknownEvent(stream, command); err != nil {
 				warning("handle bus command [%s] failed: %v. You may need to upgrade tsshd.", command, err)
@@ -146,7 +138,7 @@ func handleBusEvent(stream Stream) {
 	}
 }
 
-func handleExitEvent(stream Stream) error {
+func (s *sshUdpServer) handleExitEvent(stream Stream) error {
 	var exitMsg exitMessage
 	if err := recvMessage(stream, &exitMsg); err != nil {
 		return fmt.Errorf("recv exit message failed: %v", err)
@@ -155,7 +147,7 @@ func handleExitEvent(stream Stream) error {
 	return nil
 }
 
-func handleCloseEvent() {
+func (s *sshUdpServer) handleCloseEvent() {
 	closeAllSessions()
 	debug("close bus and exit tsshd")
 
@@ -173,11 +165,11 @@ func handleCloseEvent() {
 
 	go func() {
 		time.Sleep(200 * time.Millisecond) // give udp some time
-		exitChan <- 0
+		exitWithCode(kExitCodeNormal)
 	}()
 }
 
-func handleAliveEvent(stream Stream, heartbeatTimeout, intervalTime int64) error {
+func (s *sshUdpServer) handleAliveEvent(stream Stream, heartbeatTimeoutMilli, intervalTimeMilli int64) error {
 	var msg aliveMessage
 	if err := recvMessage(stream, &msg); err != nil {
 		return fmt.Errorf("recv alive message failed: %v", err)
@@ -188,50 +180,59 @@ func handleAliveEvent(stream Stream, heartbeatTimeout, intervalTime int64) error
 	// If the time since the last recorded activity exceeds heartbeatTimeout,
 	// it indicates that the client was previously disconnected and has now reconnected.
 	// Set the flag to clear the packet cache after the client stabilizes.
-	if now-clientAliveTime.latest() > heartbeatTimeout {
-		debug("client reconnected, last active at %v", time.UnixMilli(clientAliveTime.latest()).Format("15:04:05.000"))
-		pendingClearPktCache = true
-	} else if enableDebugLogging && pendingClearPktCache {
+	if now-s.clientAliveTime.latest() > heartbeatTimeoutMilli {
+		debug("client reconnected, last active at %v", time.UnixMilli(s.clientAliveTime.latest()).Format("15:04:05.000"))
+		s.pendingClearPktCache = true
+	} else if enableDebugLogging && s.pendingClearPktCache {
 		debug("client active at %v", time.UnixMilli(now).Format("15:04:05.000"))
 	}
 
-	clientAliveTime.addMilli(now)
+	s.clientAliveTime.addMilli(now)
 
-	if pendingClearPktCache {
+	if s.pendingClearPktCache {
 		// If the client has remained active for a sufficient number of intervals,
 		// consider the connection stable and clear the packet cache.
-		if now-clientAliveTime.oldest() < (kAliveTimeCap+1)*intervalTime {
-			totalSize, totalCount := globalServerProxy.pktCache.clearCache()
+		if now-s.clientAliveTime.oldest() < (kAliveTimeCap+1)*intervalTimeMilli {
+			totalSize, totalCount := s.client.pktCache.clearCache()
 			if enableDebugLogging && (totalSize > 0 || totalCount > 0) {
 				debug("drop packet cache count [%d] size [%d]", totalCount, totalSize)
 			}
-			pendingClearPktCache = false
+			s.pendingClearPktCache = false
 		}
 	}
 
-	return sendBusMessage("alive", msg)
+	return s.sendBusMessage("alive", msg)
 }
 
-func handleSettingEvent(stream Stream) error {
+func (s *sshUdpServer) handleSettingEvent(stream Stream) error {
 	var msg settingsMessage
 	if err := recvMessage(stream, &msg); err != nil {
 		return fmt.Errorf("recv settings message failed: %v", err)
 	}
 	if msg.KeepPendingInput != nil {
-		globalSetting.keepPendingInput.Store(*msg.KeepPendingInput)
+		s.keepPendingInput.Store(*msg.KeepPendingInput)
 	}
 	if msg.KeepPendingOutput != nil {
-		globalSetting.keepPendingOutput.Store(*msg.KeepPendingOutput)
+		s.keepPendingOutput.Store(*msg.KeepPendingOutput)
 	}
 	return nil
 }
 
-func handleRekeyEvent(stream Stream) error {
+func (s *sshUdpServer) handleRekeyEvent(stream Stream) error {
 	var msg rekeyMessage
 	if err := recvMessage(stream, &msg); err != nil {
 		return fmt.Errorf("recv rekey message failed: %v", err)
 	}
-	return globalProtoServer.handleRekeyEvent(&msg)
+
+	crypto := s.client.kcpCrypto.Load()
+	if crypto == nil {
+		return fmt.Errorf("rekey failed: crypto is nil")
+	}
+	if err := crypto.handleServerRekey(s, &msg); err != nil {
+		return fmt.Errorf("rekey failed: %v", err)
+	}
+
+	return nil
 }
 
 func handleUnknownEvent(stream Stream, command string) error {
@@ -240,34 +241,4 @@ func handleUnknownEvent(stream Stream, command string) error {
 		return fmt.Errorf("recv message for unknown command [%s] failed: %v", command, err)
 	}
 	return fmt.Errorf("unknown command: %s", command)
-}
-
-func keepAlive(aliveTimeout time.Duration, intervalTime time.Duration) {
-	timeoutMilli := int64(aliveTimeout / time.Millisecond)
-	for {
-		if time.Now().UnixMilli()-clientAliveTime.latest() > timeoutMilli {
-			warning("tsshd keep alive timeout")
-			exitChan <- 2
-			return
-		}
-		time.Sleep(intervalTime)
-	}
-}
-
-func handleExitSignals() {
-	sigChan := make(chan os.Signal, 1)
-	signal.Notify(sigChan,
-		syscall.SIGTERM, // Default signal for the kill command
-		syscall.SIGHUP,  // Terminal closed (System reboot/shutdown)
-		os.Interrupt,    // Ctrl+C signal
-	)
-	go func() {
-		sig := <-sigChan
-		_ = sendBusMessage("quit", quitMessage{fmt.Sprintf("receiving signal [%v] from the operating system", sig)})
-		go func() {
-			time.Sleep(1000 * time.Millisecond) // give udp some time
-			debug("quit by signal wait timeout")
-			exitChan <- 3
-		}()
-	}()
 }

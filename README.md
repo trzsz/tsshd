@@ -1,16 +1,16 @@
-## tsshd - tssh udp server that supports connection migration for roaming
+## tsshd: UDP-based SSH Server with Roaming Support
 
 [![MIT License](https://img.shields.io/badge/license-MIT-green.svg?style=flat)](https://choosealicense.com/licenses/mit/)
 [![GitHub Release](https://img.shields.io/github/v/release/trzsz/tsshd)](https://github.com/trzsz/tsshd/releases)
 [![中文文档](https://img.shields.io/badge/%E4%B8%AD%E6%96%87-%E6%96%87%E6%A1%A3-blue?style=flat)](https://github.com/trzsz/tsshd/blob/main/README.cn.md)
 
-trzsz-ssh ( tssh ) with tsshd supports intermittent connectivity, allows roaming, and can be used on high-latency links such as cellular data connections, unstable Wi-Fi, etc.
+tsshd is a UDP-based SSH server built for unreliable networks. It supports seamless roaming across networks and IP changes, and works well on high-latency links such as cellular connections and unstable Wi-Fi.
 
-It aims to provide complete compatibility with openssh, mirroring all its features, while also offering additional useful features not found in the openssh client, plus:
+tsshd aims to be fully compatible with OpenSSH while providing additional capabilities:
 
-- Keeps the session alive if the client goes to sleep and wakes up later, or temporarily loses its connection.
-
-- Allows the client to "roam" and change IP addresses, switching between any networks, while keeping alive.
+- Survives sleep, wake, and temporary network loss.
+- Roams seamlessly across networks and IP changes.
+- Supports UDP port forwarding (Local and Remote).
 
 ### Comparison
 
@@ -39,109 +39,23 @@ tssh and tsshd works exactly like ssh, there are no plans to support local echo 
 
 2. Install [tsshd](https://github.com/trzsz/tsshd?tab=readme-ov-file#installation) on the server ( the remote host ).
 
-3. Use `tssh --udp xxx` to log in (latency-sensitive users can specify `--kcp` option). Or configure as follows in `~/.ssh/config` to omit `--udp` or `--kcp` option:
-
-   ```
-   Host xxx
-       #!! UdpMode Yes/QUIC/KCP
-   ```
+3. Use `tssh --udp xxx` to log in. The usage is the same as standard SSH.
+   - Latency-sensitive users can specify the `--kcp` option.
+   - Alternatively, configure the following in `~/.ssh/config` to omit the `--udp` or `--kcp` option:
+     ```
+     Host xxx
+         #!! UdpMode  ( Yes | QUIC | KCP )
+     ```
 
 ### How it works
 
-- The `tssh` plays the role of `ssh` on the client side, and the `tsshd` plays the role of `sshd` on the server side.
+- The `tssh` plays the role of `ssh` on the client side, while the `tsshd` acts as `sshd` on the server side.
 
-- The `tssh` will first login to the server normally as an ssh client, and then run a new `tsshd` process on the server.
+- The `tssh` first logs in to the server normally as an ssh client, and then starts a new `tsshd` process on the server, where each session has its own `tsshd` process.
 
-- The `tsshd` process listens on a random udp port between 61001 and 61999 (can be customized by `TsshdPort`), and sends its port number and some secret keys back to the `tssh` process over the ssh channel. The ssh connection is then shut down, and the `tssh` process communicates with the `tsshd` process over udp.
-
-### Reconnection
-
-```
-┌───────────────────────┐                ┌───────────────────────┐
-│                       │                │                       │
-│    tssh (process)     │                │    tsshd (process)    │
-│                       │                │                       │
-│ ┌───────────────────┐ │                │ ┌───────────────────┐ │
-│ │                   │ │                │ │                   │ │
-│ │  KCP/QUIC Client  │ │                │ │  KCP/QUIC Server  │ │
-│ │                   │ │                │ │                   │ │
-│ └───────┬───▲───────┘ │                │ └───────┬───▲───────┘ │
-│         │   │         │                │         │   │         │
-│         │   │         │                │         │   │         │
-│ ┌───────▼───┴───────┐ │                │ ┌───────▼───┴───────┐ │
-│ │                   ├─┼────────────────┼─►                   │ │
-│ │   Client  Proxy   │ │                │ │   Server  Proxy   │ │
-│ │                   ◄─┼────────────────┼─┤                   │ │
-│ └───────────────────┘ │                │ └───────────────────┘ │
-└───────────────────────┘                └───────────────────────┘
-```
-
-- The client `KCP/QUIC Client` and `Client Proxy` are on the same machine and in the same process, and the connection between them will not be interrupted.
-
-- The server `KCP/QUIC Server` and `Server Proxy` are on the same machine and in the same process, and the connection between them will not be interrupted.
-
-- If the client doesn't receive a heartbeat from the server for a period of time, it might be due to network changes causing the original connection to be interrupted. In this case, the `Client Proxy` will re-establish a connection to the `Server Proxy`, and communicate through the new connection after successful authentication. From the perspective of the `KCP/QUIC Client` and the `KCP/QUIC Server`, the connection is never interrupted.
-
-### Security
-
-- The `KCP/QUIC Server` listens only on the localhost at 127.0.0.1, and accepts only one connection. Once the `Server Proxy` in the same process successfully connects, all other connections will be rejected.
-
-- The `Client Proxy` listens only on the localhost at 127.0.0.1, and accepts only one connection. Once the `KCP/QUIC Client` in the same process successfully connects, all other connections will be rejected.
-
-- The `Server Proxy` only forwards packets from the unique and authenticated `Client Proxy`. The `Client Proxy` can change its IP address and port, but once a new `Client Proxy` is authenticated, the `Server Proxy` will only forward packets from the new `Client Proxy`, ignoring the old `Client Proxy` address.
-
-- The `Client Proxy` connects for the first time or reconnects to the `Server Proxy` after changing its IP address and port, it needs to send an authentication message (encrypted using the AES-GCM-256 algorithm, with a one-time key randomly generated by the server, which is sent to the client via the SSH tunnel during login). After the `Server Proxy` successfully decrypts the authentication message (without tampering), it verifies that whether the client ID matches the expectations and whether the sequence number is greater than the sequence number in all previous authentication messages. If so, it marks the client address as an authenticated address and sends an authentication confirmation message (encrypted using the AES-GCM-256 algorithm) to the client. After the `Client Proxy` receives the authentication confirmation message from the `Server Proxy` and decrypts it successfully (without tampering), it verifies the server ID and the sequence number. If they match the expectations, it starts communicating with the `Server Proxy` using the new address, forwarding messages from the local process `KCP/QUIC Client` to the `Server Proxy`. The `Server Proxy` then forwards the messages to the local process `KCP/QUIC Server` service.
-
-- The `KCP/QUIC Client` and the `KCP/QUIC Server` use the open-source [KCP](https://github.com/xtaci/kcp-go) / [QUIC](https://github.com/quic-go/quic-go) protocols, and use encrypted transmission (the key is a one-time key randomly generated by the server, which is sent to the client via the SSH tunnel during login).
-
-### Configurations
-
-```
-Host xxx
-    #!! UdpMode Yes
-    #!! TsshdPort 61001-61999
-    #!! TsshdPath ~/go/bin/tsshd
-    #!! UdpAliveTimeout 86400
-    #!! UdpHeartbeatTimeout 3
-    #!! UdpReconnectTimeout 15
-    #!! ShowNotificationOnTop yes
-    #!! ShowFullNotifications yes
-    #!! UdpProxyMode UDP
-    #!! UdpMTU 1400
-```
-
-- `UdpMode`: `No` (the default: tssh works in TCP mode), `Yes` (default protocol: `QUIC`), `QUIC` ([QUIC](https://github.com/quic-go/quic-go) protocol: faster speed), `KCP` ([KCP](https://github.com/xtaci/kcp-go) protocol: lower latency).
-
-- `TsshdPort`: Specifies the port range that tsshd listens on, default is [61001, 61999]. You can specify multiple discrete ports (e.g., `6022,7022`) or multiple discrete ranges (e.g., `8010-8020,9020-9030,10080`); tsshd will randomly choose an available port. You can also specify the port on the command line using `--tsshd-port`.
-
-- `TsshdPath`: Specifies the path to the tsshd binary on the server, lookup in $PATH if not configured. You can also specify the path on the command line using `--tsshd-path`.
-
-- `UdpAliveTimeout`: If the disconnection lasts longer than `UdpAliveTimeout` in seconds, tssh and tsshd will both exit, and no longer support reconnection. The default is 86400 seconds.
-
-- `UdpHeartbeatTimeout`: If the disconnection lasts longer than `UdpHeartbeatTimeout` in seconds, tssh will try to reconnect to the server by a new path. The default is 3 seconds.
-
-- `UdpReconnectTimeout`: If the disconnection lasts longer than `UdpReconnectTimeout` in seconds, tssh will display a notification indicating that the connection has been lost. The default is 15 seconds.
-
-- `ShowNotificationOnTop`: Whether the connection loss notification is displayed on the top. The default is yes, which may overwrite some of the previous output. Set it to `No` to display notifications on the current line of the cursor.
-
-- `ShowFullNotifications`: Whether to display the full notifications or a brief notification. The default is yes, which may output several lines to the screen. Set it to `No` will output only one line.
-
-- `UdpProxyMode`: The default transport protocol is `UDP`. If `UDP` traffic is blocked by firewalls in your network environment, you can set it to `TCP` to work around the restriction, though this may introduce additional latency.
-
-- `UdpMTU`: Sets the maximum transmission unit (MTU) for UDP packets. Default is 1400.
+- The `tsshd` process listens on a random UDP port in the range 61001–61999 (configurable via `TsshdPort`), and sends the port number and session secret keys back to the `tssh` process through the SSH channel. The SSH connection is then closed, and `tssh` communicates with `tsshd` over UDP.
 
 ### Installation
-
-- Install with Homebrew on macOS
-
-  <details><summary><code>brew install tsshd</code></summary>
-
-  ```sh
-  brew update
-  brew install tsshd
-  ```
-
-  </details>
 
 - Install with apt on Ubuntu
 
@@ -210,6 +124,16 @@ Host xxx
 
   </details>
 
+- Install with Homebrew on MacOS
+
+  <details><summary><code>brew install tsshd</code></summary>
+
+  ```sh
+  brew install tsshd
+  ```
+
+  </details>
+
 - Install with scoop on Windows
 
   <details><summary><code>scoop install tsshd</code></summary>
@@ -267,6 +191,90 @@ Host xxx
   ```
 
   </details>
+
+### Supported Terminals
+
+The following clients or terminals support the `tsshd` server:
+
+- [trzsz-ssh](https://github.com/trzsz/trzsz-ssh) ( tssh ) – An SSH client designed as a drop-in replacement for the OpenSSH client.
+
+- [rootshell](https://github.com/kitknox/rootshell) - A free, Metal-accelerated terminal emulator for iPhone, iPad, Vision Pro, and Mac.
+
+### Reconnection
+
+```
+┌───────────────────────┐                ┌───────────────────────┐
+│                       │                │                       │
+│    tssh (process)     │                │    tsshd (process)    │
+│                       │                │                       │
+│ ┌───────────────────┐ │                │ ┌───────────────────┐ │
+│ │                   │ │                │ │                   │ │
+│ │  KCP/QUIC Client  │ │                │ │  KCP/QUIC Server  │ │
+│ │                   │ │                │ │                   │ │
+│ └───────┬───▲───────┘ │                │ └───────┬───▲───────┘ │
+│         │   │         │                │         │   │         │
+│         │   │         │                │         │   │         │
+│ ┌───────▼───┴───────┐ │                │ ┌───────▼───┴───────┐ │
+│ │                   ├─┼────────────────┼─►                   │ │
+│ │   Client  Proxy   │ │                │ │   Server  Proxy   │ │
+│ │                   ◄─┼────────────────┼─┤                   │ │
+│ └───────────────────┘ │                │ └───────────────────┘ │
+└───────────────────────┘                └───────────────────────┘
+```
+
+- The client `KCP/QUIC Client` and `Client Proxy` are on the same machine and in the same process, and the connection between them will not be interrupted.
+
+- The server `KCP/QUIC Server` and `Server Proxy` are on the same machine and in the same process, and the connection between them will not be interrupted.
+
+- If the client doesn't receive a heartbeat from the server for a period of time, it might be due to network changes causing the original connection to be interrupted. In this case, the `Client Proxy` will re-establish a connection to the `Server Proxy`, and communicate through the new connection after successful authentication. From the perspective of the `KCP/QUIC Client` and the `KCP/QUIC Server`, the connection is never interrupted.
+
+### Security Model
+
+- `Client Proxy` and `KCP/QUIC Client` run in the same process, and `Server Proxy` and `KCP/QUIC Server` run in the same process on the server. The proxy implements the `net.PacketConn` interface, so packets are exchanged **directly in memory** rather than through the local network stack. This prevents other local processes from intercepting or injecting packets.
+
+- `Server Proxy` accepts packets from **only one authenticated client address at a time**. If the client reconnects from a new IP or port (for example after a network change), the new `Client Proxy` must authenticate again. Once authenticated, the new address replaces the previous one and packets from the old address are ignored.
+
+- When a `Client Proxy` connects or reconnects, it sends an **authentication packet** encrypted with **AES-256-GCM**. The encryption key is a session-specific key generated by the server and delivered to the client through the SSH channel during login.
+
+- The `Server Proxy` verifies the client ID and ensures that the authentication sequence number is strictly monotonically increasing across all previously observed authentication packets to prevent replay attacks. Upon successful verification, the server marks the client address as authenticated and responds with an encrypted authentication acknowledgment.
+
+- Communication between the client and server uses encrypted transports provided by [kcp-go](https://github.com/xtaci/kcp-go) or [quic-go](https://github.com/quic-go/quic-go). QUIC uses **TLS 1.3** as the underlying security protocol to ensure confidentiality and integrity of transmitted data, and supports **key updates** throughout the connection lifecycle. For KCP, a custom rekey mechanism is implemented to periodically rotate encryption keys with **forward secrecy**, ensuring that all traffic remains encrypted end-to-end.
+
+### Configurations
+
+```
+Host xxx
+    #!! UdpMode Yes
+    #!! TsshdPort 61001-61999
+    #!! TsshdPath ~/go/bin/tsshd
+    #!! UdpAliveTimeout 86400
+    #!! UdpHeartbeatTimeout 3
+    #!! UdpReconnectTimeout 15
+    #!! ShowNotificationOnTop yes
+    #!! ShowFullNotifications yes
+    #!! UdpProxyMode UDP
+    #!! UdpMTU 1400
+```
+
+- `UdpMode`: `No` (the default: tssh works in TCP mode), `Yes` (default protocol: `QUIC`), `QUIC` ([QUIC](https://github.com/quic-go/quic-go) protocol: faster speed), `KCP` ([KCP](https://github.com/xtaci/kcp-go) protocol: lower latency).
+
+- `TsshdPort`: Specifies the port range that tsshd listens on, default is [61001, 61999]. You can specify multiple discrete ports (e.g., `6022,7022`) or multiple discrete ranges (e.g., `8010-8020,9020-9030,10080`); tsshd will randomly choose an available port. You can also specify the port on the command line using `--tsshd-port`.
+
+- `TsshdPath`: Specifies the path to the tsshd binary on the server, lookup in $PATH if not configured. You can also specify the path on the command line using `--tsshd-path`.
+
+- `UdpAliveTimeout`: If the disconnection lasts longer than `UdpAliveTimeout` in seconds, tssh and tsshd will both exit, and no longer support reconnection. The default is 86400 seconds.
+
+- `UdpHeartbeatTimeout`: If the disconnection lasts longer than `UdpHeartbeatTimeout` in seconds, tssh will try to reconnect to the server by a new path. The default is 3 seconds.
+
+- `UdpReconnectTimeout`: If the disconnection lasts longer than `UdpReconnectTimeout` in seconds, tssh will display a notification indicating that the connection has been lost. The default is 15 seconds.
+
+- `ShowNotificationOnTop`: Whether the connection loss notification is displayed on the top. The default is yes, which may overwrite some of the previous output. Set it to `No` to display notifications on the current line of the cursor.
+
+- `ShowFullNotifications`: Whether to display the full notifications or a brief notification. The default is yes, which may output several lines to the screen. Set it to `No` will output only one line.
+
+- `UdpProxyMode`: The default transport protocol is `UDP`. If `UDP` traffic is blocked by firewalls in your network environment, you can set it to `TCP` to work around the restriction, though this may introduce additional latency.
+
+- `UdpMTU`: Sets the maximum transmission unit (MTU) for UDP packets. Default is 1400.
 
 ### Contact
 

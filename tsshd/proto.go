@@ -110,6 +110,15 @@ type busMessage struct {
 	HeartbeatTimeout time.Duration `json:",omitempty"`
 }
 
+type busResponse struct {
+	errorMessage
+	NextSessionID uint64 `json:",omitempty"`
+}
+
+func (d *busResponse) getErrorMessage() *errorMessage {
+	return &d.errorMessage
+}
+
 type x11RequestMessage struct {
 	ChannelType      string `json:",omitempty"`
 	SingleConnection bool   `json:",omitempty"`
@@ -123,17 +132,19 @@ type agentRequestMessage struct {
 }
 
 type startMessage struct {
-	ID    uint64               `json:",omitempty"`
-	Pty   bool                 `json:",omitempty"`
-	Shell bool                 `json:",omitempty"`
-	Name  string               `json:",omitempty"`
-	Args  []string             `json:",omitempty"`
-	Cols  int                  `json:",omitempty"`
-	Rows  int                  `json:",omitempty"`
-	Envs  map[string]string    `json:",omitempty"`
-	X11   *x11RequestMessage   `json:",omitempty"`
-	Agent *agentRequestMessage `json:",omitempty"`
-	Subs  string               `json:",omitempty"`
+	ID     uint64               `json:",omitempty"`
+	Pty    bool                 `json:",omitempty"`
+	Shell  bool                 `json:",omitempty"`
+	Name   string               `json:",omitempty"`
+	Args   []string             `json:",omitempty"`
+	Cols   int                  `json:",omitempty"`
+	Rows   int                  `json:",omitempty"`
+	Envs   map[string]string    `json:",omitempty"`
+	X11    *x11RequestMessage   `json:",omitempty"`
+	Agent  *agentRequestMessage `json:",omitempty"`
+	Subs   string               `json:",omitempty"`
+	Attach bool                 `json:",omitempty"`
+	ErrID  uint64               `json:",omitempty"`
 }
 
 type exitMessage struct {
@@ -389,6 +400,8 @@ type kcpClient struct {
 }
 
 func (c *kcpClient) closeClient() error {
+	c.crypto.Close()
+	c.forwarder.Close()
 	return c.session.Close()
 }
 
@@ -414,6 +427,7 @@ type quicClient struct {
 }
 
 func (c *quicClient) closeClient() error {
+	c.forwarder.Close()
 	return c.conn.CloseWithError(0, "")
 }
 
@@ -436,20 +450,20 @@ func (c *quicClient) newStream(connectTimeout time.Duration) (Stream, error) {
 	return &quicStream{stream, c.conn}, err
 }
 
-func newProtoClient(client *SshUdpClient, opts *UdpClientOptions, addr string) (protocolClient, error) {
+func newProtoClient(client *SshUdpClient, opts *UdpClientOptions, udpConn net.PacketConn, remoteAddr net.Addr) (protocolClient, error) {
 	switch opts.ServerInfo.Mode {
 	case "":
 		return nil, fmt.Errorf("%s", "Please upgrade tsshd")
 	case kUdpModeKCP:
-		return newKcpClient(client, opts, addr)
+		return newKcpClient(client, opts, udpConn, remoteAddr)
 	case kUdpModeQUIC:
-		return newQuicClient(opts, addr)
+		return newQuicClient(opts, udpConn, remoteAddr)
 	default:
 		return nil, fmt.Errorf("unknown tsshd mode: %s", opts.ServerInfo.Mode)
 	}
 }
 
-func newKcpClient(client *SshUdpClient, opts *UdpClientOptions, addr string) (protocolClient, error) {
+func newKcpClient(client *SshUdpClient, opts *UdpClientOptions, udpConn net.PacketConn, remoteAddr net.Addr) (*kcpClient, error) {
 	pass, err := hex.DecodeString(opts.ServerInfo.Pass)
 	if err != nil {
 		return nil, fmt.Errorf("decode pass [%s] failed: %w", opts.ServerInfo.Pass, err)
@@ -465,9 +479,9 @@ func newKcpClient(client *SshUdpClient, opts *UdpClientOptions, addr string) (pr
 	}
 	block := kcp.NewAEADCrypt(crypto)
 
-	conn, err := kcp.DialWithOptions(addr, block, 1, 1)
+	conn, err := kcp.NewConn2(remoteAddr, block, 1, 1, udpConn)
 	if err != nil {
-		return nil, fmt.Errorf("kcp dial [%s] failed: %w", addr, err)
+		return nil, fmt.Errorf("kcp new conn [%v] failed: %w", remoteAddr.String(), err)
 	}
 	conn.SetWindowSize(1024, 1024)
 	conn.SetNoDelay(1, 10, 2, 1)
@@ -488,7 +502,7 @@ func newKcpClient(client *SshUdpClient, opts *UdpClientOptions, addr string) (pr
 	return &kcpClient{conn, session, &udpForwarder{conn: newKcpDatagramConn(conn)}, crypto}, nil
 }
 
-func newQuicClient(opts *UdpClientOptions, addr string) (protocolClient, error) {
+func newQuicClient(opts *UdpClientOptions, udpConn net.PacketConn, remoteAddr net.Addr) (*quicClient, error) {
 	serverCert, err := hex.DecodeString(opts.ServerInfo.ServerCert)
 	if err != nil {
 		return nil, fmt.Errorf("decode server cert [%s] failed: %w", opts.ServerInfo.ServerCert, err)
@@ -526,9 +540,9 @@ func newQuicClient(opts *UdpClientOptions, addr string) (protocolClient, error) 
 
 	ctx, cancel := context.WithTimeout(context.Background(), opts.ConnectTimeout)
 	defer cancel()
-	conn, err := quic.DialAddr(ctx, addr, tlsConfig, &quicConfig)
+	conn, err := quic.Dial(ctx, udpConn, remoteAddr, tlsConfig, &quicConfig)
 	if err != nil {
-		return nil, fmt.Errorf("quic dail [%s] failed: %w", addr, err)
+		return nil, fmt.Errorf("quic dail [%v] failed: %w", remoteAddr.String(), err)
 	}
 	return &quicClient{conn, &udpForwarder{conn: newQuicDatagramConn(conn)}}, nil
 }

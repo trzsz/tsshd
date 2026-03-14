@@ -30,18 +30,13 @@ import (
 	"os"
 	"strings"
 	"sync"
-	"sync/atomic"
 )
-
-var acceptMutex sync.Mutex
-var acceptID atomic.Uint64
-var acceptMap = make(map[uint64]net.Conn)
 
 func sendProhibited(stream Stream, option string) {
 	sendErrorCode(stream, ErrProhibited, fmt.Sprintf("Check [%s] in [%s] on the server.", option, sshdConfigPath))
 }
 
-func handleDialEvent(stream Stream) {
+func (s *sshUdpServer) handleDialEvent(stream Stream) {
 	var msg dialMessage
 	if err := recvMessage(stream, &msg); err != nil {
 		sendError(stream, fmt.Errorf("recv dial message failed: %v", err))
@@ -89,14 +84,14 @@ func handleDialEvent(stream Stream) {
 		resp.RemoteAddr = addr
 	}
 	if err := sendResponse(stream, &resp); err != nil { // ack ok
-		warning("dial ack ok failed: %v", err)
+		warning("send dial response failed: %v", err)
 		return
 	}
 
-	forwardConnection(stream, conn)
+	s.forwardConnection(stream, conn)
 }
 
-func handleListenEvent(stream Stream) {
+func (s *sshUdpServer) handleListenEvent(stream Stream) {
 	var msg listenMessage
 	if err := recvMessage(stream, &msg); err != nil {
 		sendError(stream, fmt.Errorf("recv listen message failed: %v", err))
@@ -126,7 +121,7 @@ func handleListenEvent(stream Stream) {
 		return
 	}
 
-	onExitFuncs = append(onExitFuncs, func() {
+	addOnExitFunc(func() {
 		_ = listener.Close()
 		if msg.Net == "unix" {
 			_ = os.Remove(msg.Addr)
@@ -149,9 +144,9 @@ func handleListenEvent(stream Stream) {
 			warning("listener [%s] [%s] accept failed: %v", msg.Net, msg.Addr, err)
 			break
 		}
-		id := addAcceptConn(conn)
+		id := s.addAcceptConn(conn)
 		if err := sendMessage(stream, acceptMessage{id}); err != nil {
-			if conn := getAcceptConn(id); conn != nil {
+			if conn := s.takeAcceptConn(id); conn != nil {
 				_ = conn.Close()
 			}
 			if isClosedError(err) {
@@ -164,14 +159,14 @@ func handleListenEvent(stream Stream) {
 	}
 }
 
-func handleAcceptEvent(stream Stream) {
+func (s *sshUdpServer) handleAcceptEvent(stream Stream) {
 	var msg acceptMessage
 	if err := recvMessage(stream, &msg); err != nil {
 		sendError(stream, fmt.Errorf("recv accept message failed: %v", err))
 		return
 	}
 
-	conn := getAcceptConn(msg.ID)
+	conn := s.takeAcceptConn(msg.ID)
 	if conn == nil {
 		sendError(stream, fmt.Errorf("invalid accept id: %d", msg.ID))
 		return
@@ -184,35 +179,42 @@ func handleAcceptEvent(stream Stream) {
 		return
 	}
 
-	forwardConnection(stream, conn)
+	s.forwardConnection(stream, conn)
 }
 
-func addAcceptConn(conn net.Conn) uint64 {
-	acceptMutex.Lock()
-	defer acceptMutex.Unlock()
-	id := acceptID.Add(1) - 1
-	acceptMap[id] = conn
+func (s *sshUdpServer) addAcceptConn(conn net.Conn) uint64 {
+	s.fwdAcceptMutex.Lock()
+	defer s.fwdAcceptMutex.Unlock()
+
+	if s.fwdAcceptMap == nil {
+		s.fwdAcceptMap = make(map[uint64]net.Conn)
+	}
+
+	id := s.nextFwdAcceptID.Add(1) - 1
+	s.fwdAcceptMap[id] = conn
 	return id
 }
 
-func getAcceptConn(id uint64) net.Conn {
-	acceptMutex.Lock()
-	defer acceptMutex.Unlock()
-	if conn, ok := acceptMap[id]; ok {
-		delete(acceptMap, id)
+func (s *sshUdpServer) takeAcceptConn(id uint64) net.Conn {
+	s.fwdAcceptMutex.Lock()
+	defer s.fwdAcceptMutex.Unlock()
+
+	if conn, ok := s.fwdAcceptMap[id]; ok {
+		delete(s.fwdAcceptMap, id)
 		return conn
 	}
+
 	return nil
 }
 
-func forwardConnection(stream Stream, conn net.Conn) {
+func (s *sshUdpServer) forwardConnection(stream Stream, conn net.Conn) {
 	var wg sync.WaitGroup
-	wg.Go(func() { forwardConnInput(stream, conn) })
-	wg.Go(func() { forwardConnOutput(stream, conn) })
+	wg.Go(func() { s.forwardConnInput(stream, conn) })
+	wg.Go(func() { s.forwardConnOutput(stream, conn) })
 	wg.Wait()
 }
 
-func forwardConnInput(stream Stream, conn net.Conn) {
+func (s *sshUdpServer) forwardConnInput(stream Stream, conn net.Conn) {
 	buffer := make([]byte, 32*1024)
 	for {
 		n, err := stream.Read(buffer)
@@ -233,13 +235,13 @@ func forwardConnInput(stream Stream, conn net.Conn) {
 	_ = stream.CloseRead()
 }
 
-func forwardConnOutput(stream Stream, conn net.Conn) {
+func (s *sshUdpServer) forwardConnOutput(stream Stream, conn net.Conn) {
 	buffer := make([]byte, 32*1024)
 	for {
 		n, err := conn.Read(buffer)
 		if n > 0 {
-			if globalServerProxy.clientChecker.isTimeout() {
-				if globalServerProxy.clientChecker.waitUntilReconnected() != nil {
+			if s.clientChecker.isTimeout() {
+				if s.clientChecker.waitUntilReconnected() != nil {
 					break
 				}
 			}
