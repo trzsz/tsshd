@@ -92,6 +92,18 @@ func (s *replaceableStream) do(fn func(Stream) error) error {
 
 		s.mu.Lock()
 		switched := s.stream != cur
+
+		// When the stream errors without being replaced (e.g., old client
+		// force-quit), self-detach by nilling the stream and waiting for
+		// a replacement. Without this, forwardInput exits and closes PTY stdin,
+		// killing the shell before a new client can attach.
+		if !switched && err != nil {
+			s.stream = nil
+			s.mu.Unlock()
+			_ = cur.Close()
+			continue // loop back to wait for new stream via swap()
+		}
+
 		s.mu.Unlock()
 
 		if switched {
