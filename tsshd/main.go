@@ -138,13 +138,15 @@ func parseTsshdArgs() *tsshdArgs {
 	return args
 }
 
+const kEnvTsshdBackground = "TRZSZ-SSHD-BACKGROUND"
+
 func background() (bool, io.ReadCloser, error) {
-	if v := os.Getenv("TRZSZ-SSHD-BACKGROUND"); v == "TRUE" {
+	if v := os.Getenv(kEnvTsshdBackground); v == "TRUE" {
 		return false, nil, nil
 	}
 	cmd := exec.Command(os.Args[0], os.Args[1:]...)
 	cmd.Stderr = os.Stderr
-	cmd.Env = append(os.Environ(), "TRZSZ-SSHD-BACKGROUND=TRUE")
+	cmd.Env = append(os.Environ(), kEnvTsshdBackground+"=TRUE")
 	cmd.SysProcAttr = getSysProcAttr()
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {

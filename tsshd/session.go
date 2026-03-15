@@ -845,6 +845,9 @@ func getSessionStartCmd(msg *startMessage) (*exec.Cmd, error) {
 			continue
 		}
 		name := strings.TrimSpace(env[:pos])
+		if name == kEnvTsshdBackground {
+			continue
+		}
 		if _, ok := msg.Envs[name]; !ok {
 			envs = append(envs, env)
 		}
@@ -1012,10 +1015,7 @@ func (c *sessionContext) handleX11Request(msg *startMessage) {
 		go c.handleChannelAccept(listener, msg.X11.ChannelType)
 	}
 
-	if msg.Envs == nil {
-		msg.Envs = make(map[string]string)
-	}
-	msg.Envs["DISPLAY"] = display
+	c.cmd.Env = append(c.cmd.Env, fmt.Sprintf("DISPLAY=%s", display))
 }
 
 func getHostnameForX11(useLocalhost bool) string {
@@ -1150,10 +1150,7 @@ func (c *sessionContext) handleAgentRequest(msg *startMessage) {
 
 	go c.handleChannelAccept(listener, msg.Agent.ChannelType)
 
-	if msg.Envs == nil {
-		msg.Envs = make(map[string]string)
-	}
-	msg.Envs["SSH_AUTH_SOCK"] = agentPath
+	c.cmd.Env = append(c.cmd.Env, fmt.Sprintf("SSH_AUTH_SOCK=%s", agentPath))
 }
 
 func (c *sessionContext) handleChannelAccept(listener net.Listener, channelType string) {
