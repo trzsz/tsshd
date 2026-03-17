@@ -175,10 +175,14 @@ func (s *sshUdpServer) activateServer() error {
 			// from exiting unexpectedly while the old client is still connected.
 			oldServer.closeActiveStreams()
 
-			debug("new client [%x] notifying old client [%x] to quit", s.client.proxyAddr.clientID, oldServer.client.proxyAddr.clientID)
-			_ = oldServer.sendBusMessage("quit", quitMessage{fmt.Sprintf("another client attached from %s", s.client.remoteAddr())})
-			time.Sleep(time.Second) // give udp some time
-			oldServer.Close()
+			if oldServer.clientChecker.isTimeout() {
+				oldServer.Close()
+			} else {
+				debug("new client [%x] notifying old client [%x] to quit", s.client.proxyAddr.clientID, oldServer.client.proxyAddr.clientID)
+				_ = oldServer.sendBusMessage("quit", quitMessage{fmt.Sprintf("another client attached from %s", s.client.remoteAddr())})
+				time.Sleep(time.Second) // give udp some time
+				oldServer.Close()
+			}
 		}()
 	}
 
