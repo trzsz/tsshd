@@ -146,11 +146,41 @@ func (c *clientState) setAuthedAddr(addr *net.UDPAddr) {
 
 	if addr != nil && conn != nil {
 		conn.addAuthedMap(c)
+
+		// Based on logs, we observed an issue when using QUIC:
+		// multiple "authed" events occur, but no subsequent client packets
+		// are received, causing the connection to remain stuck in the auth stage.
+		// As a workaround, attempt to flush cached UDP packets here to see if it
+		// helps QUIC resume normal communication.
+		go func() {
+			time.Sleep(time.Second)
+			if c.authedAddr.Load() == addr {
+				hasCache := c.sendPacketCache(conn)
+				if enableDebugLogging && !hasCache {
+					debug("auth stage timeout but no cached packets to flush")
+				}
+			}
+		}()
 	}
 
 	if oldAddr != nil && conn != nil {
 		conn.delAuthedMap(oldAddr)
 	}
+}
+
+func (c *clientState) sendPacketCache(conn frontendConnection) bool {
+	flushSize, flushCount := c.pktCache.sendCache(func(b []byte) error {
+		conn.writeTo(b, c)
+		return nil
+	})
+
+	hasCache := flushSize > 0 || flushCount > 0
+
+	if enableDebugLogging && hasCache {
+		debug("send packet cache count [%d] size [%d]", flushCount, flushSize)
+	}
+
+	return hasCache
 }
 
 func newClientState(clientID uint64) *clientState {
@@ -753,13 +783,7 @@ func (p *serverProxy) onNewClientConn(client *clientState) {
 		// from being delivered after reconnection.
 		server.enablePendingInputDiscard()
 
-		flushSize, flushCount := client.pktCache.sendCache(func(b []byte) error {
-			p.frontendConn.writeTo(b, client)
-			return nil
-		})
-		if enableDebugLogging && (flushSize > 0 || flushCount > 0) {
-			debug("send packet cache count [%d] size [%d]", flushCount, flushSize)
-		}
+		client.sendPacketCache(p.frontendConn)
 	}
 }
 
@@ -793,13 +817,7 @@ func (p *serverProxy) ReadFrom(buf []byte) (int, net.Addr, error) {
 		server.clientChecker.updateNow()
 		if client.sendCacheFlag.Load() {
 			client.sendCacheFlag.Store(false)
-			flushSize, flushCount := client.pktCache.sendCache(func(b []byte) error {
-				p.frontendConn.writeTo(b, client)
-				return nil
-			})
-			if enableDebugLogging && (flushSize > 0 || flushCount > 0) {
-				debug("send packet cache count [%d] size [%d]", flushCount, flushSize)
-			}
+			client.sendPacketCache(p.frontendConn)
 		}
 	}
 
