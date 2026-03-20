@@ -181,10 +181,14 @@ func (s *sshUdpServer) handleAliveEvent(stream Stream, heartbeatTimeoutMilli, in
 	// it indicates that the client was previously disconnected and has now reconnected.
 	// Set the flag to clear the packet cache after the client stabilizes.
 	if now-s.clientAliveTime.latest() > heartbeatTimeoutMilli {
-		debug("client reconnected, last active at %v", time.UnixMilli(s.clientAliveTime.latest()).Format("15:04:05.000"))
+		if enableDebugLogging {
+			debug("keep alive [%d] received: reconnected=%v, elapsed=%v", msg.Time, true,
+				time.Duration(now-s.clientAliveTime.latest())*time.Millisecond)
+		}
 		s.pendingClearPktCache = true
 	} else if enableDebugLogging && s.pendingClearPktCache {
-		debug("client active at %v", time.UnixMilli(now).Format("15:04:05.000"))
+		debug("keep alive [%d] received: stabilizing=%v, interval=%v", msg.Time, s.pendingClearPktCache,
+			time.Duration(now-s.clientAliveTime.latest())*time.Millisecond)
 	}
 
 	s.clientAliveTime.addMilli(now)

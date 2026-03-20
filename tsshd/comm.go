@@ -394,7 +394,7 @@ func (tc *timeoutChecker) Close() {
 	close(tc.closeChan)
 }
 
-const kAliveTimeCap = 10
+const kAliveTimeCap = 5
 
 type aliveTime struct {
 	mutex sync.Mutex

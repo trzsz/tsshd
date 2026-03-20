@@ -163,10 +163,12 @@ func NewSshUdpClient(opts *UdpClientOptions) (*SshUdpClient, error) {
 	udpClient.activeChecker = newTimeoutChecker(opts.HeartbeatTimeout)
 	if udpClient.enableDebugging {
 		udpClient.activeChecker.onTimeout(func() {
-			udpClient.debug("transport offline, last activity at %v", time.UnixMilli(udpClient.activeChecker.getAliveTime()).Format("15:04:05.000"))
+			since := time.Since(time.UnixMilli(udpClient.activeChecker.getAliveTime()))
+			udpClient.debug("transport offline: since_last_activity=%v", since)
 		})
 		udpClient.activeChecker.onReconnected(func() {
-			udpClient.debug("transport resumed, last activity at %v", time.UnixMilli(udpClient.activeChecker.getAliveTime()).Format("15:04:05.000"))
+			since := time.Since(time.UnixMilli(udpClient.activeChecker.getAliveTime()))
+			udpClient.debug("transport resumed: since_last_activity=%v", since)
 		})
 	}
 	udpClient.activeChecker.onReconnected(func() {
@@ -534,27 +536,32 @@ func (c *SshUdpClient) keepAlive(intervalTime time.Duration) {
 		}
 
 		aliveTime := time.Now().UnixMilli()
-		if c.enableDebugging && c.activeChecker.isTimeout() {
-			c.debug("sending new keep alive [%d]", aliveTime)
+		if c.enableDebugging {
+			timeout, stabilizing := c.activeChecker.isTimeout(), c.pendingClearPkt.Load()
+			if timeout || stabilizing {
+				c.debug("keep alive [%d] sending: timeout=%v, stabilizing=%v", aliveTime, timeout, stabilizing)
+			}
 		}
+
 		if err := c.sendBusMessage("alive", aliveMessage{aliveTime}); err != nil {
 			if !c.IsClosed() && !c.quited.Load() {
-				c.warning("send keep alive [%d] failed: %v", aliveTime, err)
+				c.warning("keep alive [%d] send failed: %v", aliveTime, err)
 			}
-		} else if c.enableDebugging && c.activeChecker.isTimeout() {
-			c.debug("keep alive [%d] sent success", aliveTime)
 		}
 
 		ackTime := <-c.activeAckChan
+
+		if c.enableDebugging {
+			timeout, stabilizing, rtt := c.activeChecker.isTimeout(), c.pendingClearPkt.Load(), time.Since(time.UnixMilli(ackTime))
+			if timeout || stabilizing || rtt > (2*intervalTime) {
+				c.debug("keep alive [%d] confirmed: timeout=%v, stabilizing=%v, rtt=%v", ackTime, timeout, stabilizing, rtt)
+			}
+		}
+
 		c.activeChecker.updateTime(ackTime)
 
 		if c.pendingClearPkt.Load() {
-			if c.enableDebugging {
-				c.debug("server active at %v", time.UnixMilli(ackTime).Format("15:04:05.000"))
-			}
-
 			serverAliveTime.addMilli(ackTime)
-
 			// If the server has remained active for a sufficient number of intervals,
 			// consider the connection stable and clear the packet cache.
 			if time.Since(time.UnixMilli(serverAliveTime.oldest())) < time.Duration(kAliveTimeCap+1)*intervalTime {
