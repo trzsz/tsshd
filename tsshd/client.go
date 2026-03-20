@@ -29,6 +29,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -57,33 +58,34 @@ type agentRequest struct {
 
 // SshUdpClient implements a UDP SSH client
 type SshUdpClient struct {
-	proxyClient     *SshUdpClient
-	protoClient     protocolClient
-	clientProxy     *clientProxy
-	intervalTime    time.Duration
-	connectTimeout  time.Duration
-	exitWG          sync.WaitGroup
-	closed          atomic.Bool
-	quited          atomic.Bool
-	busMutex        sync.Mutex
-	busStream       Stream
-	busClosed       chan struct{}
-	sessionMutex    sync.Mutex
-	sessionID       atomic.Uint64
-	sessionMap      map[uint64]*SshUdpSession
-	channelMutex    sync.Mutex
-	channelMap      map[string]chan ssh.NewChannel
-	quitCallback    func(string)
-	discardCallback func([]byte, []byte)
-	enableDebugging bool
-	clientDebugFunc func(int64, string)
-	enableWarning   bool
-	clientWarningFn func(string)
-	activeChecker   *timeoutChecker
-	activeAckChan   chan int64
-	reconnectMutex  sync.Mutex
-	reconnectError  atomic.Pointer[error]
-	pendingClearPkt atomic.Bool
+	proxyClient      *SshUdpClient
+	protoClient      protocolClient
+	clientProxy      *clientProxy
+	intervalTime     time.Duration
+	connectTimeout   time.Duration
+	exitWG           sync.WaitGroup
+	closed           atomic.Bool
+	quited           atomic.Bool
+	busMutex         sync.Mutex
+	busStream        Stream
+	busClosed        chan struct{}
+	sessionMutex     sync.Mutex
+	sessionID        atomic.Uint64
+	sessionMap       map[uint64]*SshUdpSession
+	channelMutex     sync.Mutex
+	channelMap       map[string]chan ssh.NewChannel
+	quitCallback     func(string)
+	discardCallback  func([]byte)
+	enableDebugging  bool
+	clientDebugFunc  func(int64, string)
+	enableWarning    bool
+	clientWarningFn  func(string)
+	activeChecker    *timeoutChecker
+	activeAckChan    chan int64
+	reconnectMutex   sync.Mutex
+	reconnectError   atomic.Pointer[error]
+	pendingClearPkt  atomic.Bool
+	keepPendingInput atomic.Bool
 }
 
 // UdpClientOptions contains all configuration parameters required to create and initialize a new SshUdpClient
@@ -102,7 +104,7 @@ type UdpClientOptions struct {
 	DebugFunc        func(int64, string)
 	WarningFunc      func(string)
 	QuitCallback     func(reason string)
-	DiscardCallback  func(before []byte, after []byte)
+	DiscardCallback  func(discarded []byte)
 }
 
 // NewSshUdpClient creates a SshUdpClient
@@ -438,6 +440,7 @@ func (c *SshUdpClient) SendRequest(name string, wantReply bool, payload []byte) 
 
 // SetKeepPendingInput sets whether to keep the pending input during disconnection.
 func (c *SshUdpClient) SetKeepPendingInput(keep bool) error {
+	c.keepPendingInput.Store(keep)
 	return c.sendBusMessage("setting", settingsMessage{KeepPendingInput: &keep})
 }
 
@@ -710,13 +713,22 @@ func (c *SshUdpClient) handleAliveEvent() {
 }
 
 func (c *SshUdpClient) handleDiscardEvent() {
-	var discardMsg discardMessage
-	if err := recvMessage(c.busStream, &discardMsg); err != nil {
+	var msg discardMessage
+	if err := recvMessage(c.busStream, &msg); err != nil {
 		c.warning("recv discard message failed: %v", err)
 		return
 	}
-	if c.discardCallback != nil {
-		c.discardCallback(discardMsg.DiscardMarker, discardMsg.DiscardedInput)
+
+	if len(msg.DiscardedInput) > 0 && c.discardCallback != nil {
+		go c.discardCallback(msg.DiscardedInput)
+	}
+
+	if len(msg.DiscardMarker) > 0 {
+		c.sessionMutex.Lock()
+		defer c.sessionMutex.Unlock()
+		for _, sess := range c.sessionMap {
+			sess.discardMarker.Store(&msg.DiscardMarker)
+		}
 	}
 }
 
@@ -735,22 +747,23 @@ func (c *SshUdpClient) handleRekeyEvent() {
 
 // SshUdpSession represents a connection to a remote command or shell
 type SshUdpSession struct {
-	id      uint64
-	exitWG  sync.WaitGroup
-	client  *SshUdpClient
-	stream  Stream
-	pty     bool
-	height  int
-	width   int
-	envs    map[string]string
-	started bool
-	closed  atomic.Bool
-	stdin   *io.PipeReader
-	stdout  *io.PipeWriter
-	stderr  *io.PipeWriter
-	code    int
-	x11     *x11Request
-	agent   *agentRequest
+	id            uint64
+	exitWG        sync.WaitGroup
+	client        *SshUdpClient
+	stream        Stream
+	pty           bool
+	height        int
+	width         int
+	envs          map[string]string
+	started       bool
+	closed        atomic.Bool
+	stdin         *io.PipeReader
+	stdout        *io.PipeWriter
+	stderr        *io.PipeWriter
+	code          int
+	x11           *x11Request
+	agent         *agentRequest
+	discardMarker atomic.Pointer[[]byte]
 }
 
 // Wait waits for the remote command to exit
@@ -888,30 +901,50 @@ func (s *SshUdpSession) startSession(msg *startMessage) error {
 
 func (s *SshUdpSession) forwardInput() {
 	defer func() {
+		s.client.debug("session [%d] stdin completed", s.id)
 		_ = s.stdin.Close()
 		if err := s.stream.CloseWrite(); err != nil {
 			s.client.debug("session [%d] close write failed: %v", s.id, err)
 		}
 	}()
+
 	buffer := make([]byte, 32*1024)
 	for {
 		n, err := s.stdin.Read(buffer)
 		if n > 0 {
+			buf := buffer[:n]
+
 			if s.client.clientProxy.serverChecker.isTimeout() {
-				if s.client.clientProxy.serverChecker.waitUntilReconnected() != nil {
-					s.client.debug("session [%d] server timeout and closed", s.id)
-					break
+				if s.client.keepPendingInput.Load() {
+					if s.client.clientProxy.serverChecker.waitUntilReconnected() != nil {
+						s.client.debug("session [%d] server timeout and closed", s.id)
+						return
+					}
+				} else {
+					s.client.debug("discard input: %s", strconv.QuoteToASCII(string(buf)))
+					if s.client.discardCallback != nil {
+						// Currently in timeout; no need for asynchronous call,
+						// so call the discard callback synchronously without copying the buffer
+						s.client.discardCallback(buf)
+					}
+					continue
 				}
 			}
-			if err := writeAll(s.stream, buffer[:n]); err != nil {
-				break
+
+			if marker := s.discardMarker.Swap(nil); marker != nil {
+				if err := writeAll(s.stream, *marker); err != nil {
+					return
+				}
+			}
+
+			if err := writeAll(s.stream, buf); err != nil {
+				return
 			}
 		}
 		if err != nil {
-			break
+			return
 		}
 	}
-	s.client.debug("session [%d] stdin completed", s.id)
 }
 
 func (s *SshUdpSession) forwardOutput(name string, reader Stream, writer *io.PipeWriter) {

@@ -61,14 +61,10 @@ type sshUdpServer struct {
 	pendingClearPktCache bool
 
 	// session related
-	stderrMutex               sync.Mutex
-	stderrMap                 map[uint64]*stderrStream
-	keepPendingInput          atomic.Bool
-	keepPendingOutput         atomic.Bool
-	discardPendingInputFlag   atomic.Bool
-	discardPendingInputMarker []byte
-	discardMarkerCurrentIndex uint32
-	discardMarkerIndexMutex   sync.Mutex
+	stderrMutex       sync.Mutex
+	stderrMap         map[uint64]*stderrStream
+	keepPendingInput  atomic.Bool
+	keepPendingOutput atomic.Bool
 
 	// TCP forwarding
 	nextFwdAcceptID atomic.Uint64

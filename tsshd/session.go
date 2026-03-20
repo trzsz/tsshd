@@ -47,39 +47,48 @@ import (
 var maxSessionID atomic.Uint64
 var maxPendingOutputLines = 1000
 
+var discardMarkerCurrentIndex uint32
+var discardMarkerIndexMutex sync.Mutex
+
 func (s *sshUdpServer) enablePendingInputDiscard() {
 	if s.keepPendingInput.Load() {
 		return
 	}
 
-	idx := s.getNextDiscardMarkerIndex()
-	s.discardPendingInputMarker = []byte{0xFF, 0xC0, 0xC1, 0xFF,
+	sessionMutex.Lock()
+	defer sessionMutex.Unlock()
+
+	idx := getNextDiscardMarkerIndex()
+	marker := []byte{0xFF, 0xC0, 0xC1, 0xFF,
 		byte(idx >> 24), byte(idx >> 16), byte(idx >> 8), byte(idx),
 	}
-	s.discardPendingInputFlag.Store(true)
+
+	for _, sess := range sessionMap {
+		sess.discardMarker.Store(&marker)
+	}
 
 	go func() {
-		debug("discard marker: %X", s.discardPendingInputMarker)
-		if err := s.sendBusMessage("discard", discardMessage{DiscardMarker: s.discardPendingInputMarker}); err != nil {
-			warning("send discard marker [%X] failed: %v", s.discardPendingInputMarker, err)
+		debug("discard marker: %X", marker)
+		if err := s.sendBusMessage("discard", discardMessage{DiscardMarker: marker}); err != nil {
+			warning("send discard marker [%X] failed: %v", marker, err)
 		}
 	}()
 }
 
-func (s *sshUdpServer) getNextDiscardMarkerIndex() uint32 {
-	s.discardMarkerIndexMutex.Lock()
-	defer s.discardMarkerIndexMutex.Unlock()
+func getNextDiscardMarkerIndex() uint32 {
+	discardMarkerIndexMutex.Lock()
+	defer discardMarkerIndexMutex.Unlock()
 
-	s.discardMarkerCurrentIndex++
+	discardMarkerCurrentIndex++
 	for i := 3; i >= 0; i-- {
 		shift := i * 8
-		b := (s.discardMarkerCurrentIndex >> shift) & 0xFF
+		b := (discardMarkerCurrentIndex >> shift) & 0xFF
 		if b == ';' || b == '\r' { // skip ; and \r for tmux
-			s.discardMarkerCurrentIndex = ((s.discardMarkerCurrentIndex >> shift) + 1) << shift
-			return s.discardMarkerCurrentIndex
+			discardMarkerCurrentIndex = ((discardMarkerCurrentIndex >> shift) + 1) << shift
+			return discardMarkerCurrentIndex
 		}
 	}
-	return s.discardMarkerCurrentIndex
+	return discardMarkerCurrentIndex
 }
 
 type sessionContext struct {
@@ -103,6 +112,7 @@ type sessionContext struct {
 	errStream       *replaceableStream
 	clientChecker   *replaceableTimeoutChecker
 	discardedBuffer []byte
+	discardMarker   atomic.Pointer[[]byte]
 }
 
 var sessionMutex sync.Mutex
@@ -171,14 +181,14 @@ func (c *sessionContext) showMotd(stream Stream) {
 	printMotd([]string{"/etc/motd"}) // always print traditional /etc/motd.
 }
 
-func (c *sessionContext) discardPendingInput(server *sshUdpServer, buf []byte) error {
+func (c *sessionContext) discardPendingInput(server *sshUdpServer, buf []byte, marker *[]byte) error {
 	c.discardedBuffer = append(c.discardedBuffer, buf...)
-	pos := bytes.Index(c.discardedBuffer, server.discardPendingInputMarker)
+	pos := bytes.Index(c.discardedBuffer, *marker)
 	if pos < 0 {
 		return nil
 	}
 
-	remainingBuffer := c.discardedBuffer[pos+len(server.discardPendingInputMarker):]
+	remainingBuffer := c.discardedBuffer[pos+len(*marker):]
 	if len(remainingBuffer) > 0 {
 		if err := writeAll(c.stdin, remainingBuffer); err != nil {
 			return err
@@ -189,24 +199,23 @@ func (c *sessionContext) discardPendingInput(server *sshUdpServer, buf []byte) e
 		if enableDebugLogging {
 			debug("discard input: %s", strconv.QuoteToASCII(string(c.discardedBuffer[:pos])))
 		}
-		if server := c.server.Load(); server != nil {
-			_ = server.sendBusMessage("discard", discardMessage{DiscardedInput: c.discardedBuffer[:pos]})
-		}
+		_ = server.sendBusMessage("discard", discardMessage{DiscardedInput: c.discardedBuffer[:pos]})
 	} else if enableDebugLogging {
 		debug("no pending input to discard")
 	}
-	c.discardedBuffer = nil
 
-	server.discardPendingInputFlag.Store(false)
-	debug("new transport path is now active")
+	c.discardedBuffer = nil
+	c.discardMarker.CompareAndSwap(marker, nil)
 	return nil
 }
 
 func (c *sessionContext) forwardInput(stream Stream) {
 	defer func() {
+		debug("session [%d] stdin completed", c.id)
 		_ = c.stdin.Close()
 		_ = stream.CloseRead()
 	}()
+
 	buffer := make([]byte, 32*1024)
 	for {
 		n, err := stream.Read(buffer)
@@ -216,21 +225,22 @@ func (c *sessionContext) forwardInput(stream Stream) {
 				// nil indicates the session has been detached, input from the old client should be discarded.
 				continue
 			}
-			if server.discardPendingInputFlag.Load() {
-				if err := c.discardPendingInput(server, buffer[:n]); err != nil {
-					break
+
+			if marker := c.discardMarker.Load(); marker != nil {
+				if err := c.discardPendingInput(server, buffer[:n], marker); err != nil {
+					return
 				}
-			} else {
-				if err := writeAll(c.stdin, buffer[:n]); err != nil {
-					break
-				}
+				continue
+			}
+
+			if err := writeAll(c.stdin, buffer[:n]); err != nil {
+				return
 			}
 		}
 		if err != nil {
-			break
+			return
 		}
 	}
-	debug("session [%d] stdin completed", c.id)
 }
 
 func (c *sessionContext) isKeepPendingOutput() bool {

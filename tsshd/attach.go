@@ -409,6 +409,7 @@ func (s *sshUdpServer) detachAllSessions() {
 		if sess.ioStream != nil {
 			sess.ioStream.swap(nil)
 		}
+		sess.discardMarker.Store(nil)
 		sess.server.Store(nil)
 
 		sess.waitMutex.Lock()
