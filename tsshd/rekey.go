@@ -52,26 +52,26 @@ type rotatingCrypto struct {
 	keySalt          []byte
 	gcmList          []cipher.AEAD
 	activeIdx        int
+	nonceSize        int
+	overhead         int
+	timeThreshold    time.Duration
 	bytesConsumed    uint64
 	bytesThreshold   uint64
 	bytesTriggered   bool
-	rekeyInFlight    atomic.Bool
-	clientPriKey     *ecdh.PrivateKey
+	rekeyInFlight    bool
+	lastRekeyTime    time.Time
+	clientPriKey     atomic.Pointer[ecdh.PrivateKey]
 	closed           atomic.Bool
 	stopCh           chan struct{}
 	delegatedToProxy bool
 }
 
 func (r *rotatingCrypto) NonceSize() int {
-	r.mutex.Lock()
-	defer r.mutex.Unlock()
-	return r.gcmList[r.activeIdx].NonceSize()
+	return r.nonceSize
 }
 
 func (r *rotatingCrypto) Overhead() int {
-	r.mutex.Lock()
-	defer r.mutex.Unlock()
-	return r.gcmList[r.activeIdx].Overhead()
+	return r.overhead
 }
 
 func (r *rotatingCrypto) Seal(dst, nonce, plaintext, additionalData []byte) []byte {
@@ -98,16 +98,23 @@ func (r *rotatingCrypto) Seal(dst, nonce, plaintext, additionalData []byte) []by
 	return gcm.Seal(dst, nonce, plaintext, additionalData)
 }
 
-func (r *rotatingCrypto) sealPacket(buf []byte) ([]byte, error) {
-	nonceSize := r.NonceSize()
-	if len(buf) < nonceSize {
+func (r *rotatingCrypto) sealPacket(buf []byte, inPlace bool) ([]byte, error) {
+	if len(buf) < r.nonceSize {
 		return nil, io.ErrShortBuffer
 	}
-	dst := buf[:nonceSize]
-	nonce := buf[:nonceSize]
-	plaintext := buf[nonceSize:]
-	buf = r.Seal(dst, nonce, plaintext, nil)
-	return buf, nil
+
+	nonce := buf[:r.nonceSize]
+	plaintext := buf[r.nonceSize:]
+
+	if inPlace {
+		dst := buf[:r.nonceSize]
+		return r.Seal(dst, nonce, plaintext, nil), nil
+	}
+
+	out := make([]byte, r.nonceSize+len(plaintext)+r.overhead)
+	dst := out[:r.nonceSize]
+	copy(dst, nonce)
+	return r.Seal(dst, nonce, plaintext, nil), nil
 }
 
 func (r *rotatingCrypto) Open(dst, nonce, ciphertext, additionalData []byte) (plaintext []byte, err error) {
@@ -145,14 +152,12 @@ func (r *rotatingCrypto) Open(dst, nonce, ciphertext, additionalData []byte) (pl
 }
 
 func (r *rotatingCrypto) openPacket(buf []byte) (int, error) {
-	overhead := r.Overhead()
-	nonceSize := r.NonceSize()
-	if len(buf) < nonceSize+overhead {
+	if len(buf) < r.nonceSize+r.overhead {
 		return 0, io.ErrShortBuffer
 	}
 
-	nonce := buf[:nonceSize]
-	ciphertext := buf[nonceSize:]
+	nonce := buf[:r.nonceSize]
+	ciphertext := buf[r.nonceSize:]
 	plaintext, err := r.Open(ciphertext[:0], nonce, ciphertext, nil)
 	if err != nil {
 		return 0, err
@@ -162,7 +167,7 @@ func (r *rotatingCrypto) openPacket(buf []byte) (int, error) {
 		copy(ciphertext[:0], plaintext)
 	}
 
-	return nonceSize + len(plaintext), nil
+	return r.nonceSize + len(plaintext), nil
 }
 
 func (r *rotatingCrypto) debug(format string, a ...any) {
@@ -183,7 +188,7 @@ func (r *rotatingCrypto) consumeBytes(n uint64) {
 
 	r.bytesConsumed += n
 
-	if r.bytesConsumed > r.bytesThreshold && !r.bytesTriggered {
+	if r.bytesConsumed >= r.bytesThreshold && !r.bytesTriggered {
 		r.bytesTriggered = true
 		r.debug("byte-based rekey triggered: consumed [%d] threshold [%d]", r.bytesConsumed, r.bytesThreshold)
 		go r.startRekey()
@@ -214,8 +219,11 @@ func (r *rotatingCrypto) installKey(secret []byte, active bool) error {
 		r.activeIdx = len(r.gcmList) - 1
 	}
 
-	r.rekeyInFlight.Store(false)
+	if isRekey := len(r.gcmList) > 1; isRekey {
+		r.lastRekeyTime = time.Now()
+	}
 	r.bytesConsumed, r.bytesTriggered = 0, false
+	r.rekeyInFlight = false
 
 	r.debug("traffic key installed: key count [%d] active index [%d]", len(r.gcmList), r.activeIdx)
 
@@ -241,32 +249,57 @@ func (r *rotatingCrypto) promoteKey(idx int) {
 }
 
 func (r *rotatingCrypto) startRekey() {
-	if !r.rekeyInFlight.CompareAndSwap(false, true) {
-		return
-	}
+	r.mutex.Lock()
+	defer r.mutex.Unlock()
 
 	if r.closed.Load() {
 		return
 	}
 
-	err := func() error {
-		curve := ecdh.P256()
-		clientPriKey, err := curve.GenerateKey(crypto_rand.Reader)
-		if err != nil {
-			return fmt.Errorf("generate key failed: %v", err)
-		}
-
-		r.clientPriKey = clientPriKey
-
-		for !r.client.isBusStreamInited() {
-			time.Sleep(100 * time.Millisecond)
-		}
-		return r.client.sendBusMessage("rekey", rekeyMessage{clientPriKey.PublicKey().Bytes()})
-	}()
-
-	if err != nil {
-		r.client.warning("rekey failed: %v", err)
+	if r.rekeyInFlight {
+		r.debug("rekey skipped: already in flight")
+		return
 	}
+
+	since := time.Since(r.lastRekeyTime)
+	if since < r.timeThreshold/2 && r.bytesConsumed < r.bytesThreshold {
+		r.debug("rekey suppressed: since last [%v] < half threshold [%v], bytes [%d/%d]",
+			since, r.timeThreshold/2, r.bytesConsumed, r.bytesThreshold)
+		return
+	}
+
+	r.rekeyInFlight = true
+
+	if r.lastRekeyTime.IsZero() {
+		r.debug("rekey started: first rekey")
+	} else {
+		r.debug("rekey started: since last [%v], bytes [%d/%d]", since, r.bytesConsumed, r.bytesThreshold)
+	}
+
+	go func() {
+		if err := r.doRekey(); err != nil {
+			r.client.warning("rekey failed: %v", err)
+
+			r.mutex.Lock()
+			r.rekeyInFlight = false
+			r.mutex.Unlock()
+		}
+	}()
+}
+
+func (r *rotatingCrypto) doRekey() error {
+	curve := ecdh.P256()
+	clientPriKey, err := curve.GenerateKey(crypto_rand.Reader)
+	if err != nil {
+		return fmt.Errorf("generate key failed: %v", err)
+	}
+
+	r.clientPriKey.Store(clientPriKey)
+
+	for !r.client.isBusStreamInited() {
+		time.Sleep(100 * time.Millisecond)
+	}
+	return r.client.sendBusMessage("rekey", rekeyMessage{clientPriKey.PublicKey().Bytes()})
 }
 
 func (r *rotatingCrypto) handleClientRekey(msg *rekeyMessage) error {
@@ -276,7 +309,12 @@ func (r *rotatingCrypto) handleClientRekey(msg *rekeyMessage) error {
 		return fmt.Errorf("new public key failed: %v", err)
 	}
 
-	secret, err := r.clientPriKey.ECDH(serverPubKey)
+	clientPriKey := r.clientPriKey.Load()
+	if clientPriKey == nil {
+		return fmt.Errorf("client private key is nil")
+	}
+
+	secret, err := clientPriKey.ECDH(serverPubKey)
 	if err != nil {
 		return fmt.Errorf("ecdh failed: %v", err)
 	}
@@ -285,7 +323,7 @@ func (r *rotatingCrypto) handleClientRekey(msg *rekeyMessage) error {
 		return err
 	}
 
-	r.clientPriKey = nil
+	r.clientPriKey.CompareAndSwap(clientPriKey, nil)
 	return nil
 }
 
@@ -324,11 +362,13 @@ func (r *rotatingCrypto) Close() {
 }
 
 func newRotatingCrypto(client *SshUdpClient, pass, salt []byte, bytesThreshold uint64, timeThreshold time.Duration) (*rotatingCrypto, error) {
-	r := &rotatingCrypto{client: client, keyPass: pass, keySalt: salt, bytesThreshold: bytesThreshold}
+	r := &rotatingCrypto{client: client, keyPass: pass, keySalt: salt, timeThreshold: timeThreshold, bytesThreshold: bytesThreshold}
 
 	if err := r.installKey(pass, true); err != nil {
 		return nil, err
 	}
+
+	r.nonceSize, r.overhead = r.gcmList[0].NonceSize(), r.gcmList[0].Overhead()
 
 	if client != nil && timeThreshold > 0 {
 		r.stopCh = make(chan struct{})

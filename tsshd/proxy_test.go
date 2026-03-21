@@ -255,7 +255,7 @@ func runProxyEchoTest(t *testing.T, args *tsshdArgs) {
 				t.Fatalf("renew transport path failed: %v", err)
 			}
 
-			proto, err := newProtoClient(nil, opts, proxy, proxy.remoteAddr)
+			proto, err := newProtoClient(opts, proxy, proxy.remoteAddr)
 			if err != nil {
 				t.Fatalf("new proto client failed: %v", err)
 			}
@@ -358,4 +358,245 @@ func TestProxy_KCP_TCP_Attachable(t *testing.T) {
 		Port:           "31000-65000",
 		ConnectTimeout: 3 * time.Second,
 	})
+}
+
+type mockFrontendConn struct {
+	mu   sync.Mutex
+	data [][]byte
+}
+
+type proxyTestAdapter struct {
+	writeFn func([]byte) error
+	flushFn func()
+	getAll  func() [][]byte
+}
+
+func runProxyWriteAndCacheTest(t *testing.T, adapter *proxyTestAdapter, crypto *rotatingCrypto, checker *timeoutChecker) {
+	nonceSize := crypto.NonceSize()
+
+	// ---------- test direct WriteTo ----------
+	payloads := [][]byte{
+		[]byte("hello"),
+		[]byte("world"),
+		[]byte("kcp-test"),
+	}
+
+	for _, p := range payloads {
+		buf := make([]byte, crypto.NonceSize()+len(p))
+		copy(buf[crypto.NonceSize():], p)
+		if err := adapter.writeFn(buf); err != nil {
+			t.Fatalf("WriteTo failed: %v", err)
+		}
+	}
+
+	writes := adapter.getAll()
+	if len(writes) != len(payloads) {
+		t.Fatalf("unexpected write count: got=%d want=%d", len(writes), len(payloads))
+	}
+
+	// Verify decryption correctness
+	for i, enc := range writes {
+		decBuf := make([]byte, len(enc))
+		copy(decBuf, enc)
+
+		n, err := crypto.openPacket(decBuf)
+		if err != nil {
+			t.Fatalf("decrypt failed: %v", err)
+		}
+
+		if !bytes.Equal(decBuf[nonceSize:n], payloads[i]) {
+			t.Fatalf("payload mismatch: got=%s want=%s", decBuf[nonceSize:n], payloads[i])
+		}
+	}
+
+	// ---------- test pktCache + flush ----------
+	// Simulate timeout so packets are cached instead of sent
+	checker.timeoutFlag.Store(true)
+
+	cachePayloads := [][]byte{
+		[]byte("cache1"),
+		[]byte("cache2"),
+	}
+
+	for _, p := range cachePayloads {
+		buf := make([]byte, crypto.NonceSize()+len(p))
+		copy(buf[crypto.NonceSize():], p)
+
+		if err := adapter.writeFn(buf); err != nil {
+			t.Fatalf("WriteTo failed: %v", err)
+		}
+	}
+
+	// Ensure nothing new was written (still cached)
+	if len(adapter.getAll()) != len(payloads) {
+		t.Fatalf("cache should not flush yet")
+	}
+
+	offset := len(payloads)
+
+	flushAndVerify := func(roundStart, roundEnd int) {
+		nonceSize := crypto.NonceSize()
+
+		for round := roundStart; round <= roundEnd; round++ {
+			// Manually trigger flush
+			adapter.flushFn()
+
+			writes := adapter.getAll()
+			expectedTotal := len(payloads) + (round)*len(cachePayloads)
+			if len(writes) != expectedTotal {
+				t.Fatalf("unexpected total writes after flush #%d: got=%d want=%d",
+					round, len(writes), expectedTotal)
+			}
+
+			// Verify only the new batch sent in this round
+			for i := range cachePayloads {
+				enc := writes[offset]
+				offset++
+
+				decBuf := make([]byte, len(enc))
+				copy(decBuf, enc)
+
+				n, err := crypto.openPacket(decBuf)
+				if err != nil {
+					t.Fatalf("round %d decrypt failed: %v", round, err)
+				}
+
+				if !bytes.Equal(decBuf[nonceSize:n], cachePayloads[i]) {
+					t.Fatalf("round %d payload mismatch: got=%q want=%q",
+						round, decBuf[nonceSize:n], cachePayloads[i])
+				}
+			}
+		}
+	}
+
+	// First 3 flushes
+	flushAndVerify(1, 3)
+
+	// rekey: install a new key and promote it
+	if err := crypto.installKey([]byte("test key"), true); err != nil {
+		t.Fatalf("install key failed: %v", err)
+	}
+	crypto.promoteKey(1)
+
+	// Next 3 flushes after rekey
+	flushAndVerify(4, 6)
+}
+
+func (m *mockFrontendConn) start(*serverProxy) {}
+
+func (m *mockFrontendConn) readFrom([]byte) (int, *clientState) {
+	return 0, nil
+}
+
+func (m *mockFrontendConn) writeTo(buf []byte, _ *clientState) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	// Copy to avoid mutation from in-place encryption
+	cp := make([]byte, len(buf))
+	copy(cp, buf)
+	m.data = append(m.data, cp)
+}
+
+func (m *mockFrontendConn) getAll() [][]byte {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.data
+}
+
+func TestServerProxyWriteToAndCache(t *testing.T) {
+	// ---------- setup ----------
+	args := &tsshdArgs{KCP: true}
+	mockConn := &mockFrontendConn{}
+
+	info := &ServerInfo{}
+	proxy, err := startServerProxy(args, info, mockConn)
+	if err != nil {
+		t.Fatalf("startServerProxy failed: %v", err)
+	}
+
+	client := proxy.soleClient
+	if client == nil {
+		t.Fatalf("client is nil")
+	}
+
+	client.server.Store(&sshUdpServer{clientChecker: newTimeoutChecker(0)})
+
+	// ---------- adapter ----------
+	adapter := &proxyTestAdapter{
+		writeFn: func(buf []byte) error {
+			_, err := proxy.WriteTo(buf, &client.proxyAddr)
+			return err
+		},
+		flushFn: func() {
+			client.sendPacketCache(mockConn)
+		},
+		getAll: mockConn.getAll,
+	}
+
+	runProxyWriteAndCacheTest(t, adapter, client.kcpCrypto, client.server.Load().clientChecker)
+}
+
+type mockPacketConn struct {
+	mu   sync.Mutex
+	data [][]byte
+}
+
+func (m *mockPacketConn) Close() error { return nil }
+
+func (m *mockPacketConn) Write(buf []byte) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	cp := make([]byte, len(buf))
+	copy(cp, buf)
+	m.data = append(m.data, cp)
+	return nil
+}
+
+func (m *mockPacketConn) Read([]byte) (int, error) {
+	return 0, io.EOF
+}
+
+func (m *mockPacketConn) Consume(consumeFn func([]byte) error) error {
+	return nil
+}
+
+func (m *mockPacketConn) getAll() [][]byte {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.data
+}
+
+func TestClientProxyWriteToAndCache(t *testing.T) {
+	// ---------- setup ----------
+	_, pass, salt := newTestKcpConfig(t)
+	kcpCrypto, err := newRotatingCrypto(nil, pass, salt, 0, 0)
+	if err != nil {
+		t.Fatalf("newRotatingCrypto failed: %v", err)
+	}
+
+	mockConn := &mockPacketConn{}
+
+	proxy := &clientProxy{
+		client:        &SshUdpClient{},
+		kcpCrypto:     kcpCrypto,
+		serverChecker: newTimeoutChecker(0),
+	}
+	proxy.backendCond = sync.NewCond(&proxy.backendMutex)
+	proxy.backendConn.Store(&serverConnHolder{mockConn})
+
+	// ---------- adapter ----------
+	adapter := &proxyTestAdapter{
+		writeFn: func(buf []byte) error {
+			_, err := proxy.WriteTo(buf, nil)
+			return err
+		},
+		flushFn: func() {
+			proxy.sendPacketCache()
+		},
+		getAll: mockConn.getAll,
+	}
+
+	runProxyWriteAndCacheTest(t, adapter, proxy.kcpCrypto, proxy.serverChecker)
 }

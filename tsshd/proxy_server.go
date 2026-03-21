@@ -63,7 +63,7 @@ type clientState struct {
 	clientCond    *sync.Cond
 	pktCache      packetCache
 	sendCacheFlag atomic.Bool
-	kcpCrypto     atomic.Pointer[rotatingCrypto]
+	kcpCrypto     *rotatingCrypto
 }
 
 func (c *clientState) remoteAddr() string {
@@ -169,8 +169,15 @@ func (c *clientState) setAuthedAddr(addr *net.UDPAddr) {
 }
 
 func (c *clientState) sendPacketCache(conn frontendConnection) bool {
-	flushSize, flushCount := c.pktCache.sendCache(func(b []byte) error {
-		conn.writeTo(b, c)
+	flushSize, flushCount := c.pktCache.sendCache(func(buf []byte) error {
+		if c.kcpCrypto != nil {
+			var err error
+			buf, err = c.kcpCrypto.sealPacket(buf, false)
+			if err != nil {
+				return err
+			}
+		}
+		conn.writeTo(buf, c)
 		return nil
 	})
 
@@ -181,12 +188,6 @@ func (c *clientState) sendPacketCache(conn frontendConnection) bool {
 	}
 
 	return hasCache
-}
-
-func newClientState(clientID uint64) *clientState {
-	client := &clientState{proxyAddr: proxyClientAddr{clientID}}
-	client.clientCond = sync.NewCond(&client.clientMutex)
-	return client
 }
 
 type frontendConnection interface {
@@ -240,6 +241,9 @@ func (c *udpFrontendConn) initConn(conn *net.UDPConn, addr *net.UDPAddr, clientI
 
 	if addr != nil {
 		client := c.proxy.getClient(clientID)
+		if client == nil {
+			return
+		}
 		client.udpFrontConn.Store(c)
 		oldSerialNumber := client.serialNumber.Load()
 		if newSerialNumber > oldSerialNumber {
@@ -462,6 +466,9 @@ func (c *udpFrontendConn) readFrom(buf []byte) (int, *clientState) {
 		// Only valid authentication packets can create a new authed address.
 		isAuthPacket, clientID, newSerialNumber := c.proxy.openAuthPacket(buf[:n])
 		client = c.proxy.getClient(clientID)
+		if client == nil {
+			continue
+		}
 		client.udpFrontConn.Store(c)
 		oldSerialNumber := client.serialNumber.Load()
 		if isAuthPacket && newSerialNumber > oldSerialNumber {
@@ -579,6 +586,9 @@ func (c *tcpFrontendConn) handshake(conn *net.TCPConn) {
 	}
 
 	client := c.proxy.getClient(clientID)
+	if client == nil {
+		return
+	}
 	oldSerialNumber := client.serialNumber.Load()
 	if newSerialNumber <= oldSerialNumber {
 		return
@@ -714,6 +724,21 @@ type serverProxy struct {
 	kcpSalt []byte
 }
 
+func (p *serverProxy) newClientState(clientID uint64) (*clientState, error) {
+	client := &clientState{proxyAddr: proxyClientAddr{clientID}}
+	client.clientCond = sync.NewCond(&client.clientMutex)
+
+	if p.args.KCP {
+		crypto, err := newRotatingCrypto(nil, p.kcpPass, p.kcpSalt, 0, 0)
+		if err != nil {
+			return nil, fmt.Errorf("new rotating crypto failed: %v", err)
+		}
+		client.kcpCrypto = crypto
+	}
+
+	return client, nil
+}
+
 func (p *serverProxy) getClient(clientID uint64) *clientState {
 	if !p.args.Attachable && clientID == p.clientID {
 		return p.soleClient
@@ -733,7 +758,10 @@ func (p *serverProxy) getClient(clientID uint64) *clientState {
 		return client
 	}
 
-	client = newClientState(clientID)
+	client, err := p.newClientState(clientID)
+	if err != nil {
+		return nil
+	}
 
 	if p.clientMap == nil {
 		p.clientMap = make(map[uint64]*clientState)
@@ -797,14 +825,9 @@ func (p *serverProxy) ReadFrom(buf []byte) (int, net.Addr, error) {
 	for {
 		n, client = p.frontendConn.readFrom(buf)
 
-		if p.args.Attachable && p.args.KCP {
-			crypto := client.kcpCrypto.Load()
-			if crypto == nil {
-				crypto, _ = newRotatingCrypto(nil, p.kcpPass, p.kcpSalt, 0, 0)
-				client.kcpCrypto.Store(crypto)
-			}
+		if client.kcpCrypto != nil {
 			var err error
-			n, err = crypto.openPacket(buf[:n])
+			n, err = client.kcpCrypto.openPacket(buf[:n])
 			if err != nil {
 				continue
 			}
@@ -834,22 +857,21 @@ func (p *serverProxy) WriteTo(buf []byte, addr net.Addr) (int, error) {
 	}
 
 	client := p.getClient(clientAddr.clientID)
-
-	if p.args.Attachable && p.args.KCP {
-		crypto := client.kcpCrypto.Load()
-		if crypto == nil {
-			return n, nil
-		}
-		var err error
-		buf, err = crypto.sealPacket(buf)
-		if err != nil {
-			return n, nil
-		}
+	if client == nil {
+		return n, nil
 	}
 
 	if server := client.server.Load(); server != nil && server.clientChecker.isTimeout() {
 		client.pktCache.addPacket(buf)
 		return n, nil
+	}
+
+	if client.kcpCrypto != nil {
+		var err error
+		buf, err = client.kcpCrypto.sealPacket(buf, true)
+		if err != nil {
+			return n, nil
+		}
 	}
 
 	p.frontendConn.writeTo(buf, client)
@@ -902,7 +924,25 @@ func startServerProxy(args *tsshdArgs, info *ServerInfo, conn frontendConnection
 		return nil, fmt.Errorf("aes new cipher failed: %v", err)
 	}
 
-	var client *clientState
+	proxy := &serverProxy{
+		args:         args,
+		frontendConn: conn,
+		cipherBlock:  &cipherBlock,
+	}
+
+	if args.KCP {
+		proxy.kcpPass = make([]byte, 48)
+		if _, err := crypto_rand.Read(proxy.kcpPass); err != nil {
+			return nil, fmt.Errorf("rand pass failed: %v", err)
+		}
+		proxy.kcpSalt = make([]byte, 48)
+		if _, err := crypto_rand.Read(proxy.kcpSalt); err != nil {
+			return nil, fmt.Errorf("rand salt failed: %v", err)
+		}
+		info.Pass = fmt.Sprintf("%x", proxy.kcpPass)
+		info.Salt = fmt.Sprintf("%x", proxy.kcpSalt)
+	}
+
 	if !args.Attachable {
 		for info.ClientID == 0 {
 			clientID := make([]byte, 8)
@@ -911,7 +951,13 @@ func startServerProxy(args *tsshdArgs, info *ServerInfo, conn frontendConnection
 			}
 			info.ClientID = binary.BigEndian.Uint64(clientID)
 		}
-		client = newClientState(info.ClientID)
+		proxy.clientID = info.ClientID
+
+		client, err := proxy.newClientState(info.ClientID)
+		if err != nil {
+			return nil, fmt.Errorf("new client state failed: %v", err)
+		}
+		proxy.soleClient = client
 	}
 
 	serverID := make([]byte, 8)
@@ -919,18 +965,10 @@ func startServerProxy(args *tsshdArgs, info *ServerInfo, conn frontendConnection
 		return nil, fmt.Errorf("rand server id failed: %v", err)
 	}
 	info.ServerID = binary.BigEndian.Uint64(serverID)
+	proxy.serverID = info.ServerID
 
 	if args.TCP {
 		info.ProxyMode = kProxyModeTCP
-	}
-
-	proxy := &serverProxy{
-		args:         args,
-		frontendConn: conn,
-		cipherBlock:  &cipherBlock,
-		serverID:     info.ServerID,
-		clientID:     info.ClientID,
-		soleClient:   client,
 	}
 
 	conn.start(proxy)

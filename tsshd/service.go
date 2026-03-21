@@ -88,7 +88,6 @@ type protocolServer interface {
 }
 
 type kcpServer struct {
-	crypto    *rotatingCrypto
 	session   *smux.Session
 	forwarder *udpForwarder
 }
@@ -134,20 +133,12 @@ func initServer(args *tsshdArgs) (string, error) {
 	}
 
 	if args.KCP {
-		listener, crypto, err := listenKCP(proxy, info)
+		listener, err := listenKCP(proxy, info, proxy.kcpPass, proxy.kcpSalt, true)
 		if err != nil {
 			return "", err
 		}
 		addOnExitFunc(func() { _ = listener.Close() })
-
-		if args.Attachable {
-			crypto.delegatedToProxy = true
-		} else {
-			proxy.soleClient.kcpCrypto.Store(crypto)
-		}
-		proxy.kcpPass, proxy.kcpSalt = crypto.keyPass, crypto.keySalt
-
-		go serveKCP(args, proxy, listener, crypto)
+		go serveKCP(args, proxy, listener)
 	} else {
 		listener, err := listenQUIC(proxy, info, args.MTU)
 		if err != nil {
@@ -408,31 +399,22 @@ func tcpListenOnPort(addrs []*net.UDPAddr, port int) (fc frontendConnection, err
 	return &tcpFrontendConn{listenerList: listenerList}, nil
 }
 
-func listenKCP(conn net.PacketConn, info *ServerInfo) (*kcp.Listener, *rotatingCrypto, error) {
-	pass := make([]byte, 48)
-	if _, err := crypto_rand.Read(pass); err != nil {
-		return nil, nil, fmt.Errorf("rand pass failed: %v", err)
-	}
-	salt := make([]byte, 48)
-	if _, err := crypto_rand.Read(salt); err != nil {
-		return nil, nil, fmt.Errorf("rand salt failed: %v", err)
-	}
-
+func listenKCP(conn net.PacketConn, info *ServerInfo, pass, salt []byte, delegToProxy bool) (*kcp.Listener, error) {
 	crypto, err := newRotatingCrypto(nil, pass, salt, 0, 0)
 	if err != nil {
-		return nil, nil, fmt.Errorf("new rotating gcm failed: %w", err)
+		return nil, fmt.Errorf("new rotating crypto failed: %w", err)
 	}
+	crypto.delegatedToProxy = delegToProxy
 	block := kcp.NewAEADCrypt(crypto)
 
 	listener, err := kcp.ServeConn(block, 1, 1, conn)
 	if err != nil {
-		return nil, nil, fmt.Errorf("kcp serve conn failed: %v", err)
+		return nil, fmt.Errorf("kcp serve conn failed: %v", err)
 	}
 
 	info.Mode = kUdpModeKCP
-	info.Pass = fmt.Sprintf("%x", pass)
-	info.Salt = fmt.Sprintf("%x", salt)
-	return listener, crypto, nil
+
+	return listener, nil
 }
 
 func listenQUIC(conn net.PacketConn, info *ServerInfo, mtu uint16) (*quic.Listener, error) {
@@ -611,7 +593,7 @@ func (c *quicDatagramConn) GetMaxDatagramSize() uint16 {
 	return c.mtu
 }
 
-func serveKCP(args *tsshdArgs, proxy *serverProxy, listener *kcp.Listener, crypto *rotatingCrypto) {
+func serveKCP(args *tsshdArgs, proxy *serverProxy, listener *kcp.Listener) {
 	for {
 		conn, err := listener.AcceptKCP()
 		if err != nil {
@@ -619,11 +601,11 @@ func serveKCP(args *tsshdArgs, proxy *serverProxy, listener *kcp.Listener, crypt
 			return
 		}
 		debug("kcp accepted new connection from client [%v]", conn.RemoteAddr())
-		go handleKcpConn(args, proxy, crypto, conn)
+		go handleKcpConn(args, proxy, conn)
 	}
 }
 
-func handleKcpConn(args *tsshdArgs, proxy *serverProxy, crypto *rotatingCrypto, conn *kcp.UDPSession) {
+func handleKcpConn(args *tsshdArgs, proxy *serverProxy, conn *kcp.UDPSession) {
 	defer func() { _ = conn.Close() }()
 
 	if !args.Attachable {
@@ -647,7 +629,7 @@ func handleKcpConn(args *tsshdArgs, proxy *serverProxy, crypto *rotatingCrypto, 
 		return
 	}
 
-	server := newSshUdpServer(args, proxy, conn.RemoteAddr(), &kcpServer{crypto, session, &udpForwarder{conn: newKcpDatagramConn(conn)}})
+	server := newSshUdpServer(args, proxy, conn.RemoteAddr(), &kcpServer{session, &udpForwarder{conn: newKcpDatagramConn(conn)}})
 	if server == nil {
 		return
 	}

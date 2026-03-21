@@ -118,6 +118,7 @@ type clientProxy struct {
 	renewMutex    sync.Mutex
 	serialNumber  uint64
 	pktCache      packetCache
+	kcpCrypto     *rotatingCrypto
 	serverChecker *timeoutChecker
 	closed        atomic.Bool
 }
@@ -149,10 +150,7 @@ func (p *clientProxy) renewTransportPath(proxyClient *SshUdpClient, connectTimeo
 
 	p.serverChecker.updateNow()
 
-	flushSize, flushCount := p.pktCache.sendCache(conn.Write)
-	if p.client.enableDebugging && (flushSize > 0 || flushCount > 0) {
-		p.client.debug("send packet cache count [%d] size [%d]", flushCount, flushSize)
-	}
+	p.sendPacketCache()
 
 	return nil
 }
@@ -311,6 +309,28 @@ func (p *clientProxy) isAuthSuccessful(buf []byte) bool {
 	return p.serialNumber == serialNumber
 }
 
+func (p *clientProxy) sendPacketCache() {
+	conn := p.backendConn.Load()
+	if conn == nil {
+		return
+	}
+
+	flushSize, flushCount := p.pktCache.sendCache(func(buf []byte) error {
+		if p.kcpCrypto != nil {
+			var err error
+			buf, err = p.kcpCrypto.sealPacket(buf, false)
+			if err != nil {
+				return err
+			}
+		}
+		return conn.Write(buf)
+	})
+
+	if p.client.enableDebugging && (flushSize > 0 || flushCount > 0) {
+		p.client.debug("send packet cache count [%d] size [%d]", flushCount, flushSize)
+	}
+}
+
 func (p *clientProxy) ReadFrom(buf []byte) (int, net.Addr, error) {
 	p.readMutex.Lock()
 	defer p.readMutex.Unlock()
@@ -327,6 +347,14 @@ func (p *clientProxy) ReadFrom(buf []byte) (int, net.Addr, error) {
 				}
 				continue
 			}
+
+			if p.kcpCrypto != nil {
+				n, err = p.kcpCrypto.openPacket(buf[:n])
+				if err != nil {
+					continue
+				}
+			}
+
 			p.serverChecker.updateNow()
 			return n, p.remoteAddr, nil
 		}
@@ -352,11 +380,21 @@ func (p *clientProxy) WriteTo(buf []byte, _ net.Addr) (int, error) {
 		}
 
 		if conn := p.backendConn.Load(); conn != nil {
+
+			if p.kcpCrypto != nil {
+				var err error
+				buf, err = p.kcpCrypto.sealPacket(buf, true)
+				if err != nil {
+					return len(buf), nil
+				}
+			}
+
 			if err := conn.Write(buf); err != nil {
 				if p.backendConn.CompareAndSwap(conn, nil) {
 					_ = conn.Close()
 				}
 			}
+
 			// Do not return an error here, otherwise QUIC/KCP may drop all subsequent packets.
 			return len(buf), nil
 		}
@@ -386,6 +424,10 @@ func (p *clientProxy) Close() error {
 	}
 
 	p.serverChecker.Close()
+
+	if p.kcpCrypto != nil {
+		p.kcpCrypto.Close()
+	}
 
 	return nil
 }
@@ -486,6 +528,21 @@ func startClientProxy(client *SshUdpClient, opts *UdpClientOptions) (*clientProx
 	}
 	proxy.backendCond = sync.NewCond(&proxy.backendMutex)
 
+	if opts.ServerInfo.Mode == kUdpModeKCP {
+		pass, err := hex.DecodeString(opts.ServerInfo.Pass)
+		if err != nil {
+			return nil, fmt.Errorf("decode pass [%s] failed: %w", opts.ServerInfo.Pass, err)
+		}
+		salt, err := hex.DecodeString(opts.ServerInfo.Salt)
+		if err != nil {
+			return nil, fmt.Errorf("decode salt [%s] failed: %w", opts.ServerInfo.Pass, err)
+		}
+		proxy.kcpCrypto, err = newRotatingCrypto(client, pass, salt, kRekeyBytesThreshold, kRekeyTimeThreshold)
+		if err != nil {
+			return nil, fmt.Errorf("new rotating crypto failed: %w", err)
+		}
+	}
+
 	if client.enableDebugging {
 		proxy.serverChecker.onTimeout(func() {
 			client.debug("blocked due to no server output for [%v]", opts.HeartbeatTimeout)
@@ -496,14 +553,7 @@ func startClientProxy(client *SshUdpClient, opts *UdpClientOptions) (*clientProx
 	}
 
 	if opts.ProxyClient != nil {
-		opts.ProxyClient.activeChecker.onReconnected(func() {
-			if conn := proxy.backendConn.Load(); conn != nil {
-				flushSize, flushCount := proxy.pktCache.sendCache(conn.Write)
-				if client.enableDebugging && (flushSize > 0 || flushCount > 0) {
-					client.debug("send packet cache count [%d] size [%d]", flushCount, flushSize)
-				}
-			}
-		})
+		opts.ProxyClient.activeChecker.onReconnected(proxy.sendPacketCache)
 	}
 
 	return proxy, nil

@@ -155,7 +155,7 @@ func NewSshUdpClient(opts *UdpClientOptions) (*SshUdpClient, error) {
 		return nil, err
 	}
 
-	udpClient.protoClient, err = newProtoClient(udpClient, opts, udpClient.clientProxy, udpClient.clientProxy.remoteAddr)
+	udpClient.protoClient, err = newProtoClient(opts, udpClient.clientProxy, udpClient.clientProxy.remoteAddr)
 	if err != nil {
 		return nil, err
 	}
@@ -746,9 +746,11 @@ func (c *SshUdpClient) handleRekeyEvent() {
 		return
 	}
 
-	if err := c.protoClient.handleRekeyEvent(&msg); err != nil {
-		c.warning("rekey failed: %v", err)
-		return
+	if c.clientProxy.kcpCrypto != nil {
+		if err := c.clientProxy.kcpCrypto.handleClientRekey(&msg); err != nil {
+			c.warning("rekey failed: %v", err)
+			return
+		}
 	}
 }
 
@@ -928,7 +930,9 @@ func (s *SshUdpSession) forwardInput() {
 						return
 					}
 				} else {
-					s.client.debug("discard input: %s", strconv.QuoteToASCII(string(buf)))
+					if enableDebugLogging {
+						s.client.debug("discard input: %s", strconv.QuoteToASCII(string(buf)))
+					}
 					if s.client.discardCallback != nil {
 						// Currently in timeout; no need for asynchronous call,
 						// so call the discard callback synchronously without copying the buffer

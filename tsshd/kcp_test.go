@@ -26,6 +26,7 @@ package tsshd
 
 import (
 	"bytes"
+	"crypto/rand"
 	"fmt"
 	"io"
 	"net"
@@ -39,13 +40,26 @@ import (
 	"github.com/xtaci/kcp-go/v5"
 )
 
+func newTestKcpConfig(t *testing.T) (*UdpClientOptions, []byte, []byte) {
+	t.Helper()
+	pass := make([]byte, 48)
+	if _, err := rand.Read(pass); err != nil {
+		t.Fatalf("rand pass failed: %v", err)
+	}
+	salt := make([]byte, 48)
+	if _, err := rand.Read(salt); err != nil {
+		t.Fatalf("rand salt failed: %v", err)
+	}
+	return &UdpClientOptions{ServerInfo: &ServerInfo{}}, pass, salt
+}
+
 func TestKCP_PassSaltValidation(t *testing.T) {
-	info := ServerInfo{}
+	opts, pass, salt := newTestKcpConfig(t)
 	svrConn := listenRandomUDP(t)
 	defer func() { _ = svrConn.Close() }()
 
 	// Start KCP server
-	listener, _, err := listenKCP(svrConn, &info)
+	listener, err := listenKCP(svrConn, opts.ServerInfo, pass, salt, false)
 	if err != nil {
 		t.Fatalf("listenKCP failed: %v", err)
 	}
@@ -114,14 +128,11 @@ func TestKCP_PassSaltValidation(t *testing.T) {
 		defer close(clientErrCh)
 
 		// ---------- Case 1: invalid pass/salt (swap) ----------
-		illegalInfo := info
-		illegalInfo.Pass, illegalInfo.Salt = info.Salt, info.Pass
-
 		// The client may believe it has connected successfully.
 		// We intentionally do NOT assert failure here.
 		cliConn1 := listenRandomUDP(t)
 		defer func() { _ = cliConn1.Close() }()
-		illegalClient, err := newKcpClient(nil, &UdpClientOptions{ServerInfo: &illegalInfo}, cliConn1, svrConn.LocalAddr())
+		illegalClient, err := newKcpClient(opts, cliConn1, svrConn.LocalAddr(), salt, pass, false)
 		if err == nil {
 			defer func() { _ = illegalClient.closeClient() }()
 			// Try to open a smux stream with a short timeout.
@@ -135,7 +146,7 @@ func TestKCP_PassSaltValidation(t *testing.T) {
 		// ---------- Case 2: valid pass/salt ----------
 		cliConn2 := listenRandomUDP(t)
 		defer func() { _ = cliConn2.Close() }()
-		client, err := newKcpClient(nil, &UdpClientOptions{ServerInfo: &info}, cliConn2, svrConn.LocalAddr())
+		client, err := newKcpClient(opts, cliConn2, svrConn.LocalAddr(), pass, salt, false)
 		if err != nil {
 			clientErrCh <- fmt.Errorf("valid pass/salt should succeed: %v", err)
 			return
@@ -185,12 +196,12 @@ func TestKCP_PassSaltValidation(t *testing.T) {
 }
 
 func TestKCP_OOB(t *testing.T) {
-	info := ServerInfo{}
+	opts, pass, salt := newTestKcpConfig(t)
 	svrConn := listenRandomUDP(t)
 	defer func() { _ = svrConn.Close() }()
 
 	// Start KCP server
-	listener, _, err := listenKCP(svrConn, &info)
+	listener, err := listenKCP(svrConn, opts.ServerInfo, pass, salt, false)
 	if err != nil {
 		t.Fatalf("listenKCP failed: %v", err)
 	}
@@ -257,12 +268,10 @@ func TestKCP_OOB(t *testing.T) {
 	var wg sync.WaitGroup
 	cliConn := listenRandomUDP(t)
 	defer func() { _ = cliConn.Close() }()
-	client, err := newKcpClient(nil, &UdpClientOptions{ServerInfo: &info}, cliConn, svrConn.LocalAddr())
+	client, err := newKcpClient(opts, cliConn, svrConn.LocalAddr(), pass, salt, false)
 	if err != nil {
 		t.Fatalf("new kcp client failed: %v", err)
 	}
-
-	client.crypto.bytesThreshold = 0
 
 	size := client.conn.GetOOBMaxSize()
 	if size < 1000 {
@@ -446,12 +455,12 @@ func runKcpEchoTest(t *testing.T, listener *kcp.Listener, client *kcpClient) {
 }
 
 func TestKCP_EchoBasic(t *testing.T) {
-	info := ServerInfo{}
+	opts, pass, salt := newTestKcpConfig(t)
 
 	svrConn := listenRandomUDP(t)
 	defer func() { _ = svrConn.Close() }()
 
-	listener, _, err := listenKCP(svrConn, &info)
+	listener, err := listenKCP(svrConn, opts.ServerInfo, pass, salt, false)
 	if err != nil {
 		t.Fatalf("listenKCP failed: %v", err)
 	}
@@ -460,7 +469,7 @@ func TestKCP_EchoBasic(t *testing.T) {
 	cliConn := listenRandomUDP(t)
 	defer func() { _ = cliConn.Close() }()
 
-	client, err := newKcpClient(nil, &UdpClientOptions{ServerInfo: &info}, cliConn, svrConn.LocalAddr())
+	client, err := newKcpClient(opts, cliConn, svrConn.LocalAddr(), pass, salt, false)
 	if err != nil {
 		t.Fatalf("newKcpClient failed: %v", err)
 	}
@@ -485,7 +494,7 @@ func (p *proxyWithCrypto) ReadFrom(buf []byte) (n int, addr net.Addr, err error)
 }
 
 func (p *proxyWithCrypto) WriteTo(buf []byte, addr net.Addr) (n int, err error) {
-	buf, err = p.crypto.sealPacket(buf)
+	buf, err = p.crypto.sealPacket(buf, true)
 	if err != nil {
 		return 0, err
 	}
@@ -499,24 +508,22 @@ func (p *proxyWithCrypto) SetReadDeadline(t time.Time) error  { return p.conn.Se
 func (p *proxyWithCrypto) SetWriteDeadline(t time.Time) error { return p.conn.SetWriteDeadline(t) }
 
 func TestKCP_DelegatedCrypto(t *testing.T) {
-	info := ServerInfo{}
+	opts, pass, salt := newTestKcpConfig(t)
 
 	svrConn := listenRandomUDP(t)
 	defer func() { _ = svrConn.Close() }()
 
-	proxy := &proxyWithCrypto{t: t, conn: svrConn}
+	crypto, err := newRotatingCrypto(nil, pass, salt, 0, 0)
+	if err != nil {
+		t.Fatalf("newRotatingCrypto failed: %v", err)
+	}
+	proxy := &proxyWithCrypto{t: t, conn: svrConn, crypto: crypto}
 
-	listener, crypto, err := listenKCP(proxy, &info)
+	listener, err := listenKCP(proxy, opts.ServerInfo, pass, salt, true)
 	if err != nil {
 		t.Fatalf("listenKCP failed: %v", err)
 	}
 	defer func() { _ = listener.Close() }()
-
-	crypto.delegatedToProxy = true
-	proxy.crypto, err = newRotatingCrypto(nil, crypto.keyPass, crypto.keySalt, 0, 0)
-	if err != nil {
-		t.Fatalf("newRotatingCrypto failed: %v", err)
-	}
 
 	oriClientDebugFn, oriEnableDebugLogging := clientDebugFn, enableDebugLogging
 	defer func() { clientDebugFn, enableDebugLogging = oriClientDebugFn, oriEnableDebugLogging }()
@@ -538,7 +545,7 @@ func TestKCP_DelegatedCrypto(t *testing.T) {
 	cliConn := listenRandomUDP(t)
 	defer func() { _ = cliConn.Close() }()
 
-	client, err := newKcpClient(nil, &UdpClientOptions{ServerInfo: &info}, cliConn, svrConn.LocalAddr())
+	client, err := newKcpClient(opts, cliConn, svrConn.LocalAddr(), pass, salt, false)
 	if err != nil {
 		t.Fatalf("newKcpClient failed: %v", err)
 	}
