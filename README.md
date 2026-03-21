@@ -242,6 +242,14 @@ The following clients or terminals support the `tsshd` server:
 
 ### Configurations
 
+#### Server Configuration (tsshd)
+
+- By default, tsshd reuses OpenSSH configuration (default `/etc/ssh/sshd_config` on Unix-like systems), ensuring behavior is consistent with OpenSSH.
+
+- If `$XDG_CONFIG_HOME/tsshd/sshd_config` exists (default `~/.config/tsshd/sshd_config`), tsshd prefers it over the OpenSSH config, even if it is empty.
+
+#### Client Configuration (tssh)
+
 ```
 Host xxx
     #!! UdpMode Yes

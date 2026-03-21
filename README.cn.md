@@ -241,6 +241,14 @@ tssh 和 tsshd 的工作方式与 ssh 完全相同，没有计划支持本地回
 
 ## 配置说明
 
+### Server 配置 (tsshd)
+
+- 默认情况下，tsshd 会复用 OpenSSH 的配置（默认路径 `/etc/ssh/sshd_config`），以尽可能保持与 OpenSSH 一致的行为。
+
+- 如果存在 `$XDG_CONFIG_HOME/tsshd/sshd_config`（默认 `~/.config/tsshd/sshd_config`），tsshd 会优先使用它（即使文件为空）。
+
+### Client 配置 (tssh)
+
 ```
 Host xxx
     #!! UdpMode Yes

@@ -214,15 +214,18 @@ func TsshdMain() int {
 		args.ConnectTimeout = kDefaultConnectTimeout
 	}
 
-	// init sshd_config
-	initSshdConfig()
-
-	// init log level
-	enableWarningLogging = true
+	// init debug
 	if args.Debug {
 		enableDebugLogging = true
 		debug("tsshd version: %s", getTsshdVersion())
-	} else {
+	}
+
+	// init sshd_config
+	initSshdConfig()
+
+	// init warning
+	enableWarningLogging = true
+	if !enableDebugLogging {
 		if v := strings.ToLower(getSshdConfig("LogLevel")); v == "quiet" || v == "fatal" {
 			enableWarningLogging = false
 		}

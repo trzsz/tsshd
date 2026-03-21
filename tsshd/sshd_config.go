@@ -38,6 +38,19 @@ var sshdConfigMap map[string]string
 var sshdSubsystemMap map[string]string
 
 func getSshdConfigPath() string {
+	xdgConfigHome := os.Getenv("XDG_CONFIG_HOME")
+	if xdgConfigHome == "" {
+		if home, err := os.UserHomeDir(); err == nil {
+			xdgConfigHome = filepath.Join(home, ".config")
+		}
+	}
+	if xdgConfigHome != "" {
+		path := filepath.Join(xdgConfigHome, "tsshd", "sshd_config")
+		if _, err := os.Stat(path); err == nil {
+			return path
+		}
+	}
+
 	if runtime.GOOS == "windows" {
 		if path := os.Getenv("ProgramData"); path != "" {
 			path = filepath.Join(path, "ssh", "sshd_config")
@@ -80,6 +93,12 @@ func getSshdSubsystem(name string) string {
 
 func initSshdConfig() {
 	sshdConfigPath = getSshdConfigPath()
+
+	if enableDebugLogging {
+		if _, err := os.Stat(sshdConfigPath); err == nil {
+			debug("sshd_config path: %s", sshdConfigPath)
+		}
+	}
 
 	var user string
 	var groups []string
