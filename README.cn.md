@@ -151,7 +151,11 @@ tssh 和 tsshd 的工作方式与 ssh 完全相同，没有计划支持本地回
   <details><summary><code>go install github.com/trzsz/tsshd/cmd/tsshd@latest</code></summary>
 
   ```sh
+  # 最新发布版本
   go install github.com/trzsz/tsshd/cmd/tsshd@latest
+
+  # 最新开发版本（ main 分支 ）
+  go install github.com/trzsz/tsshd/cmd/tsshd@main
   ```
 
   安装后，`tsshd` 程序一般位于 `~/go/bin/` 目录下（ Windows 一般在 `C:\Users\your_name\go\bin\` ）。
@@ -282,6 +286,40 @@ Host xxx
 - `UdpProxyMode`: 默认使用 `UDP` 协议进行传输。如果所在的网络环境有防火墙禁止了 `UDP` 流量，可以配置为 `TCP` 以绕过防火墙限制，但这可能会带来额外的延迟。
 
 - `UdpMTU`: 设置 UDP 数据包的最大传输单元（MTU），默认值为 1400。
+
+## UDP 端口转发
+
+使用 tssh 作为客户端时，支持 UDP 端口转发。
+
+- 命令行 UDP 端口转发，扩展 `-L` / `-R` 参数，增加 `udp/` 前缀 ( 其中 `/` 可以换成 `:`、`_` 或 `-` )：
+
+  ```
+  -L udp/[bind_address:]port:host:hostport
+  -L udp:[bind_address:]port:/remote_socket
+  -L udp_/local_socket:host:hostport
+  -L udp-/local_socket:/remote_socket
+
+  -R udp/[bind_address:]port:host:hostport
+  -R udp:[bind_address:]port:/local_socket
+  -R udp_/remote_socket:host:hostport
+  -R udp-/remote_socket:/local_socket
+  ```
+
+- 配置文件 UDP 端口转发，类似 `LocalForward` 和 `RemoteForward`，增加 `UDP` 前缀 (不区分大小写)：
+
+  ```
+  UdpLocalForward [bind_address:]port host:hostport
+  UdpLocalForward [bind_address:]port /remote_socket
+  UdpLocalForward /local_socket host:hostport
+  UdpLocalForward /local_socket /remote_socket
+
+  UdpRemoteForward [bind_address:]port host:hostport
+  UdpRemoteForward [bind_address:]port /local_socket
+  UdpRemoteForward /remote_socket host:hostport
+  UdpRemoteForward /remote_socket /local_socket
+  ```
+
+- `ForwardUdpTimeout`: 设置 UDP 转发会话的空闲超时时间。在指定时间内无数据收发时将自动清理对应的转发会话以释放资源。默认 5 分钟。
 
 ## 联系方式
 

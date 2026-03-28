@@ -152,7 +152,11 @@ tssh and tsshd works exactly like ssh, there are no plans to support local echo 
   <details><summary><code>go install github.com/trzsz/tsshd/cmd/tsshd@latest</code></summary>
 
   ```sh
+  # latest release
   go install github.com/trzsz/tsshd/cmd/tsshd@latest
+
+  # latest development version (main branch)
+  go install github.com/trzsz/tsshd/cmd/tsshd@main
   ```
 
   The binaries are usually located in ~/go/bin/ ( C:\Users\your_name\go\bin\ on Windows ).
@@ -283,6 +287,40 @@ Host xxx
 - `UdpProxyMode`: The default transport protocol is `UDP`. If `UDP` traffic is blocked by firewalls in your network environment, you can set it to `TCP` to work around the restriction, though this may introduce additional latency.
 
 - `UdpMTU`: Sets the maximum transmission unit (MTU) for UDP packets. Default is 1400.
+
+### UDP Port Forwarding
+
+When using tssh as the client, UDP port forwarding is supported.
+
+- Command-line `-L` / `-R` options are extended with a `udp/` prefix (the `/` can also be replaced with `:`, `_`, or `-`):
+
+  ```
+  -L udp/[bind_address:]port:host:hostport
+  -L udp:[bind_address:]port:/remote_socket
+  -L udp_/local_socket:host:hostport
+  -L udp-/local_socket:/remote_socket
+
+  -R udp/[bind_address:]port:host:hostport
+  -R udp:[bind_address:]port:/local_socket
+  -R udp_/remote_socket:host:hostport
+  -R udp-/remote_socket:/local_socket
+  ```
+
+- Configuration is similar to `LocalForward` and `RemoteForward`, with an added `UDP` prefix (case-insensitive):
+
+  ```
+  UdpLocalForward [bind_address:]port host:hostport
+  UdpLocalForward [bind_address:]port /remote_socket
+  UdpLocalForward /local_socket host:hostport
+  UdpLocalForward /local_socket /remote_socket
+
+  UdpRemoteForward [bind_address:]port host:hostport
+  UdpRemoteForward [bind_address:]port /local_socket
+  UdpRemoteForward /remote_socket host:hostport
+  UdpRemoteForward /remote_socket /local_socket
+  ```
+
+- `ForwardUdpTimeout`: Sets the idle timeout for UDP forwarding sessions; the corresponding forwarding session will be cleared automatically if no data is sent or received within this period to free resources. Default is 5 minutes.
 
 ### Contact
 
