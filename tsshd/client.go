@@ -515,11 +515,23 @@ func (c *SshUdpClient) tryToReconnect() {
 		c.debug("new transport path established")
 		c.reconnectError.Store(nil)
 
-		// blocks until the server becomes active or a timeout occurs
-		for !c.clientProxy.serverChecker.isTimeout() {
+		// After a successful reconnection, activeChecker.isTimeout() does not immediately become false.
+		// We wait here until the heartbeat normalizes (activeChecker.isTimeout() == false).
+		//
+		// Note: Before renewTransportPath returns successfully, it calls serverChecker.updateNow(),
+		// so we expect serverChecker.isTimeout() to be false. However, because serverChecker.timeoutFlag
+		// is updated asynchronously by another goroutine, an immediate check might incorrectly return true.
+		// To prevent a premature reconnection loop, we wait a short interval before checking serverChecker.isTimeout().
+		//
+		// If the connection drops again while waiting (serverChecker.isTimeout() == true),
+		// we break the loop to trigger another reconnection attempt.
+		for {
 			time.Sleep(c.intervalTime)
 			if !c.activeChecker.isTimeout() {
 				return
+			}
+			if c.clientProxy.serverChecker.isTimeout() {
+				break
 			}
 		}
 	}
