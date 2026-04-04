@@ -29,6 +29,7 @@ import (
 	"os"
 	os_user "os/user"
 	"path/filepath"
+	"regexp"
 	"runtime"
 	"strings"
 )
@@ -188,9 +189,34 @@ func splitKeyValue(line string) (string, string) {
 	return key, value
 }
 
+func wildcardToRegexp(pattern string) string {
+	var buf strings.Builder
+	buf.WriteByte('^')
+	for _, c := range pattern {
+		switch c {
+		case '*':
+			buf.WriteString(".*")
+		case '?':
+			buf.WriteByte('.')
+		case '(', ')', '[', ']', '{', '}', '.', '+', ',', '-', '^', '$', '|', '\\':
+			buf.WriteByte('\\')
+			buf.WriteRune(c)
+		default:
+			buf.WriteRune(c)
+		}
+	}
+	buf.WriteByte('$')
+	return buf.String()
+}
+
 func wildcardMatch(pattern, value string) bool {
-	matched, _ := filepath.Match(pattern, value)
-	return matched
+	expr := wildcardToRegexp(pattern)
+	re, err := regexp.Compile(expr)
+	if err != nil {
+		warning("sshd_config: compile [%s] regexp [%s] failed: %v", pattern, expr, err)
+		return false
+	}
+	return re.MatchString(value)
 }
 
 func evalMatchLine(line, user string, groups []string) bool {

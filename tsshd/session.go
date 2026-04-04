@@ -41,6 +41,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/google/shlex"
 	"github.com/trzsz/shellescape"
 )
 
@@ -852,23 +853,7 @@ func getSessionStartCmd(msg *startMessage) (*exec.Cmd, error) {
 		return getSubsystemCmd(msg.Subs)
 	}
 
-	var envs []string
-	for _, env := range os.Environ() {
-		pos := strings.IndexRune(env, '=')
-		if pos <= 0 {
-			continue
-		}
-		name := strings.TrimSpace(env[:pos])
-		if name == kEnvTsshdBackground {
-			continue
-		}
-		if _, ok := msg.Envs[name]; !ok {
-			envs = append(envs, env)
-		}
-	}
-	for key, value := range msg.Envs {
-		envs = append(envs, fmt.Sprintf("%s=%s", key, value))
-	}
+	envs := getEnvironments(msg)
 
 	if !msg.Shell {
 		name := msg.Name
@@ -921,6 +906,72 @@ func getSessionStartCmd(msg *startMessage) (*exec.Cmd, error) {
 	}
 	cmd.Env = envs
 	return cmd, nil
+}
+
+func getEnvironments(msg *startMessage) []string {
+	var envs []string
+
+	var acceptEnvExpr string
+	acceptEnv := getSshdConfig("AcceptEnv")
+	if acceptEnv != "" {
+		patterns, err := shlex.Split(acceptEnv)
+		if err != nil {
+			warning("split AcceptEnv [%s] failed: %v", acceptEnv, err)
+		} else {
+			var buf strings.Builder
+			for _, pattern := range patterns {
+				if buf.Len() > 0 {
+					buf.WriteByte('|')
+				}
+				buf.WriteByte('(')
+				buf.WriteString(wildcardToRegexp(pattern))
+				buf.WriteByte(')')
+			}
+			acceptEnvExpr = buf.String()
+			debug("accept env regexp: %s", acceptEnvExpr)
+		}
+	}
+
+	var acceptEnvRegexp *regexp.Regexp
+	if acceptEnvExpr != "" {
+		var err error
+		acceptEnvRegexp, err = regexp.Compile(acceptEnvExpr)
+		if err != nil {
+			warning("compile AcceptEnv [%s] regexp [%s] failed: %v", acceptEnv, acceptEnvExpr, err)
+		}
+	}
+
+	acceptMap := make(map[string]struct{})
+	for name, value := range msg.Envs {
+		if name == "TERM" { // always allow TERM from pty-req
+			acceptMap[name] = struct{}{}
+			envs = append(envs, fmt.Sprintf("%s=%s", name, value))
+			continue
+		}
+		if acceptEnvRegexp == nil || !acceptEnvRegexp.MatchString(name) {
+			debug("ignore env: %s=%s", name, value)
+			continue
+		}
+		debug("accept env: %s=%s", name, value)
+		acceptMap[name] = struct{}{}
+		envs = append(envs, fmt.Sprintf("%s=%s", name, value))
+	}
+
+	for _, env := range os.Environ() {
+		pos := strings.IndexRune(env, '=')
+		if pos <= 0 {
+			continue
+		}
+		name := strings.TrimSpace(env[:pos])
+		if name == kEnvTsshdBackground {
+			continue
+		}
+		if _, ok := acceptMap[name]; !ok {
+			envs = append(envs, env)
+		}
+	}
+
+	return envs
 }
 
 func getSubsystemCmd(name string) (*exec.Cmd, error) {
