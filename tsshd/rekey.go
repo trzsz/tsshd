@@ -225,7 +225,9 @@ func (r *rotatingCrypto) installKey(secret []byte, active bool) error {
 	r.bytesConsumed, r.bytesTriggered = 0, false
 	r.rekeyInFlight = false
 
-	r.debug("traffic key installed: key count [%d] active index [%d]", len(r.gcmList), r.activeIdx)
+	if !r.delegatedToProxy {
+		r.debug("traffic key installed: key count [%d] active index [%d]", len(r.gcmList), r.activeIdx)
+	}
 
 	return nil
 }
@@ -361,8 +363,10 @@ func (r *rotatingCrypto) Close() {
 	}
 }
 
-func newRotatingCrypto(client *SshUdpClient, pass, salt []byte, bytesThreshold uint64, timeThreshold time.Duration) (*rotatingCrypto, error) {
-	r := &rotatingCrypto{client: client, keyPass: pass, keySalt: salt, timeThreshold: timeThreshold, bytesThreshold: bytesThreshold}
+func newRotatingCrypto(client *SshUdpClient, pass, salt []byte, bytesThreshold uint64, timeThreshold time.Duration,
+	delegToProxy bool) (*rotatingCrypto, error) {
+	r := &rotatingCrypto{client: client, keyPass: pass, keySalt: salt,
+		timeThreshold: timeThreshold, bytesThreshold: bytesThreshold, delegatedToProxy: delegToProxy}
 
 	if err := r.installKey(pass, true); err != nil {
 		return nil, err

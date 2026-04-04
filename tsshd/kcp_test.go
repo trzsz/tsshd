@@ -513,7 +513,7 @@ func TestKCP_DelegatedCrypto(t *testing.T) {
 	svrConn := listenRandomUDP(t)
 	defer func() { _ = svrConn.Close() }()
 
-	crypto, err := newRotatingCrypto(nil, pass, salt, 0, 0)
+	crypto, err := newRotatingCrypto(nil, pass, salt, 0, 0, false)
 	if err != nil {
 		t.Fatalf("newRotatingCrypto failed: %v", err)
 	}

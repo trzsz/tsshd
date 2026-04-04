@@ -488,7 +488,7 @@ func (m *mockFrontendConn) readFrom([]byte) (int, *clientState) {
 	return 0, nil
 }
 
-func (m *mockFrontendConn) writeTo(buf []byte, _ *clientState) {
+func (m *mockFrontendConn) writeTo(buf []byte, _ *clientState) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
@@ -496,6 +496,7 @@ func (m *mockFrontendConn) writeTo(buf []byte, _ *clientState) {
 	cp := make([]byte, len(buf))
 	copy(cp, buf)
 	m.data = append(m.data, cp)
+	return nil
 }
 
 func (m *mockFrontendConn) getAll() [][]byte {
@@ -571,7 +572,7 @@ func (m *mockPacketConn) getAll() [][]byte {
 func TestClientProxyWriteToAndCache(t *testing.T) {
 	// ---------- setup ----------
 	_, pass, salt := newTestKcpConfig(t)
-	kcpCrypto, err := newRotatingCrypto(nil, pass, salt, 0, 0)
+	kcpCrypto, err := newRotatingCrypto(nil, pass, salt, 0, 0, false)
 	if err != nil {
 		t.Fatalf("newRotatingCrypto failed: %v", err)
 	}

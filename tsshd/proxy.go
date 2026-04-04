@@ -41,6 +41,10 @@ const kProxyBufferSize = 1024 * 1024
 
 const kProxyDSCP = 46
 
+// For QUIC/KCP encrypted packets, the authentication tag is 16 bytes.
+// Packets with length <= 16 bytes cannot be valid and are safe to drop.
+const kSafeToDropPacketLen = 16
+
 func setDSCP(conn net.Conn, dscp int) {
 	_ = ipv4.NewConn(conn).SetTOS(dscp << 2)
 	_ = ipv6.NewConn(conn).SetTrafficClass(dscp)
@@ -97,6 +101,7 @@ func recvUdpPacket(conn io.Reader, data []byte) (int, error) {
 	return n, nil
 }
 
+const kSampleCacheSize = 10
 const kPacketCacheSize = 100
 
 type packetCache struct {
@@ -106,6 +111,22 @@ type packetCache struct {
 	recentIdx  int
 	totalSize  int
 	totalCount int
+	sampleIdx  int
+	sampleBuf  [kSampleCacheSize][]byte
+}
+
+func (p *packetCache) addSample(buf []byte) {
+	p.mutex.Lock()
+	defer p.mutex.Unlock()
+
+	data := make([]byte, len(buf))
+	copy(data, buf)
+
+	p.sampleBuf[p.sampleIdx] = data
+	p.sampleIdx = p.sampleIdx + 1
+	if p.sampleIdx >= kSampleCacheSize {
+		p.sampleIdx = 0
+	}
 }
 
 func (p *packetCache) addPacket(buf []byte) {
@@ -145,15 +166,33 @@ func (p *packetCache) sendCache(writeFn func([]byte) error) (flushSize, flushCou
 	p.mutex.Lock()
 	defer p.mutex.Unlock()
 
+	var once sync.Once
+
+	for i := range kSampleCacheSize {
+		buf := p.sampleBuf[(p.sampleIdx+i)%kSampleCacheSize]
+		if len(buf) == 0 {
+			continue
+		}
+		if err := writeFn(buf); err != nil {
+			once.Do(func() { debug("send cache failed: %v", err) })
+		}
+		flushSize += len(buf)
+		flushCount++
+	}
+
 	for _, buf := range p.firstBuf {
-		_ = writeFn(buf)
+		if err := writeFn(buf); err != nil {
+			once.Do(func() { debug("send cache failed: %v", err) })
+		}
 		flushSize += len(buf)
 		flushCount++
 	}
 
 	for i := range len(p.recentBuf) {
 		buf := p.recentBuf[(p.recentIdx+i)%kPacketCacheSize]
-		_ = writeFn(buf)
+		if err := writeFn(buf); err != nil {
+			once.Do(func() { debug("send cache failed: %v", err) })
+		}
 		flushSize += len(buf)
 		flushCount++
 	}
@@ -164,6 +203,10 @@ func (p *packetCache) sendCache(writeFn func([]byte) error) (flushSize, flushCou
 func (p *packetCache) clearCache() (totalSize, totalCount int) {
 	p.mutex.Lock()
 	defer p.mutex.Unlock()
+
+	for i := range kSampleCacheSize {
+		p.sampleBuf[i] = nil
+	}
 
 	p.firstBuf, p.recentBuf, p.recentIdx = nil, nil, 0
 

@@ -30,6 +30,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"os"
 	"strconv"
 	"strings"
 	"sync"
@@ -50,6 +51,41 @@ var initDebugSenderOnce sync.Once
 
 var warningMsgChan chan string
 var initWarningSenderOnce sync.Once
+
+var debugLogFile *os.File
+var cleanupDebugLog atomic.Bool
+
+func initDebugLogging() {
+	enableDebugLogging = true
+
+	var err error
+	debugLogFile, err = os.CreateTemp("", fmt.Sprintf("tsshd_debug_%d_*.log", os.Getpid()))
+	if err != nil {
+		debug("create debug log file failed: %v", err)
+	} else {
+		debug("tsshd log path: %s", debugLogFile.Name())
+		addOnExitFunc(func() {
+			_ = debugLogFile.Close()
+			if cleanupDebugLog.Load() {
+				_ = os.Remove(debugLogFile.Name())
+			}
+		})
+	}
+
+	if path, err := os.Executable(); err == nil {
+		debug("tsshd exe path: %s", path)
+	}
+	debug("tsshd version: %s", getTsshdVersion())
+	debug("tsshd options: %s", strings.Join(os.Args[1:], " "))
+}
+
+func writeDebugLog(now *time.Time, msg string) {
+	if debugLogFile == nil {
+		return
+	}
+
+	_, _ = fmt.Fprintf(debugLogFile, "%s | %s\n", now.Format("15:04:05.000"), msg)
+}
 
 func debug(format string, a ...any) {
 	if !enableDebugLogging {
@@ -73,12 +109,17 @@ func debug(format string, a ...any) {
 					time.Sleep(100 * time.Millisecond)
 					server = activeSshUdpServer.Load()
 				}
-				_ = server.sendBusMessage("debug", msg)
+				if err := server.sendBusMessage("debug", msg); err != nil && debugLogFile != nil {
+					now := time.Now()
+					writeDebugLog(&now, fmt.Sprintf("send debug message failed: %v", err))
+				}
 			}
 		})
 	})
 
-	dbgMsg := &debugMessage{Msg: msg, Time: time.Now().UnixMilli()}
+	now := time.Now()
+	writeDebugLog(&now, msg)
+	dbgMsg := &debugMessage{Msg: msg, Time: now.UnixMilli()}
 
 	busClosingMu.Lock()
 	defer busClosingMu.Unlock()
@@ -115,10 +156,18 @@ func warning(format string, a ...any) {
 					time.Sleep(100 * time.Millisecond)
 					server = activeSshUdpServer.Load()
 				}
-				_ = server.sendBusMessage("error", errorMessage{Msg: msg})
+				if err := server.sendBusMessage("error", errorMessage{Msg: msg}); err != nil && debugLogFile != nil {
+					now := time.Now()
+					writeDebugLog(&now, fmt.Sprintf("send error message failed: %v", err))
+				}
 			}
 		})
 	})
+
+	if debugLogFile != nil {
+		now := time.Now()
+		writeDebugLog(&now, fmt.Sprintf("warning: %s", msg))
+	}
 
 	busClosingMu.Lock()
 	defer busClosingMu.Unlock()
@@ -218,28 +267,28 @@ type timeoutChecker struct {
 	closed               atomic.Bool
 	closeChan            chan struct{}
 	timeoutFlag          atomic.Bool
-	timeoutMilli         atomic.Int64
 	lastAliveTime        atomic.Int64
 	reconnectedCh        atomic.Pointer[chan struct{}]
 	updateNowChan        chan struct{}
 	updateTimeChan       chan int64
 	timeoutEventChan     chan struct{}
+	heartbeatTimeout     time.Duration
 	timeoutCallbacks     []func()
 	reconnectedCallbacks []func()
 }
 
-func newTimeoutChecker(timeout time.Duration) *timeoutChecker {
+func newTimeoutChecker(heartbeatTimeout time.Duration) *timeoutChecker {
 	tc := &timeoutChecker{
 		closeChan:        make(chan struct{}),
 		updateNowChan:    make(chan struct{}, 1),
 		updateTimeChan:   make(chan int64, 2),
 		timeoutEventChan: make(chan struct{}),
+		heartbeatTimeout: heartbeatTimeout,
 	}
-	tc.timeoutMilli.Store(int64(timeout / time.Millisecond))
 	tc.lastAliveTime.Store(time.Now().UnixMilli())
 
 	go tc.handleEvent()
-	if tc.timeoutMilli.Load() > 0 {
+	if tc.heartbeatTimeout > 0 {
 		go tc.checkTimeout()
 	}
 
@@ -251,6 +300,10 @@ func (tc *timeoutChecker) isTimeout() bool {
 }
 
 func (tc *timeoutChecker) waitUntilReconnected() error {
+	return tc.waitReconnect(context.Background())
+}
+
+func (tc *timeoutChecker) waitReconnect(ctx context.Context) error {
 	for {
 		if !tc.isTimeout() {
 			return nil
@@ -270,6 +323,8 @@ func (tc *timeoutChecker) waitUntilReconnected() error {
 			continue
 		case <-tc.closeChan:
 			return fmt.Errorf("timeout closed")
+		case <-ctx.Done():
+			return ctx.Err()
 		}
 	}
 }
@@ -322,10 +377,10 @@ func (tc *timeoutChecker) notifyReconnected() {
 
 func (tc *timeoutChecker) checkTimeout() {
 	for !tc.closed.Load() {
-		sleepMilli := tc.lastAliveTime.Load() + tc.timeoutMilli.Load() - time.Now().UnixMilli()
-		if sleepMilli > 0 {
+		sleepTime := time.Until(time.UnixMilli(tc.lastAliveTime.Load()).Add(tc.heartbeatTimeout))
+		if sleepTime > 0 {
 			select {
-			case <-time.After(min(time.Duration(sleepMilli)*time.Millisecond, 10*time.Second)):
+			case <-time.After(min(sleepTime, 10*time.Second)):
 			case <-tc.closeChan:
 				return
 			}
@@ -340,7 +395,7 @@ func (tc *timeoutChecker) checkTimeout() {
 		}
 
 		select {
-		case <-time.After(min(time.Duration(tc.timeoutMilli.Load())*time.Millisecond, 10*time.Second)):
+		case <-time.After(min(tc.heartbeatTimeout, 10*time.Second)):
 		case <-tc.closeChan:
 			return
 		}
@@ -366,12 +421,12 @@ func (tc *timeoutChecker) handleEvent() {
 		case msec := <-tc.updateTimeChan:
 			if msec > tc.lastAliveTime.Load() {
 				tc.lastAliveTime.Store(msec)
-				if msec+tc.timeoutMilli.Load() > time.Now().UnixMilli() {
+				if time.UnixMilli(msec).Add(tc.heartbeatTimeout).After(time.Now()) {
 					setReconnected()
 				}
 			}
 		case <-tc.timeoutEventChan:
-			if tc.lastAliveTime.Load()+tc.timeoutMilli.Load() <= time.Now().UnixMilli() {
+			if time.UnixMilli(tc.lastAliveTime.Load()).Add(tc.heartbeatTimeout).Before(time.Now()) {
 				if !tc.timeoutFlag.Load() {
 					newCh := make(chan struct{})
 					if oldCh := tc.reconnectedCh.Swap(&newCh); oldCh != nil && *oldCh != nil {

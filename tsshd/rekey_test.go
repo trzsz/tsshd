@@ -31,12 +31,12 @@ import (
 
 func TestRotatingCrypto_MultiKeyOpenOverlap(t *testing.T) {
 	// Simulate client and server rotatingCrypto
-	clientCrypto, err := newRotatingCrypto(nil, []byte("secret1"), []byte("salt1"), 0, 0)
+	clientCrypto, err := newRotatingCrypto(nil, []byte("secret1"), []byte("salt1"), 0, 0, false)
 	if err != nil {
 		t.Fatalf("client newRotatingCrypto failed: %v", err)
 	}
 
-	serverCrypto, err := newRotatingCrypto(nil, []byte("secret1"), []byte("salt1"), 0, 0)
+	serverCrypto, err := newRotatingCrypto(nil, []byte("secret1"), []byte("salt1"), 0, 0, false)
 	if err != nil {
 		t.Fatalf("server newRotatingCrypto failed: %v", err)
 	}

@@ -517,19 +517,13 @@ func (c *SshUdpClient) tryToReconnect() {
 
 		// After a successful reconnection, activeChecker.isTimeout() does not immediately become false.
 		// We wait here until the heartbeat normalizes (activeChecker.isTimeout() == false).
-		//
-		// Note: Before renewTransportPath returns successfully, it calls serverChecker.updateNow(),
-		// so we expect serverChecker.isTimeout() to be false. However, because serverChecker.timeoutFlag
-		// is updated asynchronously by another goroutine, an immediate check might incorrectly return true.
-		// To prevent a premature reconnection loop, we wait a short interval before checking serverChecker.isTimeout().
-		//
-		// If the connection drops again while waiting (serverChecker.isTimeout() == true),
-		// we break the loop to trigger another reconnection attempt.
 		for {
 			time.Sleep(c.intervalTime)
 			if !c.activeChecker.isTimeout() {
 				return
 			}
+			// If the connection drops again while waiting (serverChecker.isTimeout() == true),
+			// we break the loop to trigger another reconnection attempt.
 			if c.clientProxy.serverChecker.isTimeout() {
 				break
 			}
@@ -1153,12 +1147,14 @@ func (s *SshUdpSession) RedrawScreen() {
 	if s.height <= 0 || s.width <= 0 {
 		return
 	}
-	_ = s.client.sendBusMessage("resize", resizeMessage{
+	if err := s.client.sendBusMessage("resize", resizeMessage{
 		ID:     s.id,
 		Cols:   s.width,
 		Rows:   s.height,
 		Redraw: true,
-	})
+	}); err != nil {
+		s.client.warning("send redraw message failed: %v", err)
+	}
 }
 
 // GetTerminalWidth returns the width of the terminal

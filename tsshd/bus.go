@@ -93,6 +93,19 @@ func (s *sshUdpServer) handleBusEvent(stream Stream) {
 		return
 	}
 
+	go func() {
+		// Periodically sample traffic packets.
+		// These samples are replayed upon reconnection to proactively trigger QUIC/KCP session recovery.
+		ticker := time.NewTicker(max(msg.HeartbeatTimeout/kSampleCacheSize, 100*time.Millisecond))
+		defer ticker.Stop()
+		for range ticker.C {
+			if s.closed.Load() {
+				return
+			}
+			s.shouldSample.Store(true)
+		}
+	}()
+
 	intervalTimeMilli := int64(msg.IntervalTime / time.Millisecond)
 	heartbeatTimeoutMilli := int64(msg.HeartbeatTimeout / time.Millisecond)
 
@@ -108,7 +121,10 @@ func (s *sshUdpServer) handleBusEvent(stream Stream) {
 
 		if server := activeSshUdpServer.Load(); server != s {
 			if enableDebugLogging {
-				_ = s.sendBusMessage("debug", debugMessage{Msg: "server instance is no longer active", Time: time.Now().UnixMilli()})
+				if err := s.sendBusMessage("debug",
+					debugMessage{Msg: "server instance is no longer active", Time: time.Now().UnixMilli()}); err != nil {
+					debug("send debug message failed: %v", err)
+				}
 			}
 			return
 		}

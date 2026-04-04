@@ -11,7 +11,7 @@ require (
 	github.com/stretchr/testify v1.11.1
 	github.com/trzsz/shellescape v1.6.0
 	github.com/trzsz/smux v1.6.0
-	github.com/xtaci/kcp-go/v5 v5.6.71
+	github.com/xtaci/kcp-go/v5 v5.6.72
 	golang.org/x/crypto v0.49.0
 	golang.org/x/net v0.52.0
 	golang.org/x/sys v0.42.0

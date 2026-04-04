@@ -452,11 +452,10 @@ func newProtoClient(opts *UdpClientOptions, proxy *clientProxy, remoteAddr net.A
 }
 
 func newKcpClient(opts *UdpClientOptions, udpConn net.PacketConn, remoteAddr net.Addr, pass, salt []byte, delegToProxy bool) (*kcpClient, error) {
-	crypto, err := newRotatingCrypto(nil, pass, salt, 0, 0)
+	crypto, err := newRotatingCrypto(nil, pass, salt, 0, 0, delegToProxy)
 	if err != nil {
 		return nil, fmt.Errorf("new rotating crypto failed: %w", err)
 	}
-	crypto.delegatedToProxy = delegToProxy
 	block := kcp.NewAEADCrypt(crypto)
 
 	conn, err := kcp.NewConn2(remoteAddr, block, 1, 1, udpConn)

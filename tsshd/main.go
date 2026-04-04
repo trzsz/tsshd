@@ -216,8 +216,7 @@ func TsshdMain() int {
 
 	// init debug
 	if args.Debug {
-		enableDebugLogging = true
-		debug("tsshd version: %s", getTsshdVersion())
+		initDebugLogging()
 	}
 
 	// init sshd_config
@@ -234,6 +233,7 @@ func TsshdMain() int {
 	// init tsshd server
 	info, err := initServer(args)
 	if err != nil {
+		debug("init server failed: %v", err)
 		fmt.Println(err)
 		_ = os.Stdout.Close()
 		return kExitCodeInitServer
@@ -244,6 +244,11 @@ func TsshdMain() int {
 	addOnExitFunc(func() {
 		if server := activeSshUdpServer.Load(); server != nil {
 			server.Close()
+			// If the client is still active on exit, logs have likely been delivered,
+			// so the server-side debug log can be cleaned up.
+			if enableDebugLogging && !server.clientChecker.isTimeout() {
+				cleanupDebugLog.Store(true)
+			}
 		}
 	})
 
@@ -307,7 +312,9 @@ func handleExitSignals() {
 
 	sig := <-sigChan
 	if s := activeSshUdpServer.Load(); s != nil {
-		_ = s.sendBusMessage("quit", quitMessage{fmt.Sprintf("receiving signal [%v] from the operating system", sig)})
+		if err := s.sendBusMessage("quit", quitMessage{fmt.Sprintf("receiving signal [%v] from the operating system", sig)}); err != nil {
+			warning("send quit message failed: %v", err)
+		}
 	}
 	go func() {
 		time.Sleep(time.Second) // give udp some time

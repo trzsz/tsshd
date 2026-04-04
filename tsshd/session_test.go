@@ -257,7 +257,7 @@ func TestForwardOutput_VoidedCapacity(t *testing.T) {
 
 	var buf bytes.Buffer
 	for i := range 1000 {
-		buf.WriteString(fmt.Sprintf("|%d\n", i))
+		fmt.Fprintf(&buf, "|%d\n", i)
 	}
 	reader := &chunkReader{data: [][]byte{buf.Bytes()}, chunk: 1}
 
@@ -398,7 +398,7 @@ func TestForwardOutput_DiscardTmuxOutput(t *testing.T) {
 	stream := newMockStream()
 	var buf bytes.Buffer
 	for i := range 10 {
-		buf.WriteString(fmt.Sprintf("%%output %%56 %d\r\n", i))
+		fmt.Fprintf(&buf, "%%output %%56 %d\r\n", i)
 	}
 	reader := &chunkReader{data: [][]byte{buf.Bytes()}, chunk: 10}
 
@@ -419,7 +419,7 @@ func TestForwardOutput_DiscardExtendedOutput(t *testing.T) {
 	stream := newMockStream()
 	var buf bytes.Buffer
 	for i := range 100 {
-		buf.WriteString(fmt.Sprintf("%%extended-output %%123 0 : %d\r\n", i))
+		fmt.Fprintf(&buf, "%%extended-output %%123 0 : %d\r\n", i)
 	}
 	reader := &chunkReader{data: [][]byte{buf.Bytes()}, chunk: 10}
 

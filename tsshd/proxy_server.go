@@ -51,19 +51,18 @@ func (a *proxyClientAddr) String() string {
 }
 
 type clientState struct {
-	sealed        atomic.Bool
-	server        atomic.Pointer[sshUdpServer]
-	proxyAddr     proxyClientAddr
-	serialNumber  atomic.Uint64
-	clientConn    atomic.Pointer[net.TCPConn]
-	clientAddr    atomic.Pointer[net.UDPAddr]
-	authedAddr    atomic.Pointer[net.UDPAddr]
-	udpFrontConn  atomic.Pointer[udpFrontendConn]
-	clientMutex   sync.Mutex
-	clientCond    *sync.Cond
-	pktCache      packetCache
-	sendCacheFlag atomic.Bool
-	kcpCrypto     *rotatingCrypto
+	sealed       atomic.Bool
+	server       atomic.Pointer[sshUdpServer]
+	proxyAddr    proxyClientAddr
+	serialNumber atomic.Uint64
+	clientConn   atomic.Pointer[net.TCPConn]
+	clientAddr   atomic.Pointer[net.UDPAddr]
+	authedAddr   atomic.Pointer[net.UDPAddr]
+	udpFrontConn atomic.Pointer[udpFrontendConn]
+	clientMutex  sync.Mutex
+	clientCond   *sync.Cond
+	pktCache     packetCache
+	kcpCrypto    *rotatingCrypto
 }
 
 func (c *clientState) remoteAddr() string {
@@ -104,35 +103,14 @@ func (c *clientState) setClientConn(conn *net.TCPConn) {
 	}
 }
 
-func (c *clientState) waitClientAddr() *net.UDPAddr {
-	if addr := c.clientAddr.Load(); addr != nil {
-		return addr
-	}
-
-	c.clientMutex.Lock()
-	defer c.clientMutex.Unlock()
-
-	addr := c.clientAddr.Load()
-	for addr == nil {
-		c.clientCond.Wait()
-		addr = c.clientAddr.Load()
-	}
-
-	return addr
-}
-
 func (c *clientState) setClientAddr(addr *net.UDPAddr) {
 	conn := c.udpFrontConn.Load()
 
-	c.clientMutex.Lock()
 	oldAddr := c.clientAddr.Swap(addr)
-	if addr != nil {
-		if conn != nil {
-			conn.addClientMap(c)
-		}
-		c.clientCond.Broadcast()
+
+	if addr != nil && conn != nil {
+		conn.addClientMap(c)
 	}
-	c.clientMutex.Unlock()
 
 	if oldAddr != nil && conn != nil {
 		conn.delClientMap(oldAddr)
@@ -146,21 +124,6 @@ func (c *clientState) setAuthedAddr(addr *net.UDPAddr) {
 
 	if addr != nil && conn != nil {
 		conn.addAuthedMap(c)
-
-		// Based on logs, we observed an issue when using QUIC:
-		// multiple "authed" events occur, but no subsequent client packets
-		// are received, causing the connection to remain stuck in the auth stage.
-		// As a workaround, attempt to flush cached UDP packets here to see if it
-		// helps QUIC resume normal communication.
-		go func() {
-			time.Sleep(time.Second)
-			if c.authedAddr.Load() == addr {
-				hasCache := c.sendPacketCache(conn)
-				if enableDebugLogging && !hasCache {
-					debug("auth stage timeout but no cached packets to flush")
-				}
-			}
-		}()
 	}
 
 	if oldAddr != nil && conn != nil {
@@ -177,8 +140,7 @@ func (c *clientState) sendPacketCache(conn frontendConnection) bool {
 				return err
 			}
 		}
-		conn.writeTo(buf, c)
-		return nil
+		return conn.writeTo(buf, c)
 	})
 
 	hasCache := flushSize > 0 || flushCount > 0
@@ -193,7 +155,7 @@ func (c *clientState) sendPacketCache(conn frontendConnection) bool {
 type frontendConnection interface {
 	start(*serverProxy)
 	readFrom([]byte) (int, *clientState)
-	writeTo([]byte, *clientState)
+	writeTo([]byte, *clientState) error
 }
 
 type udpFrontendConn struct {
@@ -242,6 +204,7 @@ func (c *udpFrontendConn) initConn(conn *net.UDPConn, addr *net.UDPAddr, clientI
 	if addr != nil {
 		client := c.proxy.getClient(clientID)
 		if client == nil {
+			warning("get client [%x] return nil", clientID)
 			return
 		}
 		client.udpFrontConn.Store(c)
@@ -420,6 +383,9 @@ func (c *udpFrontendConn) readFrom(buf []byte) (int, *clientState) {
 		// Case 1: packet from current effective client.
 		// Fast path — directly forward.
 		if isClientAddr {
+			if n <= kSafeToDropPacketLen {
+				continue
+			}
 			return n, client
 		}
 
@@ -436,14 +402,19 @@ func (c *udpFrontendConn) readFrom(buf []byte) (int, *clientState) {
 					client.setClientAddr(addr)
 					client.setAuthedAddr(nil)
 					c.proxy.onNewClientConn(client)
+					if n <= kSafeToDropPacketLen {
+						continue
+					}
 					return n, client
 				} else {
+					warning("authed addr missing: client_id=%x, new_serial=%d", clientID, newSerialNumber)
 					continue
 				}
 			}
 
 			// Client ID mismatch — this should not happen.
 			if clientID != client.proxyAddr.clientID {
+				warning("client id mismatch: expected=%d, got=%d", client.proxyAddr.clientID, clientID)
 				client.setAuthedAddr(nil)
 				continue
 			}
@@ -451,13 +422,18 @@ func (c *udpFrontendConn) readFrom(buf []byte) (int, *clientState) {
 			// Redundant authentication packet.
 			// Update serial number if newer and resend auth response.
 			oldSerialNumber := client.serialNumber.Load()
-			if newSerialNumber >= oldSerialNumber {
-				if !client.serialNumber.CompareAndSwap(oldSerialNumber, newSerialNumber) {
-					newSerialNumber = client.serialNumber.Load()
-				}
-				if b, err := c.proxy.sealAuthPacket(newSerialNumber); err == nil {
-					_, _ = conn.WriteTo(b, addr)
-				}
+			if newSerialNumber < oldSerialNumber {
+				debug("authenticate rejected: old_serial=%d, new_serial=%d", oldSerialNumber, newSerialNumber)
+				continue
+			}
+			if !client.serialNumber.CompareAndSwap(oldSerialNumber, newSerialNumber) {
+				debug("authenticate conflict: old_serial=%d, new_serial=%d", oldSerialNumber, newSerialNumber)
+				newSerialNumber = client.serialNumber.Load()
+			}
+			if b, err := c.proxy.sealAuthPacket(newSerialNumber); err != nil {
+				warning("seal auth packet failed: %v", err)
+			} else if _, err := conn.WriteTo(b, addr); err != nil {
+				warning("send auth packet failed: %v", err)
 			}
 			continue
 		}
@@ -465,44 +441,52 @@ func (c *udpFrontendConn) readFrom(buf []byte) (int, *clientState) {
 		// Case 3: packet from unknown address.
 		// Only valid authentication packets can create a new authed address.
 		isAuthPacket, clientID, newSerialNumber := c.proxy.openAuthPacket(buf[:n])
-		client = c.proxy.getClient(clientID)
-		if client == nil {
+		if !isAuthPacket {
 			continue
 		}
+
+		client = c.proxy.getClient(clientID)
+		if client == nil {
+			warning("get client [%x] return nil", clientID)
+			continue
+		}
+
 		client.udpFrontConn.Store(c)
 		oldSerialNumber := client.serialNumber.Load()
-		if isAuthPacket && newSerialNumber > oldSerialNumber {
-			if client.serialNumber.CompareAndSwap(oldSerialNumber, newSerialNumber) {
-				if enableDebugLogging {
-					debug("client [%x] [%d] authed from %s", clientID, newSerialNumber, addr)
-				}
-				// Store as authenticated but not yet activated address.
-				client.setAuthedAddr(cloneNetAddr(addr).(*net.UDPAddr))
-			} else {
-				newSerialNumber = client.serialNumber.Load()
-			}
-			// Send authentication response (ack).
-			if b, err := c.proxy.sealAuthPacket(newSerialNumber); err == nil {
-				_, _ = conn.WriteTo(b, addr)
-			}
+		if newSerialNumber <= oldSerialNumber {
+			debug("authenticate rejected: old_serial=%d, new_serial=%d", oldSerialNumber, newSerialNumber)
 			continue
+		}
+
+		if client.serialNumber.CompareAndSwap(oldSerialNumber, newSerialNumber) {
+			debug("client [%x] [%d] authed from %s", clientID, newSerialNumber, addr)
+			// Store as authenticated but not yet activated address.
+			client.setAuthedAddr(cloneNetAddr(addr).(*net.UDPAddr))
+		} else {
+			debug("authenticate conflict: old_serial=%d, new_serial=%d", oldSerialNumber, newSerialNumber)
+			newSerialNumber = client.serialNumber.Load()
+		}
+		// Send authentication response (ack).
+		if b, err := c.proxy.sealAuthPacket(newSerialNumber); err != nil {
+			warning("seal auth packet failed: %v", err)
+		} else if _, err := conn.WriteTo(b, addr); err != nil {
+			warning("send auth packet failed: %v", err)
 		}
 	}
 }
 
-func (c *udpFrontendConn) writeTo(buf []byte, client *clientState) {
+func (c *udpFrontendConn) writeTo(buf []byte, client *clientState) error {
 	addr := client.clientAddr.Load()
 	if addr == nil {
-		if c.proxy.args.Attachable {
-			// In attachable mode, drop UDP packets if the client is not ready.
-			// This prevents clients from blocking or interfering with each other.
-			return
-		}
-		// When only one client is expected, block the sender until reconnection completes.
-		addr = client.waitClientAddr()
+		// Drop the packet immediately instead of waiting for the client to reconnect.
+		// In attachable mode, waiting for the old client to reconnect may block new clients from sending packets.
+		// In all modes, waiting could block subsequent packets and prevent caching of packets during disconnections.
+		// In scenarios with frequent reconnections, a lack of cached packets may fail to reactivate the KCP/QUIC session.
+		return fmt.Errorf("client addr is nil")
 	}
 
-	_, _ = c.waitConn().WriteTo(buf, addr)
+	_, err := c.waitConn().WriteTo(buf, addr)
+	return err
 }
 
 type tcpFrameSignal struct {
@@ -587,21 +571,26 @@ func (c *tcpFrontendConn) handshake(conn *net.TCPConn) {
 
 	client := c.proxy.getClient(clientID)
 	if client == nil {
+		warning("get client [%x] return nil", clientID)
 		return
 	}
 	oldSerialNumber := client.serialNumber.Load()
 	if newSerialNumber <= oldSerialNumber {
+		debug("handshake rejected: old_serial=%d, new_serial=%d", oldSerialNumber, newSerialNumber)
 		return
 	}
 	if !client.serialNumber.CompareAndSwap(oldSerialNumber, newSerialNumber) {
+		debug("handshake conflict: old_serial=%d, new_serial=%d", oldSerialNumber, newSerialNumber)
 		return
 	}
 
 	// auth success
 	debug("client [%x] [%d] authed from %s", clientID, newSerialNumber, conn.RemoteAddr())
-	if b, err := c.proxy.sealAuthPacket(newSerialNumber); err == nil {
-		_ = sendUdpPacket(conn, b)
-	} else {
+	if b, err := c.proxy.sealAuthPacket(newSerialNumber); err != nil {
+		warning("seal auth packet failed: %v", err)
+		return
+	} else if err := sendUdpPacket(conn, b); err != nil {
+		warning("send auth packet failed: %v", err)
 		return
 	}
 
@@ -687,23 +676,24 @@ func (c *tcpFrontendConn) readFrom(buf []byte) (int, *clientState) {
 	}
 }
 
-func (c *tcpFrontendConn) writeTo(buf []byte, client *clientState) {
+func (c *tcpFrontendConn) writeTo(buf []byte, client *clientState) error {
 	conn := client.clientConn.Load()
 	if conn == nil {
-		if c.proxy.args.Attachable {
-			// In attachable mode, drop UDP packets if the client is not ready.
-			// This prevents clients from blocking or interfering with each other.
-			return
-		}
-		// When only one client is expected, block the sender until reconnection completes.
-		conn = client.waitClientConn()
+		// Drop the packet immediately instead of waiting for the client to reconnect.
+		// In attachable mode, waiting for the old client to reconnect may block new clients from sending packets.
+		// In all modes, waiting could block subsequent packets and prevent caching of packets during disconnections.
+		// In scenarios with frequent reconnections, a lack of cached packets may fail to reactivate the KCP/QUIC session.
+		return fmt.Errorf("client conn is nil")
 	}
 
 	if err := sendUdpPacket(conn, buf); err != nil {
 		if client.clientConn.CompareAndSwap(conn, nil) {
 			_ = conn.Close()
 		}
+		return err
 	}
+
+	return nil
 }
 
 type serverProxy struct {
@@ -715,6 +705,7 @@ type serverProxy struct {
 	clientID     uint64
 	soleClient   *clientState
 	clientMutex  sync.RWMutex
+	cachingPkt   atomic.Bool
 	// This map is intentionally not cleaned up to prevent replay attacks.
 	// Only optimize if memory usage becomes a real issue, and even then,
 	// serialNumber must be retained for replay protection.
@@ -729,7 +720,7 @@ func (p *serverProxy) newClientState(clientID uint64) (*clientState, error) {
 	client.clientCond = sync.NewCond(&client.clientMutex)
 
 	if p.args.KCP {
-		crypto, err := newRotatingCrypto(nil, p.kcpPass, p.kcpSalt, 0, 0)
+		crypto, err := newRotatingCrypto(nil, p.kcpPass, p.kcpSalt, 0, 0, false)
 		if err != nil {
 			return nil, fmt.Errorf("new rotating crypto failed: %v", err)
 		}
@@ -760,6 +751,7 @@ func (p *serverProxy) getClient(clientID uint64) *clientState {
 
 	client, err := p.newClientState(clientID)
 	if err != nil {
+		warning("new client state failed: %v", err)
 		return nil
 	}
 
@@ -803,9 +795,6 @@ func (p *serverProxy) onNewClientConn(client *clientState) {
 	}
 
 	if server := client.server.Load(); server != nil {
-
-		server.clientChecker.updateNow()
-
 		// Discard pending terminal input from previous sessions to prevent stale
 		// or unintended input (possibly generated while the client was disconnected)
 		// from being delivered after reconnection.
@@ -829,6 +818,9 @@ func (p *serverProxy) ReadFrom(buf []byte) (int, net.Addr, error) {
 			var err error
 			n, err = client.kcpCrypto.openPacket(buf[:n])
 			if err != nil {
+				if enableDebugLogging {
+					debug("open packet failed: len=%d, auth=%v", n, len(aesDecrypt(p.cipherBlock, buf[:n])) == 16)
+				}
 				continue
 			}
 		}
@@ -838,10 +830,6 @@ func (p *serverProxy) ReadFrom(buf []byte) (int, net.Addr, error) {
 
 	if server := client.server.Load(); server != nil {
 		server.clientChecker.updateNow()
-		if client.sendCacheFlag.Load() {
-			client.sendCacheFlag.Store(false)
-			client.sendPacketCache(p.frontendConn)
-		}
 	}
 
 	return n, &client.proxyAddr, nil
@@ -858,23 +846,38 @@ func (p *serverProxy) WriteTo(buf []byte, addr net.Addr) (int, error) {
 
 	client := p.getClient(clientAddr.clientID)
 	if client == nil {
+		warning("get client [%x] return nil", clientAddr.clientID)
 		return n, nil
 	}
 
-	if server := client.server.Load(); server != nil && server.clientChecker.isTimeout() {
-		client.pktCache.addPacket(buf)
-		return n, nil
+	if server := client.server.Load(); server != nil {
+		if server.clientChecker.isTimeout() {
+			if enableDebugLogging && p.cachingPkt.CompareAndSwap(false, true) {
+				debug("switching to packet caching mode")
+			}
+			client.pktCache.addPacket(buf)
+			return n, nil
+		} else if enableDebugLogging && p.cachingPkt.CompareAndSwap(true, false) {
+			debug("switching to direct transmission mode")
+		}
+
+		if server.shouldSample.Load() && server.shouldSample.CompareAndSwap(true, false) {
+			client.pktCache.addSample(buf)
+		}
 	}
 
 	if client.kcpCrypto != nil {
 		var err error
 		buf, err = client.kcpCrypto.sealPacket(buf, true)
 		if err != nil {
+			warning("seal packet failed: %v", err)
 			return n, nil
 		}
 	}
 
-	p.frontendConn.writeTo(buf, client)
+	if err := p.frontendConn.writeTo(buf, client); err != nil {
+		debug("frontend write failed: %v", err)
+	}
 	return n, nil
 }
 

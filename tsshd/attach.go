@@ -380,7 +380,9 @@ func (s *sshUdpServer) attachSession(stream Stream, msg *startMessage) (*session
 			sess.cols, sess.rows = msg.Cols, msg.Rows
 		}
 		// redraw screen
-		_ = sess.SetSize(sess.cols, sess.rows, true)
+		if err := sess.SetSize(sess.cols, sess.rows, true); err != nil {
+			warning("session [%d] redraw failed: %v", msg.ID, err)
+		}
 	}
 
 	debug("session [%d] attached by client [%x]", msg.ID, s.client.proxyAddr.clientID)

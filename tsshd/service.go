@@ -121,6 +121,10 @@ func initServer(args *tsshdArgs) (string, error) {
 		return "", err
 	}
 
+	if enableDebugLogging {
+		debug("tsshd listening: pid=%d, port=%d", os.Getpid(), port)
+	}
+
 	info := &ServerInfo{
 		ServerVer: kTsshdVersion,
 		Port:      port,
@@ -400,11 +404,10 @@ func tcpListenOnPort(addrs []*net.UDPAddr, port int) (fc frontendConnection, err
 }
 
 func listenKCP(conn net.PacketConn, info *ServerInfo, pass, salt []byte, delegToProxy bool) (*kcp.Listener, error) {
-	crypto, err := newRotatingCrypto(nil, pass, salt, 0, 0)
+	crypto, err := newRotatingCrypto(nil, pass, salt, 0, 0, delegToProxy)
 	if err != nil {
 		return nil, fmt.Errorf("new rotating crypto failed: %w", err)
 	}
-	crypto.delegatedToProxy = delegToProxy
 	block := kcp.NewAEADCrypt(crypto)
 
 	listener, err := kcp.ServeConn(block, 1, 1, conn)

@@ -59,6 +59,7 @@ type sshUdpServer struct {
 	busStream            Stream
 	clientAliveTime      aliveTime
 	pendingClearPktCache bool
+	shouldSample         atomic.Bool
 
 	// session related
 	stderrMutex       sync.Mutex
@@ -120,8 +121,7 @@ func (s *sshUdpServer) initClientChecker(timeout time.Duration) {
 
 	if enableDebugLogging {
 		s.clientChecker.onTimeout(func() {
-			debug("blocked due to no client [%x] input for [%v]", s.client.proxyAddr.clientID,
-				time.Duration(s.clientChecker.timeoutMilli.Load()*int64(time.Millisecond)))
+			debug("blocked due to no client [%x] input for [%v]", s.client.proxyAddr.clientID, s.clientChecker.heartbeatTimeout)
 		})
 		s.clientChecker.onReconnected(func() {
 			debug("resumed after receiving client [%x] input", s.client.proxyAddr.clientID)
@@ -129,7 +129,6 @@ func (s *sshUdpServer) initClientChecker(timeout time.Duration) {
 	}
 
 	s.clientChecker.onTimeout(func() {
-		s.client.sendCacheFlag.Store(true)
 		// Clear authenticated UDP client addresses to prevent the UDP endpoint
 		// from being reused by another peer after timeout.
 		s.client.setAuthedAddr(nil)
@@ -175,7 +174,10 @@ func (s *sshUdpServer) activateServer() error {
 				oldServer.Close()
 			} else {
 				debug("new client [%x] notifying old client [%x] to quit", s.client.proxyAddr.clientID, oldServer.client.proxyAddr.clientID)
-				_ = oldServer.sendBusMessage("quit", quitMessage{fmt.Sprintf("another client attached from %s", s.client.remoteAddr())})
+				if err := oldServer.sendBusMessage("quit",
+					quitMessage{fmt.Sprintf("another client attached from %s", s.client.remoteAddr())}); err != nil {
+					debug("send quit message failed: %v", err)
+				}
 				time.Sleep(time.Second) // give udp some time
 				oldServer.Close()
 			}
@@ -228,7 +230,6 @@ func (s *sshUdpServer) handleStream(stream Stream) {
 		s.streamMutex.Lock()
 		delete(s.streamMap, id)
 		s.streamMutex.Unlock()
-		debug("handler return closing stream [%x][%d]", s.client.proxyAddr.clientID, id)
 		_ = stream.Close()
 	}()
 
@@ -239,7 +240,10 @@ func (s *sshUdpServer) handleStream(stream Stream) {
 		return
 	}
 
-	debug("stream [%x][%d] starts with command [%s]", s.client.proxyAddr.clientID, id, command)
+	if enableDebugLogging && command != "dial" && command != "accept" && command != "dial-udp" && command != "accept-udp" {
+		debug("stream [%x][%d] command [%s] starts", s.client.proxyAddr.clientID, id, command)
+		defer debug("stream [%x][%d] command [%s] closes", s.client.proxyAddr.clientID, id, command)
+	}
 
 	// NOTE: In attachable mode, multiple servers may coexist.
 	if command == "bus" {
