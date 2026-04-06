@@ -124,6 +124,14 @@ func parseSshdConfig(path, user string, groups []string) {
 	sshdConfigMap = make(map[string]string)
 	sshdSubsystemMap = make(map[string]string)
 
+	// While OpenSSH defaults AcceptEnv to empty, most Linux distributions
+	// (e.g., Ubuntu, Debian, CentOS) include "LANG" and "LC_*" by default
+	// to preserve locale settings across SSH sessions.
+	// We follow this convention as our internal default. However, we also
+	// support explicitly setting AcceptEnv to an empty value in the
+	// configuration to override this behavior and clear all accepted variables.
+	sshdConfigMap["AcceptEnv"] = "LANG LC_*"
+
 	file, err := os.Open(path)
 	if err != nil {
 		return
@@ -142,11 +150,8 @@ func parseSshdConfig(path, user string, groups []string) {
 		}
 
 		key, value := splitKeyValue(line)
-		if value == "" {
-			continue
-		}
 
-		if key == "match" {
+		if key == "match" && value != "" {
 			inMatch = true
 			userMatch = evalMatchLine(value, user, groups)
 			continue
@@ -156,9 +161,9 @@ func parseSshdConfig(path, user string, groups []string) {
 			continue
 		}
 
-		if key == "subsystem" {
+		if key == "subsystem" && value != "" {
 			name, path := splitKeyValue(value)
-			if name != "" && path != "" {
+			if name != "" {
 				sshdSubsystemMap[name] = path
 			}
 			continue

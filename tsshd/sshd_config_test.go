@@ -60,7 +60,7 @@ Match User mary
 
 Match Group admin
     AllowTcpForwarding Yes
-	AcceptEnv LANG LC_*
+	AcceptEnv
 Subsystem Asvr	/usr/bin/asvr
 
 Match User bob Group=users
@@ -84,6 +84,8 @@ Match User bob Group=users
 	assert.Equal("Yes", getSshdConfig("X11Forwarding"))
 	assert.Equal("/usr/lib/openssh/sftp-server", getSshdSubsystem("sftp"))
 	assert.Equal("/usr/bin/asvr", getSshdSubsystem("ASVR"))
+	// Empty AcceptEnv inside Match should override the default/global value.
+	assert.Equal("", getSshdConfig("AcceptEnv"))
 }
 
 func TestSplitKeyValue(t *testing.T) {
