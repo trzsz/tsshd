@@ -130,7 +130,7 @@ func parseSshdConfig(path, user string, groups []string) {
 	// We follow this convention as our internal default. However, we also
 	// support explicitly setting AcceptEnv to an empty value in the
 	// configuration to override this behavior and clear all accepted variables.
-	sshdConfigMap["AcceptEnv"] = "LANG LC_*"
+	sshdConfigMap["acceptenv"] = "LANG LC_*"
 
 	file, err := os.Open(path)
 	if err != nil {
