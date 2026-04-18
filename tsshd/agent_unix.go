@@ -51,10 +51,7 @@ func listenForAgent() (net.Listener, string, error) {
 		warning("agent forwarding chmod [%s] failed: %v", agentPath, err)
 	}
 
-	addOnExitFunc(func() {
-		_ = listener.Close()
-		_ = os.Remove(agentPath)
-	})
+	_ = newFileUnlinker(agentPath, listener)
 
 	return listener, agentPath, nil
 }

@@ -168,33 +168,16 @@ func (s *sshUdpServer) handleListenEvent(stream Stream) {
 		return
 	}
 
-	var createdInfo os.FileInfo
 	if msg.Net == "unix" {
 		mode := os.FileMode(0666) &^ os.FileMode(streamLocalBindMask())
 		if err := os.Chmod(msg.Addr, mode); err != nil {
 			warning("chmod unix socket [%s] to %#o failed: %v", msg.Addr, mode, err)
 		}
-		if info, err := os.Stat(msg.Addr); err == nil {
-			createdInfo = info
-		}
+		defer newFileUnlinker(msg.Addr, listener)()
+	} else {
+		defer func() { _ = listener.Close() }()
+		addOnExitFunc(func() { _ = listener.Close() })
 	}
-
-	addOnExitFunc(func() {
-		_ = listener.Close()
-		if msg.Net != "unix" || createdInfo == nil {
-			return
-		}
-		current, err := os.Stat(msg.Addr)
-		if err != nil {
-			return
-		}
-		if !os.SameFile(createdInfo, current) {
-			debug("unix socket [%s] replaced since creation; skipping unlink", msg.Addr)
-			return
-		}
-		_ = os.Remove(msg.Addr)
-	})
-	defer func() { _ = listener.Close() }()
 
 	if err := sendSuccess(stream); err != nil { // ack ok
 		warning("listener [%s] [%s] ack ok failed: %v", msg.Net, msg.Addr, err)

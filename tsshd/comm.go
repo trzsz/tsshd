@@ -475,3 +475,57 @@ func (r *aliveTime) oldest() int64 {
 	defer r.mutex.Unlock()
 	return r.buf[(r.last+1)%kAliveTimeCap]
 }
+
+// newFileUnlinker returns a cleanup function that closes the provided closer
+// and unlinks (removes) the specified file path. It ensures that the cleanup
+// logic is executed only once, even if called multiple times (e.g., via both
+// defer and a global exit hook).
+func newFileUnlinker(path string, closer io.Closer) func() {
+	var once sync.Once
+
+	// Snapshot the file information at creation time to prevent
+	// accidental unlinking if the file is replaced later.
+	createdInfo, err := os.Stat(path)
+	if err != nil {
+		warning("stat created file [%s] failed: %v", path, err)
+	}
+
+	cleanup := func() {
+		once.Do(func() {
+			// 1. Close the resource first.
+			if closer != nil {
+				if err := closer.Close(); err != nil {
+					debug("close resource for [%s] failed: %v", path, err)
+				}
+			}
+
+			// 2. If we couldn't get the initial stat, it's unsafe to unlink.
+			if createdInfo == nil {
+				return
+			}
+
+			// 3. Verify the file identity (Inode check) before unlinking.
+			currentInfo, err := os.Stat(path)
+			if err != nil { // File might already be gone, which is fine.
+				return
+			}
+			if !os.SameFile(createdInfo, currentInfo) {
+				debug("file [%s] replaced since creation; skipping unlink", path)
+				return
+			}
+
+			// 4. Perform the actual unlinking.
+			if err := os.Remove(path); err != nil {
+				warning("unlink file [%s] failed: %v", path, err)
+				return
+			}
+			debug("unlink file [%s] successful", path)
+		})
+	}
+
+	// Register the cleanup function to the global exit registry.
+	addOnExitFunc(cleanup)
+
+	// Return the cleanup function to be used with defer.
+	return cleanup
+}
