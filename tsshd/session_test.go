@@ -30,6 +30,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -53,7 +54,7 @@ func TestGetSubsystemCmdEmptyCommand(t *testing.T) {
 		sshdSubsystemMap = origMap
 	}()
 
-	sshdConfigPath = "/tmp/test_sshd_config"
+	sshdConfigPath = filepath.Join(t.TempDir(), "sshd_config")
 	sshdSubsystemMap = map[string]string{"sftp": `""`}
 
 	cmd, err := getSubsystemCmd("sftp")
