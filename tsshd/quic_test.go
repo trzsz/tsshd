@@ -158,14 +158,25 @@ func TestQUIC_InitialPacketSize(t *testing.T) {
 		}
 	}
 
+	const (
+		expectedQuicMinMTU uint16 = 1200
+		expectedQuicMaxMTU uint16 = 1452
+	)
+	if kQuicMinMTU != expectedQuicMinMTU {
+		t.Fatalf("kQuicMinMTU changed: expected=%d, got=%d", expectedQuicMinMTU, kQuicMinMTU)
+	}
+	if kQuicMaxMTU != expectedQuicMaxMTU {
+		t.Fatalf("kQuicMaxMTU changed: expected=%d, got=%d", expectedQuicMaxMTU, kQuicMaxMTU)
+	}
+
 	// MTU below min
-	verifyInitialPacketSize(kQuicMinMTU-1, kQuicMinMTU)
+	verifyInitialPacketSize(expectedQuicMinMTU-1, expectedQuicMinMTU)
 
 	// Default MTU
 	verifyInitialPacketSize(kDefaultMTU, kDefaultMTU)
 
 	// MTU above max
-	verifyInitialPacketSize(kQuicMaxMTU+1, kQuicMaxMTU)
+	verifyInitialPacketSize(expectedQuicMaxMTU+1, expectedQuicMaxMTU)
 }
 
 // TestQUIC_ShortHeaderSize ensures that the constant kQuicShortHeaderSize
