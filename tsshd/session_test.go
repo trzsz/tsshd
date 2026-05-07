@@ -45,6 +45,23 @@ type mockStream struct {
 	first bool
 }
 
+func TestGetSubsystemCmdEmptyCommand(t *testing.T) {
+	origPath := sshdConfigPath
+	origMap := sshdSubsystemMap
+	defer func() {
+		sshdConfigPath = origPath
+		sshdSubsystemMap = origMap
+	}()
+
+	sshdConfigPath = "/tmp/test_sshd_config"
+	sshdSubsystemMap = map[string]string{"sftp": `""`}
+
+	cmd, err := getSubsystemCmd("sftp")
+	require.Error(t, err)
+	require.Nil(t, cmd)
+	require.Contains(t, err.Error(), "command is empty")
+}
+
 func newMockStream() *mockStream {
 	return &mockStream{first: true}
 }

@@ -1040,6 +1040,9 @@ func getSubsystemCmd(name string) (*exec.Cmd, error) {
 	if err != nil {
 		return nil, fmt.Errorf("split subsystem [%s] [%s] failed: %v", name, command, err)
 	}
+	if len(args) == 0 || args[0] == "" {
+		return nil, fmt.Errorf("subsystem [%s] command is empty in [%s]", name, sshdConfigPath)
+	}
 	return exec.Command(args[0], args[1:]...), nil
 }
 
