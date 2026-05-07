@@ -511,17 +511,15 @@ func newQuicClient(opts *UdpClientOptions, udpConn net.PacketConn, remoteAddr ne
 	}
 
 	config := quicConfig
-	var initialPacketSize uint16
 	if opts.ServerInfo.MTU != 0 {
-		initialPacketSize = quicInitialPacketSize(opts.ServerInfo.MTU)
+		config.InitialPacketSize = opts.ServerInfo.MTU
 		config.DisablePathMTUDiscovery = true
 	} else if opts.ProxyClient != nil {
-		initialPacketSize = quicInitialPacketSize(opts.ProxyClient.GetMaxDatagramSize())
+		config.InitialPacketSize = opts.ProxyClient.GetMaxDatagramSize()
 		config.DisablePathMTUDiscovery = true
 	} else {
-		initialPacketSize = kDefaultMTU
+		config.InitialPacketSize = kDefaultMTU
 	}
-	config.InitialPacketSize = initialPacketSize
 
 	ctx, cancel := context.WithTimeout(context.Background(), opts.ConnectTimeout)
 	defer cancel()
@@ -529,5 +527,5 @@ func newQuicClient(opts *UdpClientOptions, udpConn net.PacketConn, remoteAddr ne
 	if err != nil {
 		return nil, fmt.Errorf("quic dail [%v] failed: %w", remoteAddr.String(), err)
 	}
-	return &quicClient{conn, &udpForwarder{conn: newQuicDatagramConn(conn, initialPacketSize)}}, nil
+	return &quicClient{conn, &udpForwarder{conn: newQuicDatagramConn(conn, config.InitialPacketSize)}}, nil
 }

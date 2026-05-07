@@ -74,19 +74,6 @@ var quicConfig = quic.Config{
 	EnableDatagrams:      true,
 }
 
-func quicInitialPacketSize(mtu uint16) uint16 {
-	if mtu == 0 {
-		return kDefaultMTU
-	}
-	if mtu < kQuicMinMTU {
-		return kQuicMinMTU
-	}
-	if mtu > kQuicMaxMTU {
-		return kQuicMaxMTU
-	}
-	return mtu
-}
-
 var smuxConfig = smux.Config{
 	Version:           2,
 	KeepAliveDisabled: true,
@@ -157,12 +144,12 @@ func initServer(args *tsshdArgs) (string, error) {
 		addOnExitFunc(func() { _ = listener.Close() })
 		go serveKCP(args, proxy, listener)
 	} else {
-		listener, err := listenQUIC(proxy, info, args.MTU)
+		listener, initialPacketSize, err := listenQUIC(proxy, info, args.MTU)
 		if err != nil {
 			return "", err
 		}
 		addOnExitFunc(func() { _ = listener.Close() })
-		go serveQUIC(args, proxy, listener, quicInitialPacketSize(args.MTU))
+		go serveQUIC(args, proxy, listener, initialPacketSize)
 	}
 
 	infoStr, err := json.Marshal(info)
@@ -433,19 +420,19 @@ func listenKCP(conn net.PacketConn, info *ServerInfo, pass, salt []byte, delegTo
 	return listener, nil
 }
 
-func listenQUIC(conn net.PacketConn, info *ServerInfo, mtu uint16) (*quic.Listener, error) {
+func listenQUIC(conn net.PacketConn, info *ServerInfo, mtu uint16) (*quic.Listener, uint16, error) {
 	serverCertPEM, serverKeyPEM, err := generateCertKeyPair()
 	if err != nil {
-		return nil, err
+		return nil, 0, err
 	}
 	clientCertPEM, clientKeyPEM, err := generateCertKeyPair()
 	if err != nil {
-		return nil, err
+		return nil, 0, err
 	}
 
 	serverTlsCert, err := tls.X509KeyPair(serverCertPEM, serverKeyPEM)
 	if err != nil {
-		return nil, fmt.Errorf("x509 key pair failed: %v", err)
+		return nil, 0, fmt.Errorf("x509 key pair failed: %v", err)
 	}
 
 	clientCertPool := x509.NewCertPool()
@@ -457,12 +444,16 @@ func listenQUIC(conn net.PacketConn, info *ServerInfo, mtu uint16) (*quic.Listen
 	}
 
 	config := quicConfig
-	config.InitialPacketSize = quicInitialPacketSize(mtu)
-	config.DisablePathMTUDiscovery = mtu > 0
+	if mtu > 0 {
+		config.InitialPacketSize = mtu
+		config.DisablePathMTUDiscovery = true
+	} else {
+		config.InitialPacketSize = kDefaultMTU
+	}
 
 	listener, err := (&quic.Transport{Conn: conn}).Listen(tlsConfig, &config)
 	if err != nil {
-		return nil, fmt.Errorf("quic listen failed: %v", err)
+		return nil, 0, fmt.Errorf("quic listen failed: %v", err)
 	}
 
 	info.Mode = kUdpModeQUIC
@@ -470,7 +461,7 @@ func listenQUIC(conn net.PacketConn, info *ServerInfo, mtu uint16) (*quic.Listen
 	info.ClientCert = fmt.Sprintf("%x", clientCertPEM)
 	info.ClientKey = fmt.Sprintf("%x", clientKeyPEM)
 
-	return listener, nil
+	return listener, config.InitialPacketSize, nil
 }
 
 func generateCertKeyPair() ([]byte, []byte, error) {

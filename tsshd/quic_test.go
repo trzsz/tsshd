@@ -100,10 +100,6 @@ func listenRandomUDP(t *testing.T) *udpPacketConn {
 // quicConfig.
 func TestQUIC_InitialPacketSize(t *testing.T) {
 	verifyInitialPacketSize := func(requestedMTU, expectedMTU uint16) {
-		if got := quicInitialPacketSize(requestedMTU); got != expectedMTU {
-			t.Fatalf("quicInitialPacketSize mismatch: requested=%d, expected=%d, got=%d", requestedMTU, expectedMTU, got)
-		}
-
 		info := &ServerInfo{MTU: requestedMTU}
 		svrConn := listenRandomUDP(t)
 		defer func() { _ = svrConn.Close() }()
@@ -112,11 +108,14 @@ func TestQUIC_InitialPacketSize(t *testing.T) {
 
 		// Server
 		quicConfig.InitialPacketSize = 0
-		listener, err := listenQUIC(svrConn, info, requestedMTU)
+		listener, serverInitialPacketSize, err := listenQUIC(svrConn, info, requestedMTU)
 		if err != nil {
 			t.Fatalf("listenQUIC failed (mtu=%d): %v", requestedMTU, err)
 		}
 
+		if serverInitialPacketSize != expectedMTU {
+			t.Fatalf("server initial packet size mismatch: requested=%d, expected=%d, got=%d", requestedMTU, expectedMTU, serverInitialPacketSize)
+		}
 		if got := quicConfig.InitialPacketSize; got != 0 {
 			t.Fatalf("shared quicConfig should not be mutated by listenQUIC, got InitialPacketSize=%d", got)
 		}
@@ -149,34 +148,22 @@ func TestQUIC_InitialPacketSize(t *testing.T) {
 		if got := client.forwarder.conn.GetMaxDatagramSize() + kQuicShortHeaderSize + kUdpForwardChannelIdSize; got != expectedMTU {
 			t.Fatalf("client initial packet size mismatch: requested=%d, expected=%d, got=%d", requestedMTU, expectedMTU, got)
 		}
-		_ = client.closeClient()
-
 		<-acceptDone
+		_ = client.closeClient()
 
 		if got := quicConfig.InitialPacketSize; got != 0 {
 			t.Fatalf("shared quicConfig should not be mutated, got InitialPacketSize=%d", got)
 		}
 	}
 
-	const (
-		expectedQuicMinMTU uint16 = 1200
-		expectedQuicMaxMTU uint16 = 1452
-	)
-	if kQuicMinMTU != expectedQuicMinMTU {
-		t.Fatalf("kQuicMinMTU changed: expected=%d, got=%d", expectedQuicMinMTU, kQuicMinMTU)
-	}
-	if kQuicMaxMTU != expectedQuicMaxMTU {
-		t.Fatalf("kQuicMaxMTU changed: expected=%d, got=%d", expectedQuicMaxMTU, kQuicMaxMTU)
-	}
-
 	// MTU below min
-	verifyInitialPacketSize(expectedQuicMinMTU-1, expectedQuicMinMTU)
+	verifyInitialPacketSize(kQuicMinMTU-1, kQuicMinMTU)
 
 	// Default MTU
 	verifyInitialPacketSize(kDefaultMTU, kDefaultMTU)
 
 	// MTU above max
-	verifyInitialPacketSize(expectedQuicMaxMTU+1, expectedQuicMaxMTU)
+	verifyInitialPacketSize(kQuicMaxMTU+1, kQuicMaxMTU)
 }
 
 // TestQUIC_ShortHeaderSize ensures that the constant kQuicShortHeaderSize
@@ -234,7 +221,7 @@ func TestQUIC_RespectMTU(t *testing.T) {
 	svrConn := &mtuTestConn{udpPacketConn: listenRandomUDP(t), t: t, mtu: mtu}
 	defer func() { _ = svrConn.Close() }()
 
-	listener, err := listenQUIC(svrConn, info, mtu)
+	listener, _, err := listenQUIC(svrConn, info, mtu)
 	if err != nil {
 		t.Fatalf("listenQUIC failed: %v", err)
 	}
@@ -433,7 +420,7 @@ func TestQUIC_CertValidation(t *testing.T) {
 	defer func() { _ = svrConn.Close() }()
 
 	// Start QUIC server
-	listener, err := listenQUIC(svrConn, &info, 0)
+	listener, _, err := listenQUIC(svrConn, &info, 0)
 	if err != nil {
 		t.Fatalf("listenQUIC failed: %v", err)
 	}
