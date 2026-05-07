@@ -485,7 +485,9 @@ func TestForwardOutput_KeepESC6nAfterReconnect(t *testing.T) {
 	}
 
 	go func() {
-		time.Sleep(100 * time.Millisecond)
+		for s.clientChecker.isTimeout() {
+			time.Sleep(time.Millisecond)
+		}
 		close(signal)
 	}()
 
@@ -576,8 +578,9 @@ func TestForwardOutput_ReconnectWhileReadBlocked(t *testing.T) {
 		runForwardOutputAndReconnect(s, reader, stream, nil)
 	}()
 
-	time.Sleep(100 * time.Millisecond)
-	assert.Equal("a\nb\nc\n", stream.String())
+	assert.Eventually(func() bool {
+		return stream.String() == "a\nb\nc\n"
+	}, time.Second, 10*time.Millisecond)
 
 	close(block)
 }
