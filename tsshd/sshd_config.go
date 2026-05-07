@@ -38,6 +38,8 @@ var sshdConfigPath string
 var sshdConfigMap map[string]string
 var sshdSubsystemMap map[string]string
 
+var matchCriteriaCommaRegexp = regexp.MustCompile(`\s*,\s*`)
+
 func getSshdConfigPath() string {
 	xdgConfigHome := os.Getenv("XDG_CONFIG_HOME")
 	if xdgConfigHome == "" {
@@ -225,6 +227,7 @@ func wildcardMatch(pattern, value string) bool {
 }
 
 func evalMatchLine(line, user string, groups []string) bool {
+	line = matchCriteriaCommaRegexp.ReplaceAllString(line, ",")
 	tokens := strings.Fields(line)
 	if len(tokens) == 0 {
 		return false

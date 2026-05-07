@@ -291,7 +291,7 @@ func TestEvalMatchLine(t *testing.T) {
 
 	// spacing + tab
 	assert.True(evalMatchLine("User \t john \t Group = admin", "john", []string{"admin", "docker"}))
-	assert.True(evalMatchLine("User= john   Group= admin,docker", "john", []string{"admin", "docker"}))
+	assert.True(evalMatchLine("User= john   Group= admin , docker", "john", []string{"admin", "docker"}))
 
 	// reverse order (group then User)
 	assert.True(evalMatchLine("Group=admin User=john", "john", []string{"admin", "docker"}))
