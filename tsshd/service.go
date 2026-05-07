@@ -74,6 +74,19 @@ var quicConfig = quic.Config{
 	EnableDatagrams:      true,
 }
 
+func quicInitialPacketSize(mtu uint16) uint16 {
+	if mtu == 0 {
+		return kDefaultMTU
+	}
+	if mtu < kQuicMinMTU {
+		return kQuicMinMTU
+	}
+	if mtu > kQuicMaxMTU {
+		return kQuicMaxMTU
+	}
+	return mtu
+}
+
 var smuxConfig = smux.Config{
 	Version:           2,
 	KeepAliveDisabled: true,
@@ -149,7 +162,7 @@ func initServer(args *tsshdArgs) (string, error) {
 			return "", err
 		}
 		addOnExitFunc(func() { _ = listener.Close() })
-		go serveQUIC(args, proxy, listener)
+		go serveQUIC(args, proxy, listener, quicInitialPacketSize(args.MTU))
 	}
 
 	infoStr, err := json.Marshal(info)
@@ -443,14 +456,11 @@ func listenQUIC(conn net.PacketConn, info *ServerInfo, mtu uint16) (*quic.Listen
 		ClientAuth:   tls.RequireAndVerifyClientCert,
 	}
 
-	if mtu > 0 {
-		quicConfig.InitialPacketSize = mtu
-		quicConfig.DisablePathMTUDiscovery = true
-	} else {
-		quicConfig.InitialPacketSize = kDefaultMTU
-	}
+	config := quicConfig
+	config.InitialPacketSize = quicInitialPacketSize(mtu)
+	config.DisablePathMTUDiscovery = mtu > 0
 
-	listener, err := (&quic.Transport{Conn: conn}).Listen(tlsConfig, &quicConfig)
+	listener, err := (&quic.Transport{Conn: conn}).Listen(tlsConfig, &config)
 	if err != nil {
 		return nil, fmt.Errorf("quic listen failed: %v", err)
 	}
@@ -583,12 +593,10 @@ type quicDatagramConn struct {
 	mtu uint16
 }
 
-func newQuicDatagramConn(conn *quic.Conn) datagramConn {
+func newQuicDatagramConn(conn *quic.Conn, initialPacketSize uint16) datagramConn {
 	return &quicDatagramConn{
 		conn,
-		// This depends on quicConfig.InitialPacketSize being properly clamped to the valid MTU range.
-		// See TestQUIC_InitialPacketSize for the test that ensures this behavior.
-		quicConfig.InitialPacketSize - kQuicShortHeaderSize - kUdpForwardChannelIdSize, // Reserve 8 bytes from the MTU for the channel ID
+		initialPacketSize - kQuicShortHeaderSize - kUdpForwardChannelIdSize, // Reserve 8 bytes from the MTU for the channel ID
 	}
 }
 
@@ -649,7 +657,7 @@ func handleKcpConn(args *tsshdArgs, proxy *serverProxy, conn *kcp.UDPSession) {
 	}
 }
 
-func serveQUIC(args *tsshdArgs, proxy *serverProxy, listener *quic.Listener) {
+func serveQUIC(args *tsshdArgs, proxy *serverProxy, listener *quic.Listener, initialPacketSize uint16) {
 	for {
 		conn, err := listener.Accept(context.Background())
 		if err != nil {
@@ -657,11 +665,11 @@ func serveQUIC(args *tsshdArgs, proxy *serverProxy, listener *quic.Listener) {
 			return
 		}
 		debug("quic accepted new connection from client [%v]", conn.RemoteAddr())
-		go handleQuicConn(args, proxy, conn)
+		go handleQuicConn(args, proxy, conn, initialPacketSize)
 	}
 }
 
-func handleQuicConn(args *tsshdArgs, proxy *serverProxy, conn *quic.Conn) {
+func handleQuicConn(args *tsshdArgs, proxy *serverProxy, conn *quic.Conn, initialPacketSize uint16) {
 	defer func() { _ = conn.CloseWithError(0, "") }()
 
 	if !args.Attachable {
@@ -670,7 +678,7 @@ func handleQuicConn(args *tsshdArgs, proxy *serverProxy, conn *quic.Conn) {
 		}
 	}
 
-	server := newSshUdpServer(args, proxy, conn.RemoteAddr(), &quicServer{conn, &udpForwarder{conn: newQuicDatagramConn(conn)}})
+	server := newSshUdpServer(args, proxy, conn.RemoteAddr(), &quicServer{conn, &udpForwarder{conn: newQuicDatagramConn(conn, initialPacketSize)}})
 	if server == nil {
 		return
 	}

@@ -510,21 +510,24 @@ func newQuicClient(opts *UdpClientOptions, udpConn net.PacketConn, remoteAddr ne
 		ServerName:   "tsshd",
 	}
 
+	config := quicConfig
+	var initialPacketSize uint16
 	if opts.ServerInfo.MTU != 0 {
-		quicConfig.InitialPacketSize = opts.ServerInfo.MTU
-		quicConfig.DisablePathMTUDiscovery = true
+		initialPacketSize = quicInitialPacketSize(opts.ServerInfo.MTU)
+		config.DisablePathMTUDiscovery = true
 	} else if opts.ProxyClient != nil {
-		quicConfig.InitialPacketSize = opts.ProxyClient.GetMaxDatagramSize()
-		quicConfig.DisablePathMTUDiscovery = true
+		initialPacketSize = quicInitialPacketSize(opts.ProxyClient.GetMaxDatagramSize())
+		config.DisablePathMTUDiscovery = true
 	} else {
-		quicConfig.InitialPacketSize = kDefaultMTU
+		initialPacketSize = kDefaultMTU
 	}
+	config.InitialPacketSize = initialPacketSize
 
 	ctx, cancel := context.WithTimeout(context.Background(), opts.ConnectTimeout)
 	defer cancel()
-	conn, err := quic.Dial(ctx, udpConn, remoteAddr, tlsConfig, &quicConfig)
+	conn, err := quic.Dial(ctx, udpConn, remoteAddr, tlsConfig, &config)
 	if err != nil {
 		return nil, fmt.Errorf("quic dail [%v] failed: %w", remoteAddr.String(), err)
 	}
-	return &quicClient{conn, &udpForwarder{conn: newQuicDatagramConn(conn)}}, nil
+	return &quicClient{conn, &udpForwarder{conn: newQuicDatagramConn(conn, initialPacketSize)}}, nil
 }
