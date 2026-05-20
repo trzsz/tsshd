@@ -27,7 +27,9 @@ package tsshd
 import (
 	"net"
 	dbg "runtime/debug"
+	"sync/atomic"
 	"testing"
+	"time"
 )
 
 func TestServerLazyMap(t *testing.T) {
@@ -76,5 +78,65 @@ func TestServerLazyMap(t *testing.T) {
 	server.releaseUdpForwardSession(sess)
 	if size := len(server.udpFwdSessionMap); size != 0 {
 		t.Fatalf("expected session map size 0 after release, got %d", size)
+	}
+}
+
+// closeTrackingConn records whether Close was called, without needing a real
+// network connection. The embedded nil net.Conn is never exercised because the
+// reaper only ever calls Close.
+type closeTrackingConn struct {
+	net.Conn
+	closed atomic.Bool
+}
+
+func (c *closeTrackingConn) Close() error {
+	c.closed.Store(true)
+	return nil
+}
+
+// TestReapAcceptConnUnclaimed verifies the core fix: an accept connection the
+// client never claims must be closed once ConnectTimeout elapses. Without this,
+// a dead or unresponsive client (e.g. agent forwarding whose upstream agent has
+// gone away) leaves the connection parked forever, which surfaces to the user
+// as `ssh-add` or `git` SSH signing hanging indefinitely.
+func TestReapAcceptConnUnclaimed(t *testing.T) {
+	server := &sshUdpServer{args: &tsshdArgs{ConnectTimeout: 20 * time.Millisecond}}
+
+	conn := &closeTrackingConn{}
+	id := server.addAcceptConn(conn)
+	server.reapAcceptConnAfterTimeout(id)
+
+	deadline := time.Now().Add(2 * time.Second)
+	for !conn.closed.Load() && time.Now().Before(deadline) {
+		time.Sleep(2 * time.Millisecond)
+	}
+
+	if !conn.closed.Load() {
+		t.Fatal("unclaimed accept conn was not closed after ConnectTimeout")
+	}
+	if c := server.takeAcceptConn(id); c != nil {
+		t.Fatal("reaped accept conn should no longer be parked")
+	}
+}
+
+// TestReapAcceptConnClaimed verifies the reaper never disturbs a connection the
+// client claimed in time: closing a live forwarded connection out from under an
+// in-flight request would itself be a regression.
+func TestReapAcceptConnClaimed(t *testing.T) {
+	server := &sshUdpServer{args: &tsshdArgs{ConnectTimeout: 20 * time.Millisecond}}
+
+	conn := &closeTrackingConn{}
+	id := server.addAcceptConn(conn)
+	server.reapAcceptConnAfterTimeout(id)
+
+	if c := server.takeAcceptConn(id); c != conn {
+		t.Fatalf("claim failed, expected ptr %p, got %v", conn, c)
+	}
+
+	// Wait well past ConnectTimeout so the reaper has certainly fired.
+	time.Sleep(100 * time.Millisecond)
+
+	if conn.closed.Load() {
+		t.Fatal("reaper closed an accept conn that was already claimed by the client")
 	}
 }
