@@ -31,6 +31,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 )
 
 // streamLocalBindMask returns the StreamLocalBindMask from sshd_config.
@@ -195,6 +196,7 @@ func (s *sshUdpServer) handleListenEvent(stream Stream) {
 			break
 		}
 		id := s.addAcceptConn(conn)
+		s.reapAcceptConnAfterTimeout(id)
 		if err := sendMessage(stream, acceptMessage{id}); err != nil {
 			if conn := s.takeAcceptConn(id); conn != nil {
 				_ = conn.Close()
@@ -255,6 +257,28 @@ func (s *sshUdpServer) takeAcceptConn(id uint64) net.Conn {
 	}
 
 	return nil
+}
+
+// reapAcceptConnAfterTimeout closes a parked accept connection if the client
+// does not claim it within ConnectTimeout. Both agent/X11 forwarding (see
+// handleChannelAccept) and -R remote forwarding park the accepted connection
+// in fwdAcceptMap and rely on the client to open the matching channel. When the
+// client side is gone or unresponsive (for example, agent forwarding whose
+// upstream agent has disconnected), the connection would otherwise stay parked
+// forever, leaving callers such as `ssh-add` or `git` SSH commit signing
+// hanging indefinitely. The ConnectTimeout bound mirrors the one the client is
+// expected to connect within (see the run loop in main.go).
+func (s *sshUdpServer) reapAcceptConnAfterTimeout(id uint64) {
+	timeout := kDefaultConnectTimeout
+	if s.args != nil && s.args.ConnectTimeout > 0 {
+		timeout = s.args.ConnectTimeout
+	}
+	time.AfterFunc(timeout, func() {
+		if conn := s.takeAcceptConn(id); conn != nil {
+			warning("accept conn [%d] not claimed within %v, closing", id, timeout)
+			_ = conn.Close()
+		}
+	})
 }
 
 func (s *sshUdpServer) forwardConnection(stream Stream, conn net.Conn) {

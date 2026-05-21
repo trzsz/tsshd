@@ -1320,6 +1320,7 @@ func (c *sessionContext) handleChannelAccept(listener net.Listener, channelType 
 				return
 			}
 			id := server.addAcceptConn(conn)
+			server.reapAcceptConnAfterTimeout(id)
 			if err := server.sendBusMessage("channel", &channelMessage{ChannelType: channelType, ID: id}); err != nil {
 				warning("send channel message failed: %v", err)
 			}
