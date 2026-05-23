@@ -206,7 +206,7 @@ func runProxyEchoTest(t *testing.T, args *tsshdArgs) {
 		return server
 	}
 
-	output, err := initServer(args)
+	_, output, err := initServer(args)
 	if err != nil {
 		t.Fatalf("init server failed: %v", err)
 	}

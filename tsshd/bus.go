@@ -57,7 +57,7 @@ func (s *sshUdpServer) initBusAndServer(stream Stream, msg *busMessage) error {
 	s.clientAliveTime.addMilli(time.Now().UnixMilli())
 	s.aliveTimeout, s.intervalTime = msg.AliveTimeout, msg.IntervalTime
 
-	if err := s.activateServer(); err != nil {
+	if err := s.activateServer(msg.SessionName); err != nil {
 		return err
 	}
 

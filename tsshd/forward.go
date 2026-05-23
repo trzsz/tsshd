@@ -172,7 +172,10 @@ func (s *sshUdpServer) handleListenEvent(stream Stream) {
 	if msg.Net == "unix" {
 		mode := os.FileMode(0666) &^ os.FileMode(streamLocalBindMask())
 		if err := os.Chmod(msg.Addr, mode); err != nil {
-			warning("chmod unix socket [%s] to %#o failed: %v", msg.Addr, mode, err)
+			_ = listener.Close()
+			_ = os.Remove(msg.Addr)
+			sendError(stream, fmt.Errorf("chmod unix socket [%s] to %#o failed: %v", msg.Addr, mode, err))
+			return
 		}
 		defer newFileUnlinker(msg.Addr, listener)()
 	} else {

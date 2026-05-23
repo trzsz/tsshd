@@ -529,3 +529,11 @@ func newFileUnlinker(path string, closer io.Closer) func() {
 	// Return the cleanup function to be used with defer.
 	return cleanup
 }
+
+func isDirExist(path string) bool {
+	stat, err := os.Stat(path)
+	if err != nil || stat == nil {
+		return false
+	}
+	return stat.IsDir()
+}

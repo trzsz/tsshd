@@ -26,13 +26,20 @@ package tsshd
 
 import (
 	"context"
+	"fmt"
 	"io"
+	"net"
+	"os"
 	"os/exec"
+	"os/user"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"syscall"
+	"time"
 
+	"github.com/Microsoft/go-winio"
 	"github.com/UserExistsError/conpty"
 	"golang.org/x/sys/windows"
 )
@@ -117,4 +124,93 @@ func getSysProcAttr() *syscall.SysProcAttr {
 
 func splitCommandLine(command string) ([]string, error) {
 	return windows.DecomposeCommandLine(command)
+}
+
+func listenForAgent(id uint64) (net.Listener, string, error) {
+	return listenOnPipe(fmt.Sprintf("agent-%d-%d", os.Getpid(), id))
+}
+
+func listenForSocketServer() (net.Listener, error) {
+	listener, _, err := listenOnPipe(fmt.Sprintf("socket-%d", os.Getpid()))
+	return listener, err
+}
+
+func listenOnPipe(name string) (net.Listener, string, error) {
+	currentUser, err := user.Current()
+	if err != nil {
+		return nil, "", fmt.Errorf("get current user failed: %v", err)
+	}
+
+	pipeConfig := &winio.PipeConfig{
+		SecurityDescriptor: fmt.Sprintf("D:P(A;;GA;;;%s)", currentUser.Uid),
+	}
+
+	pipePath := fmt.Sprintf(`\\.\pipe\tsshd\%s\%s`, currentUser.Uid, name)
+
+	listener, err := winio.ListenPipe(pipePath, pipeConfig)
+	if err != nil {
+		return nil, "", fmt.Errorf("listen on [%s] failed: %v", pipePath, err)
+	}
+
+	addOnExitFunc(func() { _ = listener.Close() })
+
+	return listener, pipePath, nil
+}
+
+func listSocketPaths() ([]*socketPath, error) {
+	currentUser, err := user.Current()
+	if err != nil {
+		return nil, fmt.Errorf("get current user failed: %v", err)
+	}
+	prefix := fmt.Sprintf(`tsshd\%s\socket-`, currentUser.Uid)
+
+	pattern := `\\.\pipe\*`
+	ptr, err := windows.UTF16PtrFromString(pattern)
+	if err != nil {
+		return nil, fmt.Errorf("ptr from string [%s] failed: %v", pattern, err)
+	}
+
+	var data windows.Win32finddata
+	handle, err := windows.FindFirstFile(ptr, &data)
+	if err != nil {
+		if err == syscall.ERROR_FILE_NOT_FOUND {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("find first file [%s] failed: %v", pattern, err)
+	}
+	defer windows.FindClose(handle)
+
+	var socketPaths []*socketPath
+	for {
+		name := windows.UTF16ToString(data.FileName[:])
+		if strings.HasPrefix(name, prefix) {
+			if pid, err := strconv.Atoi(name[len(prefix):]); err == nil {
+				socketPaths = append(socketPaths, &socketPath{pid, `\\.\pipe\` + name})
+			}
+		}
+		err = windows.FindNextFile(handle, &data)
+		if err != nil {
+			if err == syscall.ERROR_NO_MORE_FILES {
+				break
+			}
+			return nil, err
+		}
+	}
+
+	return socketPaths, nil
+}
+
+func getSocketPath(pid int) (string, error) {
+	currentUser, err := user.Current()
+	if err != nil {
+		return "", fmt.Errorf("get current user failed: %v", err)
+	}
+
+	pipePath := fmt.Sprintf(`\\.\pipe\tsshd\%s\socket-%d`, currentUser.Uid, pid)
+	return pipePath, nil
+}
+
+func connectSocket(path string) (net.Conn, error) {
+	timeout := 1 * time.Second
+	return winio.DialPipe(path, &timeout)
 }

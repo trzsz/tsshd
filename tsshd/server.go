@@ -142,7 +142,7 @@ func (s *sshUdpServer) initClientChecker(timeout time.Duration) {
 	})
 }
 
-func (s *sshUdpServer) activateServer() error {
+func (s *sshUdpServer) activateServer(sessionName string) error {
 	if !s.args.Attachable {
 		if !activeSshUdpServer.CompareAndSwap(nil, s) {
 			return fmt.Errorf("active server is already in use")
@@ -160,6 +160,12 @@ func (s *sshUdpServer) activateServer() error {
 	}
 
 	oldServer := activeSshUdpServer.Swap(s)
+
+	// Preserve the session name from the initial connection.
+	// Later attaches do not overwrite it.
+	if oldServer == nil && globalSocketInfo != nil {
+		globalSocketInfo.sessionName = sessionName
+	}
 
 	s.detachAllSessions()
 

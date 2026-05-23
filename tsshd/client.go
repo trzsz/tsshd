@@ -96,6 +96,7 @@ type UdpClientOptions struct {
 	IPv4             bool
 	IPv6             bool
 	TsshdAddr        string
+	SessionName      string
 	ServerInfo       *ServerInfo
 	AliveTimeout     time.Duration
 	IntervalTime     time.Duration
@@ -189,6 +190,7 @@ func NewSshUdpClient(opts *UdpClientOptions) (*SshUdpClient, error) {
 
 	if err := sendMessage(busStream, busMessage{
 		ClientVer:        kTsshdVersion,
+		SessionName:      opts.SessionName,
 		AliveTimeout:     opts.AliveTimeout,
 		IntervalTime:     opts.IntervalTime,
 		HeartbeatTimeout: opts.HeartbeatTimeout}); err != nil {

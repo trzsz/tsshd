@@ -50,6 +50,9 @@ const (
 	kExitCodeAliveTimeout = 95
 	kExitCodeSignalKill   = 96
 	kExitCodeApplyOptions = 97
+	kExitCodeListFailed   = 98
+	kExitCodeViewFailed   = 99
+	kExitCodeAttachFailed = 100
 )
 
 var exitChan = make(chan int, 1)
@@ -71,13 +74,19 @@ type tsshdArgs struct {
 	IPv6           bool
 	Debug          bool
 	Attachable     bool
+	Socket         bool
+	List           bool
+	View           string
+	Attach         string
 	MTU            uint16
 	Port           string
 	ConnectTimeout time.Duration
 }
 
 func printHelp() int {
-	fmt.Printf("usage: tsshd [-h|-v|-V] [--kcp] [--tcp] [--ipv4] [--ipv6] [--debug] [--attachable] [--mtu N] [--port low-high] [--connect-timeout t]\n\n" +
+	fmt.Printf("usage: tsshd [-h|-v|-V] [--kcp] [--tcp] [--ipv4] [--ipv6] [--debug] " +
+		"[--attachable] [--socket] [--list] [--view <PID>.<SID>] [--attach <PID>] " +
+		"[--mtu N] [--port low-high] [--connect-timeout t]\n\n" +
 		"tsshd: A UDP-based SSH server with seamless roaming and auto-reconnect.\n\n" +
 		"optional arguments:\n" +
 		"  -h, --help             show this help message and exit\n" +
@@ -89,6 +98,10 @@ func printHelp() int {
 		"  --ipv6                 UDP only listens on IPv6, ignoring IPv4\n" +
 		"  --debug                Send debugging messages to the client\n" +
 		"  --attachable           Allow another client to attach to server\n" +
+		"  --socket               Listen on a socket to allow reattachment\n" +
+		"  --list                 List all tsshd sessions for current user\n" +
+		"  --view <PID>.<SID>     Print the screen contents of the session\n" +
+		"  --attach <PID>         Attach to tsshd session specified by PID\n" +
 		"  --mtu N                Sets the Maximum Transmission Unit (MTU)\n" +
 		"  --port low-high        UDP port range that the tsshd listens on\n" +
 		"  --connect-timeout t    The timeout for tssh connecting to tsshd\n")
@@ -117,6 +130,20 @@ func parseTsshdArgs() *tsshdArgs {
 			args.Debug = true
 		case "--attachable":
 			args.Attachable = true
+		case "--socket":
+			args.Socket = true
+		case "--list":
+			args.List = true
+		case "--view":
+			if i+1 < len(os.Args) && !strings.HasPrefix(os.Args[i+1], "-") {
+				args.View = os.Args[i+1]
+				i++
+			}
+		case "--attach":
+			if i+1 < len(os.Args) && !strings.HasPrefix(os.Args[i+1], "-") {
+				args.Attach = os.Args[i+1]
+				i++
+			}
 		case "--mtu":
 			if i+1 < len(os.Args) && !strings.HasPrefix(os.Args[i+1], "-") {
 				if mtu, err := strconv.ParseUint(os.Args[i+1], 10, 16); err == nil {
@@ -221,6 +248,16 @@ func RunMain(opts ...Option) (int, error) {
 		return printVersionDetailed(), nil
 	}
 
+	if args.List {
+		return handleListCommand()
+	}
+	if args.View != "" {
+		return handleViewCommand(args.View)
+	}
+	if args.Attach != "" {
+		return handleAttachCommand(args.Attach)
+	}
+
 	parent, stdout, err := background()
 	if err != nil {
 		return kExitCodeBackground, fmt.Errorf("run in background failed: %v", err)
@@ -258,7 +295,7 @@ func RunMain(opts ...Option) (int, error) {
 	}
 
 	// init tsshd server
-	info, err := initServer(args)
+	serverInfo, infoStr, err := initServer(args)
 	if err != nil {
 		debug("init server failed: %v", err)
 		fmt.Println(err)
@@ -266,7 +303,13 @@ func RunMain(opts ...Option) (int, error) {
 		return kExitCodeInitServer, nil // Error has been forwarded to stdout for parent handling
 	}
 
-	fmt.Printf("\a%s\n", info)
+	// Initialize global socket info before publishing server info,
+	// so incoming client connections can populate the session name.
+	if args.Attachable && args.Socket {
+		go startSocketServer(serverInfo)
+	}
+
+	fmt.Printf("\a%s\n", infoStr)
 
 	addOnExitFunc(func() {
 		if server := activeSshUdpServer.Load(); server != nil {

@@ -115,10 +115,10 @@ func (s *quicServer) getUdpForwarder() *udpForwarder {
 	return s.forwarder
 }
 
-func initServer(args *tsshdArgs) (string, error) {
+func initServer(args *tsshdArgs) (*ServerInfo, string, error) {
 	conn, port, err := listenOnFreePort(args)
 	if err != nil {
-		return "", err
+		return nil, "", err
 	}
 
 	if enableDebugLogging {
@@ -133,20 +133,20 @@ func initServer(args *tsshdArgs) (string, error) {
 
 	proxy, err := startServerProxy(args, info, conn)
 	if err != nil {
-		return "", err
+		return nil, "", err
 	}
 
 	if args.KCP {
 		listener, err := listenKCP(proxy, info, proxy.kcpPass, proxy.kcpSalt, true)
 		if err != nil {
-			return "", err
+			return nil, "", err
 		}
 		addOnExitFunc(func() { _ = listener.Close() })
 		go serveKCP(args, proxy, listener)
 	} else {
 		listener, initialPacketSize, err := listenQUIC(proxy, info, args.MTU)
 		if err != nil {
-			return "", err
+			return nil, "", err
 		}
 		addOnExitFunc(func() { _ = listener.Close() })
 		go serveQUIC(args, proxy, listener, initialPacketSize)
@@ -154,10 +154,10 @@ func initServer(args *tsshdArgs) (string, error) {
 
 	infoStr, err := json.Marshal(info)
 	if err != nil {
-		return "", fmt.Errorf("json marshal failed: %v", err)
+		return nil, "", fmt.Errorf("json marshal failed: %v", err)
 	}
 
-	return string(infoStr), nil
+	return info, string(infoStr), nil
 }
 
 func parsePortRanges(tsshdPort string) [][2]uint16 {

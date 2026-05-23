@@ -946,7 +946,7 @@ func startServerProxy(args *tsshdArgs, info *ServerInfo, conn frontendConnection
 		info.Salt = fmt.Sprintf("%x", proxy.kcpSalt)
 	}
 
-	if !args.Attachable {
+	if !args.Attachable || args.Socket {
 		for info.ClientID == 0 {
 			clientID := make([]byte, 8)
 			if _, err := crypto_rand.Read(clientID); err != nil {
@@ -955,7 +955,9 @@ func startServerProxy(args *tsshdArgs, info *ServerInfo, conn frontendConnection
 			info.ClientID = binary.BigEndian.Uint64(clientID)
 		}
 		proxy.clientID = info.ClientID
+	}
 
+	if !args.Attachable {
 		client, err := proxy.newClientState(info.ClientID)
 		if err != nil {
 			return nil, fmt.Errorf("new client state failed: %v", err)
