@@ -447,6 +447,8 @@ func handleBusiness(sess Session) {
 
 ## 屏幕截图
 
+![tsshd attach session](https://trzsz.github.io/images/tsshd_attach.gif)
+
 ![tsshd auto reconnect](https://trzsz.github.io/images/tsshd_conn.gif)
 
 ## 联系方式

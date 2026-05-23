@@ -447,6 +447,8 @@ To help you get started quickly, we provide fully working sample code in the [`e
 
 ### Screenshot
 
+![tsshd attach session](https://trzsz.github.io/images/tsshd_attach.gif)
+
 ![tsshd auto reconnect](https://trzsz.github.io/images/tsshd_conn.gif)
 
 ### Contact
