@@ -206,7 +206,7 @@ tssh and tsshd works exactly like ssh, there are no plans to support local echo 
 
   </details>
 
-- Download from the [GitHub Releases](https://github.com/trzsz/tsshd/releases) and install locally
+- Download from the [GitHub Releases](https://github.com/trzsz/tsshd/releases) (or [Pre-Release](https://github.com/trzsz/tsshd/releases/tag/dev)) and install locally
 
   <details><summary><code>download and install locally</code></summary>
 

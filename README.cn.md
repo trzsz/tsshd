@@ -206,7 +206,7 @@ tssh 和 tsshd 的工作方式与 ssh 完全相同，没有计划支持本地回
 
   </details>
 
-- 可从 [GitHub Releases](https://github.com/trzsz/tsshd/releases) 中下载，国内可从 [Gitee 发行版](https://gitee.com/trzsz/tsshd/releases) 中下载，然后本地安装。
+- 可从 [GitHub Releases](https://github.com/trzsz/tsshd/releases) 或 [Pre-Release](https://github.com/trzsz/tsshd/releases/tag/dev) 中下载，国内可从 [Gitee 发行版](https://gitee.com/trzsz/tsshd/releases) 中下载，然后本地安装。
 
   <details><summary><code>下载并本地安装</code></summary>
 
