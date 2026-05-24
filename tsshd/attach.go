@@ -29,10 +29,78 @@ import (
 	"io"
 	"net"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
 var attachMutex sync.Mutex
+
+type writeResult struct {
+	n   int
+	err error
+}
+
+type interruptibleStream struct {
+	Stream
+	mu      sync.Mutex
+	bufCh   chan []byte
+	ackCh   chan writeResult
+	closeCh chan struct{}
+	closed  atomic.Bool
+}
+
+func (s *interruptibleStream) Close() error {
+	if !s.closed.CompareAndSwap(false, true) {
+		return nil
+	}
+	close(s.closeCh)
+	return s.Stream.Close()
+}
+
+func (s *interruptibleStream) Write(buf []byte) (int, error) {
+	if s.closed.Load() {
+		return 0, fmt.Errorf("stream closed")
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	select {
+	case s.bufCh <- buf:
+	case <-s.closeCh:
+		return 0, fmt.Errorf("stream closed")
+	}
+
+	select {
+	case result := <-s.ackCh:
+		return result.n, result.err
+	case <-s.closeCh:
+		return 0, fmt.Errorf("stream closed")
+	}
+}
+
+func newInterruptibleStream(s Stream) *interruptibleStream {
+	ss := &interruptibleStream{
+		Stream:  s,
+		bufCh:   make(chan []byte),
+		ackCh:   make(chan writeResult, 1),
+		closeCh: make(chan struct{}),
+	}
+
+	go func() {
+		for {
+			select {
+			case buf := <-ss.bufCh:
+				n, err := ss.Stream.Write(buf)
+				ss.ackCh <- writeResult{n, err}
+			case <-ss.closeCh:
+				return
+			}
+		}
+	}()
+
+	return ss
+}
 
 type replaceableStream struct {
 	mu     sync.Mutex
@@ -42,7 +110,7 @@ type replaceableStream struct {
 }
 
 func newReplaceableStream(s Stream) *replaceableStream {
-	ss := &replaceableStream{stream: s}
+	ss := &replaceableStream{stream: newInterruptibleStream(s)}
 	ss.cond = sync.NewCond(&ss.mu)
 	return ss
 }
@@ -61,7 +129,11 @@ func (s *replaceableStream) swap(newStream Stream) {
 	}
 
 	oldStream := s.stream
-	s.stream = newStream
+	if newStream == nil {
+		s.stream = nil
+	} else {
+		s.stream = newInterruptibleStream(newStream)
+	}
 
 	s.cond.Broadcast()
 	s.mu.Unlock()
