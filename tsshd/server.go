@@ -109,6 +109,7 @@ var newSshUdpServer = func(args *tsshdArgs, proxy *serverProxy, addr net.Addr, p
 		// close the server if it does not enter the serving state within connect timeout.
 		time.Sleep(args.ConnectTimeout)
 		if !server.serving.Load() {
+			debug("client [%x] bus initialization timed out after %v", server.client.proxyAddr.clientID, args.ConnectTimeout)
 			server.Close()
 		}
 	}()
@@ -143,6 +144,7 @@ func (s *sshUdpServer) initClientChecker(timeout time.Duration) {
 }
 
 func (s *sshUdpServer) activateServer(sessionName string) error {
+	debug("client [%x] starting server activation", s.client.proxyAddr.clientID)
 	if !s.args.Attachable {
 		if !activeSshUdpServer.CompareAndSwap(nil, s) {
 			return fmt.Errorf("active server is already in use")
@@ -200,23 +202,36 @@ func (s *sshUdpServer) Close() {
 		return
 	}
 
-	// close bus
+	debug("client [%x] shutting down server", s.client.proxyAddr.clientID)
+
+	// Stop the client checker and its background goroutines.
+	s.clientChecker.Close()
+
+	// Close the bus stream
 	s.busMutex.Lock()
-	if s.busStream != nil {
-		_ = s.busStream.Close()
-	}
+	busStream := s.busStream
 	s.busMutex.Unlock()
+	if busStream != nil {
+		_, err := doWithTimeout(func() (int, error) { return 0, busStream.Close() }, time.Second)
+		debug("client [%x] bus stream closed: %v", s.client.proxyAddr.clientID, err)
+	}
+
+	// Close all stderr streams
+	s.closeAllStderrStreams()
 
 	// Ensure all active streams are closed.
 	// closeActiveStreams is idempotent and safe to call multiple times.
 	s.closeActiveStreams()
+	debug("client [%x] all streams closed", s.client.proxyAddr.clientID)
 
 	// close server connection
-	_ = s.proto.closeServer()
+	err := s.proto.closeServer()
+	debug("client [%x] transport closed: %v", s.client.proxyAddr.clientID, err)
 
-	// Release the server reference.
+	// Release the server and packet cache references.
 	// The clientState is kept in memory to prevent replay attacks.
 	s.client.server.Store(nil)
+	s.client.pktCache.Store(nil)
 }
 
 // handlerFunc defines the signature for stream handlers.
@@ -253,10 +268,29 @@ func (s *sshUdpServer) handleStream(stream Stream) {
 
 	// unregister stream on return
 	defer func() {
+		// Usually, CloseWrite has already been called, allowing the client to receive EOF.
+		// If we call Close immediately, the underlying QUIC/KCP layer might discard
+		// in-flight data that hasn't been received by the client yet.
+		// We delay the final closure to provide a grace period for the transport layer
+		// to complete data delivery, especially during connection roaming or high latency.
+		for range 60 {
+			if s.clientChecker.isTimeout() {
+				// Wait for potential reconnection to ensure the last packets can be delivered.
+				_ = s.clientChecker.waitUntilReconnected()
+			}
+			if s.closed.Load() {
+				// If the server is shutting down, it handles cleaning up all active streams.
+				return
+			}
+			time.Sleep(time.Second)
+		}
+
 		s.streamMutex.Lock()
 		delete(s.streamMap, id)
 		s.streamMutex.Unlock()
-		_ = stream.Close()
+
+		err := stream.Close()
+		debug("stream [%x][%d] closed: %v", s.client.proxyAddr.clientID, id, err)
 	}()
 
 	// read initial command
@@ -268,7 +302,7 @@ func (s *sshUdpServer) handleStream(stream Stream) {
 
 	if enableDebugLogging && command != "dial" && command != "accept" && command != "dial-udp" && command != "accept-udp" {
 		debug("stream [%x][%d] command [%s] starts", s.client.proxyAddr.clientID, id, command)
-		defer debug("stream [%x][%d] command [%s] closes", s.client.proxyAddr.clientID, id, command)
+		defer debug("stream [%x][%d] command [%s] closing", s.client.proxyAddr.clientID, id, command)
 	}
 
 	// NOTE: In attachable mode, multiple servers may coexist.
@@ -339,7 +373,7 @@ func (s *sshUdpServer) closeActiveStreams() {
 	s.streamMutex.Unlock()
 
 	for _, entry := range entries {
-		debug("server shutdown closing stream [%x][%d]", s.client.proxyAddr.clientID, entry.id)
-		_ = entry.stream.Close()
+		_, err := doWithTimeout(func() (int, error) { return 0, entry.stream.Close() }, time.Second)
+		debug("active stream [%x][%d] closed: %v", s.client.proxyAddr.clientID, entry.id, err)
 	}
 }

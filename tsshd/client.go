@@ -485,6 +485,17 @@ func (c *SshUdpClient) GetMaxDatagramSize() uint16 {
 	return c.protoClient.getUdpForwarder().conn.GetMaxDatagramSize()
 }
 
+// IsConnectionLost returns true if the underlying transport is currently unable to reach the server.
+func (c *SshUdpClient) IsConnectionLost() bool {
+	return c.activeChecker.isTimeout()
+}
+
+// WaitUntilReconnected blocks until the transport layer restores its connection to the server,
+// allowing data transmission to resume.
+func (c *SshUdpClient) WaitUntilReconnected() error {
+	return c.activeChecker.waitUntilReconnected()
+}
+
 func (c *SshUdpClient) tryToReconnect() {
 	c.reconnectMutex.Lock()
 	defer c.reconnectMutex.Unlock()
@@ -1186,6 +1197,7 @@ func (s *SshUdpSession) Attach(id uint64) error {
 	msg := startMessage{
 		ID:     id,
 		ErrID:  s.id,
+		Pty:    s.pty,
 		Attach: true,
 		Cols:   s.width,
 		Rows:   s.height,

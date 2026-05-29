@@ -61,7 +61,7 @@ type clientState struct {
 	udpFrontConn atomic.Pointer[udpFrontendConn]
 	clientMutex  sync.Mutex
 	clientCond   *sync.Cond
-	pktCache     packetCache
+	pktCache     atomic.Pointer[packetCache]
 	cachingPkt   atomic.Bool
 	kcpCrypto    *rotatingCrypto
 }
@@ -133,7 +133,11 @@ func (c *clientState) setAuthedAddr(addr *net.UDPAddr) {
 }
 
 func (c *clientState) sendPacketCache(conn frontendConnection) bool {
-	flushSize, flushCount := c.pktCache.sendCache(func(buf []byte) error {
+	pktCache := c.pktCache.Load()
+	if pktCache == nil {
+		return false
+	}
+	flushSize, flushCount := pktCache.sendCache(func(buf []byte) error {
 		if c.kcpCrypto != nil {
 			var err error
 			buf, err = c.kcpCrypto.sealPacket(buf, false)
@@ -718,6 +722,7 @@ type serverProxy struct {
 func (p *serverProxy) newClientState(clientID uint64) (*clientState, error) {
 	client := &clientState{proxyAddr: proxyClientAddr{clientID}}
 	client.clientCond = sync.NewCond(&client.clientMutex)
+	client.pktCache.Store(&packetCache{})
 
 	if p.args.KCP {
 		crypto, err := newRotatingCrypto(nil, p.kcpPass, p.kcpSalt, 0, 0, false)
@@ -855,14 +860,18 @@ func (p *serverProxy) WriteTo(buf []byte, addr net.Addr) (int, error) {
 			if enableDebugLogging && client.cachingPkt.CompareAndSwap(false, true) {
 				debug("client [%x] switching to packet caching mode", client.proxyAddr.clientID)
 			}
-			client.pktCache.addPacket(buf)
+			if pktCache := client.pktCache.Load(); pktCache != nil {
+				pktCache.addPacket(buf)
+			}
 			return n, nil
 		} else if enableDebugLogging && client.cachingPkt.CompareAndSwap(true, false) {
 			debug("client [%x] switching to direct transmission mode", client.proxyAddr.clientID)
 		}
 
 		if server.shouldSample.Load() && server.shouldSample.CompareAndSwap(true, false) {
-			client.pktCache.addSample(buf)
+			if pktCache := client.pktCache.Load(); pktCache != nil {
+				pktCache.addSample(buf)
+			}
 		}
 	}
 

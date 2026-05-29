@@ -49,7 +49,9 @@ type ErrCode int
 
 const (
 	// ErrProhibited is an error indicating administratively prohibited
-	ErrProhibited ErrCode = iota + 101
+	ErrProhibited ErrCode = 101
+	// ErrNotPty indicates the session does not support PTY
+	ErrNotPty ErrCode = 102
 )
 
 // String converts the error code to human readable form
@@ -57,8 +59,10 @@ func (c ErrCode) String() string {
 	switch c {
 	case ErrProhibited:
 		return "ErrProhibited"
+	case ErrNotPty:
+		return "ErrNotPty"
 	default:
-		return "UnknownError" + strconv.Itoa(int(c))
+		return fmt.Sprintf("ErrCode(%d)", c)
 	}
 }
 

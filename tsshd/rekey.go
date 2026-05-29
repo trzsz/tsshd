@@ -164,7 +164,7 @@ func (r *rotatingCrypto) openPacket(buf []byte) (int, error) {
 	}
 
 	if len(plaintext) > 0 && &plaintext[0] != &ciphertext[0] {
-		copy(ciphertext[:0], plaintext)
+		copy(ciphertext[:len(plaintext)], plaintext)
 	}
 
 	return r.nonceSize + len(plaintext), nil

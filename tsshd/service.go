@@ -532,8 +532,16 @@ func (s *quicStream) CloseWrite() error {
 }
 
 func (s *quicStream) Close() error {
-	_ = s.CloseRead()
-	return s.CloseWrite()
+	s.CancelRead(0)
+
+	// It is CRITICAL to call CancelWrite here.
+	// If a Write() is blocked because the client has disappeared, a standard Close()
+	// will keep the data in memory, waiting for ACKs that will never arrive.
+	// CancelWrite forcefully discards the outbound buffer and prevents a memory leak.
+	s.CancelWrite(0)
+
+	// In this context, CancelWrite is sufficient to release stream resources.
+	return nil
 }
 
 type kcpDatagramConn struct {
@@ -608,7 +616,10 @@ func serveKCP(args *tsshdArgs, proxy *serverProxy, listener *kcp.Listener) {
 }
 
 func handleKcpConn(args *tsshdArgs, proxy *serverProxy, conn *kcp.UDPSession) {
-	defer func() { _ = conn.Close() }()
+	defer func() {
+		err := conn.Close()
+		debug("kcp connection [%v] closed: %v", conn.RemoteAddr(), err)
+	}()
 
 	if !args.Attachable {
 		if s := activeSshUdpServer.Load(); s != nil && s.serving.Load() {
@@ -661,7 +672,10 @@ func serveQUIC(args *tsshdArgs, proxy *serverProxy, listener *quic.Listener, ini
 }
 
 func handleQuicConn(args *tsshdArgs, proxy *serverProxy, conn *quic.Conn, initialPacketSize uint16) {
-	defer func() { _ = conn.CloseWithError(0, "") }()
+	defer func() {
+		err := conn.CloseWithError(0, "")
+		debug("quic connection [%v] closed: %v", conn.RemoteAddr(), err)
+	}()
 
 	if !args.Attachable {
 		if s := activeSshUdpServer.Load(); s != nil && s.serving.Load() {

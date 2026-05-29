@@ -92,7 +92,7 @@ func (s *sshUdpServer) handleBusEvent(stream Stream) {
 		sendError(stream, err)
 		return
 	}
-	if s.busStream == nil { // // ACK failed, bus remains uninitialized
+	if s.busStream == nil { // ACK failed, bus remains uninitialized
 		return
 	}
 
@@ -171,21 +171,23 @@ func (s *sshUdpServer) handleCloseEvent() {
 	debug("close bus and exit tsshd")
 
 	busClosingMu.Lock()
-	busClosing.Store(true)
-	if debugMsgChan != nil {
-		close(debugMsgChan)
-	}
-	if warningMsgChan != nil {
-		close(warningMsgChan)
+	if busClosing.CompareAndSwap(false, true) {
+		if debugMsgChan != nil {
+			close(debugMsgChan)
+		}
+		if warningMsgChan != nil {
+			close(warningMsgChan)
+		}
 	}
 	busClosingMu.Unlock()
 
-	busClosingWG.Wait()
+	_, _ = doWithTimeout(func() (int, error) { busClosingWG.Wait(); return 0, nil }, time.Second)
 
-	go func() {
-		time.Sleep(200 * time.Millisecond) // give udp some time
-		exitWithCode(kExitCodeNormal)
-	}()
+	if enableWarningLogging || enableDebugLogging {
+		// Give warning and debug logs some time to be delivered to the client.
+		time.Sleep(time.Second)
+	}
+	exitWithCode(kExitCodeNormal)
 }
 
 func (s *sshUdpServer) handleAliveEvent(stream Stream, heartbeatTimeoutMilli, intervalTimeMilli int64) error {
@@ -216,9 +218,11 @@ func (s *sshUdpServer) handleAliveEvent(stream Stream, heartbeatTimeoutMilli, in
 		// If the client has remained active for a sufficient number of intervals,
 		// consider the connection stable and clear the packet cache.
 		if now-s.clientAliveTime.oldest() < (kAliveTimeCap+1)*intervalTimeMilli {
-			totalSize, totalCount := s.client.pktCache.clearCache()
-			if enableDebugLogging && (totalSize > 0 || totalCount > 0) {
-				debug("drop packet cache count [%d] size [%d]", totalCount, totalSize)
+			if pktCache := s.client.pktCache.Load(); pktCache != nil {
+				totalSize, totalCount := pktCache.clearCache()
+				if enableDebugLogging && (totalSize > 0 || totalCount > 0) {
+					debug("drop packet cache count [%d] size [%d]", totalCount, totalSize)
+				}
 			}
 			s.pendingClearPktCache = false
 		}
