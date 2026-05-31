@@ -122,7 +122,27 @@ type clientProxy struct {
 	shouldSample  atomic.Bool
 	kcpCrypto     *rotatingCrypto
 	serverChecker *timeoutChecker
+	readPktCount  atomic.Uint64
+	writePktCount atomic.Uint64
 	closed        atomic.Bool
+}
+
+func (p *clientProxy) clearBackendConn(oldConn *serverConnHolder) {
+	if oldConn != nil {
+		if !p.backendConn.CompareAndSwap(oldConn, nil) {
+			oldConn = nil
+		}
+	} else {
+		oldConn = p.backendConn.Swap(nil)
+	}
+
+	if oldConn != nil {
+		_ = oldConn.Close()
+
+		if p.client.enableDebugging {
+			p.client.debug("old transport closed. read packets: %d, write packets: %d", p.readPktCount.Swap(0), p.writePktCount.Swap(0))
+		}
+	}
 }
 
 func (p *clientProxy) renewTransportPath(proxyClient *SshUdpClient, connectTimeout time.Duration) error {
@@ -130,9 +150,7 @@ func (p *clientProxy) renewTransportPath(proxyClient *SshUdpClient, connectTimeo
 	defer p.renewMutex.Unlock()
 	p.serialNumber++
 
-	if conn := p.backendConn.Swap(nil); conn != nil {
-		_ = conn.Close()
-	}
+	p.clearBackendConn(nil)
 
 	var err error
 	var conn *serverConnHolder
@@ -180,9 +198,7 @@ func (p *clientProxy) renewTransportPath(proxyClient *SshUdpClient, connectTimeo
 	// Block until reconnection is confirmed by the arrival of valid QUIC/KCP packets,
 	// or abort if no server response is received before the heartbeat deadline.
 	if err := p.serverChecker.waitReconnect(ctx); err != nil {
-		if p.backendConn.CompareAndSwap(conn, nil) {
-			_ = conn.Close()
-		}
+		p.clearBackendConn(conn)
 		return fmt.Errorf("wait for server response failed: %v", err)
 	}
 
@@ -376,24 +392,25 @@ func (p *clientProxy) ReadFrom(buf []byte) (int, net.Addr, error) {
 		if conn := p.backendConn.Load(); conn != nil {
 			n, err := conn.Read(buf)
 			if err != nil {
-				if p.backendConn.CompareAndSwap(conn, nil) {
-					_ = conn.Close()
-				}
+				p.clearBackendConn(conn)
 				continue
 			}
 
 			if p.kcpCrypto != nil {
 				nn, err := p.kcpCrypto.openPacket(buf[:n])
 				if err != nil {
-					if enableDebugLogging {
-						p.client.debug("open packet failed: len=%d, auth=%v", n, len(aesDecrypt(p.cipherBlock, buf[:n])) == 16)
-					}
+					p.client.debug("open packet (len=%d) failed: %v", n, err)
 					continue
 				}
 				n = nn
 			}
 
 			p.serverChecker.updateNow()
+
+			if p.client.enableDebugging {
+				p.readPktCount.Add(1)
+			}
+
 			return n, p.remoteAddr, nil
 		}
 
@@ -422,7 +439,10 @@ func (p *clientProxy) WriteTo(buf []byte, _ net.Addr) (int, error) {
 			p.client.debug("switching to direct transmission mode")
 		}
 
-		if p.shouldSample.Load() && p.shouldSample.CompareAndSwap(true, false) {
+		if p.client.activeChecker.isTimeout() {
+			// Cache all packets until fully recovers, while concurrently sending them to the new transport.
+			p.pktCache.addPacket(buf)
+		} else if p.shouldSample.Load() && p.shouldSample.CompareAndSwap(true, false) {
 			p.pktCache.addSample(buf)
 		}
 
@@ -438,9 +458,9 @@ func (p *clientProxy) WriteTo(buf []byte, _ net.Addr) (int, error) {
 
 			if err := conn.Write(buf); err != nil {
 				p.client.debug("backend write failed: %v", err)
-				if p.backendConn.CompareAndSwap(conn, nil) {
-					_ = conn.Close()
-				}
+				p.clearBackendConn(conn)
+			} else if p.client.enableDebugging {
+				p.writePktCount.Add(1)
 			}
 
 			// Do not return an error here, otherwise QUIC/KCP may drop all subsequent packets.
@@ -467,9 +487,7 @@ func (p *clientProxy) Close() error {
 
 	p.client.debug("client proxy call Close")
 
-	if conn := p.backendConn.Swap(nil); conn != nil {
-		_ = conn.Close()
-	}
+	p.clearBackendConn(nil)
 
 	p.serverChecker.Close()
 

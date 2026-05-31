@@ -51,19 +51,21 @@ func (a *proxyClientAddr) String() string {
 }
 
 type clientState struct {
-	sealed       atomic.Bool
-	server       atomic.Pointer[sshUdpServer]
-	proxyAddr    proxyClientAddr
-	serialNumber atomic.Uint64
-	clientConn   atomic.Pointer[net.TCPConn]
-	clientAddr   atomic.Pointer[net.UDPAddr]
-	authedAddr   atomic.Pointer[net.UDPAddr]
-	udpFrontConn atomic.Pointer[udpFrontendConn]
-	clientMutex  sync.Mutex
-	clientCond   *sync.Cond
-	pktCache     atomic.Pointer[packetCache]
-	cachingPkt   atomic.Bool
-	kcpCrypto    *rotatingCrypto
+	sealed        atomic.Bool
+	server        atomic.Pointer[sshUdpServer]
+	proxyAddr     proxyClientAddr
+	serialNumber  atomic.Uint64
+	clientConn    atomic.Pointer[net.TCPConn]
+	clientAddr    atomic.Pointer[net.UDPAddr]
+	authedAddr    atomic.Pointer[net.UDPAddr]
+	udpFrontConn  atomic.Pointer[udpFrontendConn]
+	clientMutex   sync.Mutex
+	clientCond    *sync.Cond
+	pktCache      atomic.Pointer[packetCache]
+	cachingPkt    atomic.Bool
+	kcpCrypto     *rotatingCrypto
+	readPktCount  atomic.Uint64
+	writePktCount atomic.Uint64
 }
 
 func (c *clientState) remoteAddr() string {
@@ -101,6 +103,9 @@ func (c *clientState) setClientConn(conn *net.TCPConn) {
 
 	if oldConn != nil {
 		_ = oldConn.Close()
+		if enableDebugLogging {
+			debug("old transport closed. read packets: %d, write packets: %d", c.readPktCount.Swap(0), c.writePktCount.Swap(0))
+		}
 	}
 }
 
@@ -113,8 +118,13 @@ func (c *clientState) setClientAddr(addr *net.UDPAddr) {
 		conn.addClientMap(c)
 	}
 
-	if oldAddr != nil && conn != nil {
-		conn.delClientMap(oldAddr)
+	if oldAddr != nil {
+		if conn != nil {
+			conn.delClientMap(oldAddr)
+		}
+		if enableDebugLogging {
+			debug("old transport closed. read packets: %d, write packets: %d", c.readPktCount.Swap(0), c.writePktCount.Swap(0))
+		}
 	}
 }
 
@@ -822,9 +832,7 @@ func (p *serverProxy) ReadFrom(buf []byte) (int, net.Addr, error) {
 		if client.kcpCrypto != nil {
 			nn, err := client.kcpCrypto.openPacket(buf[:n])
 			if err != nil {
-				if enableDebugLogging {
-					debug("open packet failed: len=%d, auth=%v", n, len(aesDecrypt(p.cipherBlock, buf[:n])) == 16)
-				}
+				debug("open packet (len=%d) failed: %v", n, err)
 				continue
 			}
 			n = nn
@@ -835,6 +843,10 @@ func (p *serverProxy) ReadFrom(buf []byte) (int, net.Addr, error) {
 
 	if server := client.server.Load(); server != nil {
 		server.clientChecker.updateNow()
+	}
+
+	if enableDebugLogging {
+		client.readPktCount.Add(1)
 	}
 
 	return n, &client.proxyAddr, nil
@@ -886,7 +898,10 @@ func (p *serverProxy) WriteTo(buf []byte, addr net.Addr) (int, error) {
 
 	if err := p.frontendConn.writeTo(buf, client); err != nil {
 		debug("frontend write failed: %v", err)
+	} else if enableDebugLogging {
+		client.writePktCount.Add(1)
 	}
+
 	return n, nil
 }
 

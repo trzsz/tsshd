@@ -377,3 +377,7 @@ func (s *sshUdpServer) closeActiveStreams() {
 		debug("active stream [%x][%d] closed: %v", s.client.proxyAddr.clientID, entry.id, err)
 	}
 }
+
+func (s *sshUdpServer) isClientAlive() bool {
+	return time.Since(time.UnixMilli(s.clientAliveTime.latest())) < s.clientChecker.heartbeatTimeout
+}

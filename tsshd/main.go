@@ -316,7 +316,7 @@ func RunMain(opts ...Option) (int, error) {
 			server.Close()
 			// If the client is still active on exit, logs have likely been delivered,
 			// so the server-side debug log can be cleaned up.
-			if enableDebugLogging && !server.clientChecker.isTimeout() {
+			if enableDebugLogging && server.isClientAlive() {
 				cleanupDebugLog.Store(true)
 			}
 		}

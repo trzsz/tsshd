@@ -232,7 +232,7 @@ func runProxyEchoTest(t *testing.T, args *tsshdArgs) {
 
 	for range clientCount {
 		wg.Go(func() {
-			proxy, err := startClientProxy(&SshUdpClient{}, opts)
+			proxy, err := startClientProxy(&SshUdpClient{activeChecker: newTimeoutChecker(0)}, opts)
 			if err != nil {
 				t.Fatalf("start client proxy failed: %v", err)
 			}
@@ -536,7 +536,7 @@ func TestClientProxyWriteToAndCache(t *testing.T) {
 	mockConn := &mockPacketConn{}
 
 	proxy := &clientProxy{
-		client:        &SshUdpClient{},
+		client:        &SshUdpClient{activeChecker: newTimeoutChecker(0)},
 		kcpCrypto:     kcpCrypto,
 		serverChecker: newTimeoutChecker(0),
 	}
