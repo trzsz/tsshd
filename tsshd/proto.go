@@ -249,8 +249,10 @@ type udpReadyMessage struct {
 }
 
 type discardMessage struct {
-	DiscardMarker  []byte `json:",omitempty"`
-	DiscardedInput []byte `json:",omitempty"`
+	DiscardMarker        []byte `json:",omitempty"`
+	DiscardedInput       []byte `json:",omitempty"`
+	DiscardedOutputLines uint64 `json:",omitempty"`
+	DiscardedOutputBytes uint64 `json:",omitempty"`
 }
 
 type settingsMessage struct {

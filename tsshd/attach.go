@@ -441,6 +441,13 @@ func (s *sshUdpServer) attachSession(ioStream, errStream Stream, msg *startMessa
 	sess.ioStream.swap(ioStream)
 	sess.errStream.swap(errStream)
 
+	// Mark cached output to be discarded before clientChecker updates.
+	// This prevents a race condition where a successful reconnection reported
+	// by clientChecker immediately flushes the cache before the flag is set.
+	if pty {
+		sess.discardOutput.Store(true)
+	}
+
 	// The client checker is updated after stream setup to ensure streams
 	// are ready when the client checker reports the client reconnected.
 	sess.clientChecker.swap(s.clientChecker)

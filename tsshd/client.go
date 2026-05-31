@@ -75,7 +75,7 @@ type SshUdpClient struct {
 	channelMutex     sync.Mutex
 	channelMap       map[string]chan ssh.NewChannel
 	quitCallback     func(string)
-	discardCallback  func([]byte)
+	discardCallback  func([]byte, uint64, uint64)
 	enableDebugging  bool
 	clientDebugFunc  func(int64, string)
 	enableWarning    bool
@@ -105,7 +105,7 @@ type UdpClientOptions struct {
 	DebugFunc        func(int64, string)
 	WarningFunc      func(string)
 	QuitCallback     func(reason string)
-	DiscardCallback  func(discarded []byte)
+	DiscardCallback  func(discardedInput []byte, discardedOutputLines, discardedOutputBytes uint64)
 }
 
 // NewSshUdpClient creates a SshUdpClient
@@ -745,8 +745,8 @@ func (c *SshUdpClient) handleDiscardEvent() {
 		return
 	}
 
-	if len(msg.DiscardedInput) > 0 && c.discardCallback != nil {
-		go c.discardCallback(msg.DiscardedInput)
+	if c.discardCallback != nil && (len(msg.DiscardedInput) > 0 || msg.DiscardedOutputLines > 0 || msg.DiscardedOutputBytes > 0) {
+		go c.discardCallback(msg.DiscardedInput, msg.DiscardedOutputLines, msg.DiscardedOutputBytes)
 	}
 
 	if len(msg.DiscardMarker) > 0 {
@@ -955,7 +955,7 @@ func (s *SshUdpSession) forwardInput() {
 					if s.client.discardCallback != nil {
 						// Currently in timeout; no need for asynchronous call,
 						// so call the discard callback synchronously without copying the buffer
-						s.client.discardCallback(buf)
+						s.client.discardCallback(buf, 0, 0)
 					}
 					continue
 				}

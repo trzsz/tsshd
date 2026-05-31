@@ -122,6 +122,7 @@ type sessionContext struct {
 	clientChecker   *replaceableTimeoutChecker
 	discardedBuffer []byte
 	discardMarker   atomic.Pointer[[]byte]
+	discardOutput   atomic.Bool
 	screenBuf       chan []byte
 	screenObj       *te.Screen
 	screenMu        sync.Mutex
@@ -315,7 +316,7 @@ func (c *sessionContext) forwardOutput(name string, reader io.Reader, stream Str
 
 	var cacheLines [][]byte
 	var tmuxOutputPrefix string
-	var discardLines, discardBytes, voidedCapacity int
+	var discardLines, discardBytes, voidedCapacity uint64
 
 	cacheOutput := func(buf []byte) {
 		for len(buf) > 0 {
@@ -352,14 +353,14 @@ func (c *sessionContext) forwardOutput(name string, reader io.Reader, stream Str
 			}
 
 			dropLines := len(cacheLines) - maxLines
-			discardLines += dropLines
+			discardLines += uint64(dropLines)
 			for i := range dropLines {
-				discardBytes += len(cacheLines[i])
+				discardBytes += uint64(len(cacheLines[i]))
 			}
 			cacheLines = cacheLines[dropLines:]
 
-			voidedCapacity += dropLines
-			if voidedCapacity > maxLines {
+			voidedCapacity += uint64(dropLines)
+			if voidedCapacity > uint64(maxLines) {
 				newCacheLines := make([][]byte, len(cacheLines), maxLines*2+10)
 				copy(newCacheLines, cacheLines)
 				cacheLines = newCacheLines
@@ -444,6 +445,21 @@ func (c *sessionContext) forwardOutput(name string, reader io.Reader, stream Str
 		cacheLines, chHasNewLine, noNewLineCount = nil, false, 0
 	}
 
+	clearOutput := func() {
+		for _, line := range cacheLines {
+			discardLines += 1
+			discardBytes += uint64(len(line))
+		}
+		if discardLines > 0 {
+			debug("discard output %d lines %d bytes", discardLines, discardBytes)
+			if server := c.server.Load(); server != nil {
+				server.sendBusMessage("discard", discardMessage{DiscardedOutputLines: discardLines, DiscardedOutputBytes: discardBytes})
+			}
+		}
+		discardLines, discardBytes = 0, 0
+		cacheLines, chHasNewLine, noNewLineCount = nil, false, 0
+	}
+
 	c.clientChecker.onReconnected(func() {
 		handleMutex.Lock()
 		defer handleMutex.Unlock()
@@ -458,6 +474,11 @@ func (c *sessionContext) forwardOutput(name string, reader io.Reader, stream Str
 	handleBuffer := func(buf []byte) {
 		handleMutex.Lock()
 		defer handleMutex.Unlock()
+
+		// Discard the cached output exactly once. The flag must be set again for future discards.
+		if c.discardOutput.CompareAndSwap(true, false) {
+			clearOutput()
+		}
 
 		if chHasNewLine && c.clientChecker.isTimeout() && !c.isKeepPendingOutput() {
 			cacheOutput(buf)
