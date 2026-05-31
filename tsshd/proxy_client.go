@@ -175,7 +175,7 @@ func (p *clientProxy) renewTransportPath(proxyClient *SshUdpClient, connectTimeo
 	}
 
 	// Send cached packets if any
-	p.sendPacketCache()
+	go p.sendPacketCache()
 
 	// Block until reconnection is confirmed by the arrival of valid QUIC/KCP packets,
 	// or abort if no server response is received before the heartbeat deadline.

@@ -32,6 +32,7 @@ import (
 	"io"
 	"net"
 	"sync"
+	"time"
 
 	"golang.org/x/net/ipv4"
 	"golang.org/x/net/ipv6"
@@ -178,6 +179,7 @@ func (p *packetCache) sendCache(writeFn func([]byte) error) (flushSize, flushCou
 		}
 		flushSize += len(buf)
 		flushCount++
+		time.Sleep(time.Millisecond)
 	}
 
 	for _, buf := range p.firstBuf {
@@ -186,6 +188,7 @@ func (p *packetCache) sendCache(writeFn func([]byte) error) (flushSize, flushCou
 		}
 		flushSize += len(buf)
 		flushCount++
+		time.Sleep(time.Millisecond)
 	}
 
 	for i := range len(p.recentBuf) {
@@ -195,6 +198,7 @@ func (p *packetCache) sendCache(writeFn func([]byte) error) (flushSize, flushCou
 		}
 		flushSize += len(buf)
 		flushCount++
+		time.Sleep(time.Millisecond)
 	}
 
 	return flushSize, flushCount

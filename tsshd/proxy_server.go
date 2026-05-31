@@ -805,7 +805,7 @@ func (p *serverProxy) onNewClientConn(client *clientState) {
 		// from being delivered after reconnection.
 		server.enablePendingInputDiscard()
 
-		client.sendPacketCache(p.frontendConn)
+		go client.sendPacketCache(p.frontendConn)
 	}
 }
 
