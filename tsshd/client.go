@@ -109,11 +109,12 @@ type UdpClientOptions struct {
 }
 
 // NewSshUdpClient creates a SshUdpClient
-func NewSshUdpClient(opts *UdpClientOptions) (*SshUdpClient, error) {
+func NewSshUdpClient(opts *UdpClientOptions) (udpClient *SshUdpClient, err error) {
 	enableDebugLogging, clientDebugFn = opts.EnableDebugging, opts.DebugFunc
 	enableWarningLogging, clientWarningFn = opts.EnableWarning, opts.WarningFunc
 
-	ver, err := parseTsshdVersion(opts.ServerInfo.ServerVer)
+	var ver *tsshdVersion
+	ver, err = parseTsshdVersion(opts.ServerInfo.ServerVer)
 	if err != nil {
 		return nil, fmt.Errorf("tsshd version invalid: %v", err)
 	}
@@ -121,7 +122,7 @@ func NewSshUdpClient(opts *UdpClientOptions) (*SshUdpClient, error) {
 		return nil, fmt.Errorf("please upgrade tsshd to continue")
 	}
 
-	udpClient := &SshUdpClient{
+	udpClient = &SshUdpClient{
 		proxyClient:     opts.ProxyClient,
 		sessionMap:      make(map[uint64]*SshUdpSession),
 		channelMap:      make(map[string]chan ssh.NewChannel),
@@ -133,7 +134,13 @@ func NewSshUdpClient(opts *UdpClientOptions) (*SshUdpClient, error) {
 		clientDebugFunc: opts.DebugFunc,
 		enableWarning:   opts.EnableWarning,
 		clientWarningFn: opts.WarningFunc,
+		activeChecker:   newTimeoutChecker(opts.HeartbeatTimeout),
 	}
+	defer func() {
+		if err != nil {
+			_ = udpClient.Close()
+		}
+	}()
 
 	udpClient.clientProxy, err = startClientProxy(udpClient, opts)
 	if err != nil {
@@ -161,7 +168,6 @@ func NewSshUdpClient(opts *UdpClientOptions) (*SshUdpClient, error) {
 		return nil, err
 	}
 
-	udpClient.activeChecker = newTimeoutChecker(opts.HeartbeatTimeout)
 	if udpClient.enableDebugging {
 		udpClient.activeChecker.onTimeout(func() {
 			since := time.Since(time.UnixMilli(udpClient.activeChecker.getAliveTime()))
@@ -184,7 +190,6 @@ func NewSshUdpClient(opts *UdpClientOptions) (*SshUdpClient, error) {
 		return udpClient.newStream("bus")
 	}, opts.ConnectTimeout)
 	if err != nil {
-		_ = udpClient.Close()
 		return nil, fmt.Errorf("new bus stream failed: %v", err)
 	}
 
@@ -195,14 +200,12 @@ func NewSshUdpClient(opts *UdpClientOptions) (*SshUdpClient, error) {
 		IntervalTime:     opts.IntervalTime,
 		HeartbeatTimeout: opts.HeartbeatTimeout}); err != nil {
 		_ = busStream.Close()
-		_ = udpClient.Close()
 		return nil, fmt.Errorf("send bus message failed: %w", err)
 	}
 
 	var resp busResponse
 	if err := recvResponse(busStream, &resp); err != nil {
 		_ = busStream.Close()
-		_ = udpClient.Close()
 		return nil, fmt.Errorf("bus stream init failed: %v", err)
 	}
 	udpClient.debug("bus response next session id: %d", resp.NextSessionID)
@@ -242,47 +245,52 @@ func (c *SshUdpClient) Wait() error {
 }
 
 // Close closes the client
-func (c *SshUdpClient) Close() error {
+func (c *SshUdpClient) Close() (err error) {
 	if !c.closed.CompareAndSwap(false, true) {
 		return nil
 	}
 
-	_, _ = doWithTimeout(func() (int, error) {
-		if c.busStream == nil {
+	if c.busStream != nil {
+		_, err = doWithTimeout(func() (int, error) {
+			if err := c.sendBusCommand("close"); err != nil {
+				c.debug("send cmd [close] failed: %v", err)
+			} else {
+				c.debug("send cmd [close] completed")
+			}
+			_ = c.busStream.CloseWrite()
+
+			select {
+			case <-c.busClosed:
+				c.debug("close bus stream completed")
+			case <-time.After(280 * time.Millisecond):
+				c.debug("close bus stream timeout")
+			}
+			_ = c.busStream.Close()
 			return 0, nil
-		}
+		}, 300*time.Millisecond)
+	}
 
-		if err := c.sendBusCommand("close"); err != nil {
-			c.debug("send cmd [close] failed: %v", err)
-		} else {
-			c.debug("send cmd [close] completed")
-		}
-		_ = c.busStream.CloseWrite()
+	if c.protoClient != nil {
+		_, err = doWithTimeout(func() (int, error) {
+			err := c.protoClient.closeClient()
+			if err != nil {
+				c.debug("close client failed: %v", err)
+			} else {
+				c.debug("close client completed")
+			}
+			return 0, err
+		}, 200*time.Millisecond)
+	}
 
-		select {
-		case <-c.busClosed:
-			c.debug("close bus stream completed")
-		case <-time.After(280 * time.Millisecond):
-			c.debug("close bus stream timeout")
-		}
-		_ = c.busStream.Close()
-		return 0, nil
-	}, 300*time.Millisecond)
+	if c.clientProxy != nil {
+		_ = c.clientProxy.Close()
+	}
 
-	_, err := doWithTimeout(func() (int, error) {
-		err := c.protoClient.closeClient()
-		if err != nil {
-			c.debug("close client failed: %v", err)
-		} else {
-			c.debug("close client completed")
-		}
-		return 0, err
-	}, 200*time.Millisecond)
+	if c.activeChecker != nil {
+		c.activeChecker.Close()
+	}
 
-	_ = c.clientProxy.Close()
-	c.activeChecker.Close()
-
-	return err
+	return
 }
 
 func (c *SshUdpClient) newStream(cmd string) (Stream, error) {
