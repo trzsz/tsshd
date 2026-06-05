@@ -313,7 +313,7 @@ func RunMain(opts ...Option) (int, error) {
 
 	addOnExitFunc(func() {
 		if server := activeSshUdpServer.Load(); server != nil {
-			server.Close()
+			_, _ = doWithTimeout(func() (int, error) { server.Close(); return 0, nil }, time.Second)
 			// If the client is still active on exit, logs have likely been delivered,
 			// so the server-side debug log can be cleaned up.
 			if enableDebugLogging && server.isClientAlive() {

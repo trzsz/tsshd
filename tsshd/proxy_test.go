@@ -491,7 +491,7 @@ func TestServerProxyWriteToAndCache(t *testing.T) {
 		getAll: mockConn.getAll,
 	}
 
-	runProxyWriteAndCacheTest(t, adapter, client.kcpCrypto, client.server.Load().clientChecker)
+	runProxyWriteAndCacheTest(t, adapter, client.kcpCrypto.Load(), client.server.Load().clientChecker)
 }
 
 type mockPacketConn struct {

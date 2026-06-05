@@ -251,10 +251,11 @@ func (s *sshUdpServer) handleRekeyEvent(stream Stream) error {
 		return fmt.Errorf("recv rekey message failed: %v", err)
 	}
 
-	if s.client.kcpCrypto == nil {
+	kcpCrypto := s.client.kcpCrypto.Load()
+	if kcpCrypto == nil {
 		return fmt.Errorf("rekey failed: crypto is nil")
 	}
-	if err := s.client.kcpCrypto.handleServerRekey(s, &msg); err != nil {
+	if err := kcpCrypto.handleServerRekey(s, &msg); err != nil {
 		return fmt.Errorf("rekey failed: %v", err)
 	}
 

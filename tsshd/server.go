@@ -84,20 +84,24 @@ type sshUdpServer struct {
 var newSshUdpServer = func(args *tsshdArgs, proxy *serverProxy, addr net.Addr, proto protocolServer) streamHandler {
 	clientAddr, ok := addr.(*proxyClientAddr)
 	if !ok {
-		warning("invalid client address type: %T", addr)
+		warning("new server failed: invalid client address type: %T", addr)
 		return nil
 	}
 
 	client := proxy.getClient(clientAddr.clientID)
 	if client == nil {
-		warning("no client found for id: %x", clientAddr.clientID)
+		warning("new server failed: no client found for id: %x", clientAddr.clientID)
+		return nil
+	}
+	if client.closed.Load() {
+		warning("new server failed: client [%x] is closed", clientAddr.clientID)
 		return nil
 	}
 
 	// A client is allowed to bind to only one server instance.
 	// Re-binding is not allowed even after the server is closed and cleared.
 	if !client.sealed.CompareAndSwap(false, true) {
-		warning("client [%x] has already been sealed", clientAddr.clientID)
+		warning("new server failed: client [%x] has already been sealed", clientAddr.clientID)
 		return nil
 	}
 
@@ -130,15 +134,31 @@ func (s *sshUdpServer) initClientChecker(timeout time.Duration) {
 	}
 
 	s.clientChecker.onTimeout(func() {
+		oldAuthedAddr := s.client.authedAddr.Load()
+		oldClientAddr := s.client.clientAddr.Load()
+		oldClientConn := s.client.clientConn.Load()
+
+		// A reconnect may happen concurrently with this timeout callback.
+		// The transport loaded above may already belong to the new connection.
+		//
+		// Wait one heartbeat interval so the checker can observe the reconnect
+		// and clear the timeout state. If the timeout has been cleared, this is
+		// a stale timeout event and should not remove any transport.
+		//
+		// The CAS-based cleanup below ensures that only the transport observed
+		// above is removed, even if another reconnect occurs while waiting.
+		time.Sleep(s.clientChecker.heartbeatTimeout)
+		if !s.clientChecker.isTimeout() {
+			return
+		}
+
 		// Clear authenticated UDP client addresses to prevent the UDP endpoint
 		// from being reused by another peer after timeout.
-		s.client.setAuthedAddr(nil)
-		s.client.setClientAddr(nil)
+		s.client.setAuthedAddr(oldAuthedAddr, nil)
+		s.client.setClientAddr(oldClientAddr, nil)
 		// Also proactively close the TCP connection to ensure it cannot be
 		// reused or remain in a half-open state after the client times out.
-		if conn := s.client.clientConn.Swap(nil); conn != nil {
-			_ = conn.Close()
-		}
+		s.client.setClientConn(oldClientConn, nil)
 		debug("client [%x] transport cleared due to timeout", s.client.proxyAddr.clientID)
 	})
 }
@@ -182,8 +202,10 @@ func (s *sshUdpServer) activateServer(sessionName string) error {
 				oldServer.Close()
 			} else {
 				debug("new client [%x] notifying old client [%x] to quit", s.client.proxyAddr.clientID, oldServer.client.proxyAddr.clientID)
-				if err := oldServer.sendBusMessage("quit",
-					quitMessage{fmt.Sprintf("another client attached from %s", s.client.remoteAddr())}); err != nil {
+				if _, err := doWithTimeout(func() (int, error) {
+					return 0, oldServer.sendBusMessage("quit",
+						quitMessage{fmt.Sprintf("another client attached from %s", s.client.remoteAddr())})
+				}, time.Second); err != nil {
 					debug("send quit message failed: %v", err)
 				}
 				time.Sleep(time.Second) // give udp some time
@@ -228,10 +250,8 @@ func (s *sshUdpServer) Close() {
 	err := s.proto.closeServer()
 	debug("client [%x] transport closed: %v", s.client.proxyAddr.clientID, err)
 
-	// Release the server and packet cache references.
 	// The clientState is kept in memory to prevent replay attacks.
-	s.client.server.Store(nil)
-	s.client.pktCache.Store(nil)
+	s.client.Close()
 }
 
 // handlerFunc defines the signature for stream handlers.

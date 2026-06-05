@@ -52,6 +52,7 @@ func (a *proxyClientAddr) String() string {
 
 type clientState struct {
 	sealed        atomic.Bool
+	closed        atomic.Bool
 	server        atomic.Pointer[sshUdpServer]
 	proxyAddr     proxyClientAddr
 	serialNumber  atomic.Uint64
@@ -63,7 +64,7 @@ type clientState struct {
 	clientCond    *sync.Cond
 	pktCache      atomic.Pointer[packetCache]
 	cachingPkt    atomic.Bool
-	kcpCrypto     *rotatingCrypto
+	kcpCrypto     atomic.Pointer[rotatingCrypto]
 	readPktCount  atomic.Uint64
 	writePktCount atomic.Uint64
 }
@@ -88,6 +89,9 @@ func (c *clientState) waitClientConn() *net.TCPConn {
 
 	conn := c.clientConn.Load()
 	for conn == nil {
+		if c.clientCond == nil {
+			return nil
+		}
 		c.clientCond.Wait()
 		conn = c.clientConn.Load()
 	}
@@ -95,10 +99,18 @@ func (c *clientState) waitClientConn() *net.TCPConn {
 	return conn
 }
 
-func (c *clientState) setClientConn(conn *net.TCPConn) {
+func (c *clientState) setClientConn(oldConn, newConn *net.TCPConn) {
 	c.clientMutex.Lock()
-	oldConn := c.clientConn.Swap(conn)
-	c.clientCond.Broadcast()
+	if oldConn == nil {
+		oldConn = c.clientConn.Swap(newConn)
+	} else {
+		if !c.clientConn.CompareAndSwap(oldConn, newConn) {
+			oldConn = nil
+		}
+	}
+	if c.clientCond != nil {
+		c.clientCond.Broadcast()
+	}
 	c.clientMutex.Unlock()
 
 	if oldConn != nil {
@@ -109,12 +121,18 @@ func (c *clientState) setClientConn(conn *net.TCPConn) {
 	}
 }
 
-func (c *clientState) setClientAddr(addr *net.UDPAddr) {
+func (c *clientState) setClientAddr(oldAddr, newAddr *net.UDPAddr) {
 	conn := c.udpFrontConn.Load()
 
-	oldAddr := c.clientAddr.Swap(addr)
+	if oldAddr == nil {
+		oldAddr = c.clientAddr.Swap(newAddr)
+	} else {
+		if !c.clientAddr.CompareAndSwap(oldAddr, newAddr) {
+			oldAddr = nil
+		}
+	}
 
-	if addr != nil && conn != nil {
+	if newAddr != nil && conn != nil {
 		conn.addClientMap(c)
 	}
 
@@ -128,12 +146,18 @@ func (c *clientState) setClientAddr(addr *net.UDPAddr) {
 	}
 }
 
-func (c *clientState) setAuthedAddr(addr *net.UDPAddr) {
+func (c *clientState) setAuthedAddr(oldAddr, newAddr *net.UDPAddr) {
 	conn := c.udpFrontConn.Load()
 
-	oldAddr := c.authedAddr.Swap(addr)
+	if oldAddr == nil {
+		oldAddr = c.authedAddr.Swap(newAddr)
+	} else {
+		if !c.authedAddr.CompareAndSwap(oldAddr, newAddr) {
+			oldAddr = nil
+		}
+	}
 
-	if addr != nil && conn != nil {
+	if newAddr != nil && conn != nil {
 		conn.addAuthedMap(c)
 	}
 
@@ -148,9 +172,9 @@ func (c *clientState) sendPacketCache(conn frontendConnection) bool {
 		return false
 	}
 	flushSize, flushCount := pktCache.sendCache(func(buf []byte) error {
-		if c.kcpCrypto != nil {
+		if kcpCrypto := c.kcpCrypto.Load(); kcpCrypto != nil {
 			var err error
-			buf, err = c.kcpCrypto.sealPacket(buf, false)
+			buf, err = kcpCrypto.sealPacket(buf, false)
 			if err != nil {
 				return err
 			}
@@ -165,6 +189,30 @@ func (c *clientState) sendPacketCache(conn frontendConnection) bool {
 	}
 
 	return hasCache
+}
+
+func (c *clientState) Close() {
+	if !c.closed.CompareAndSwap(false, true) {
+		return
+	}
+
+	// clientState instances are retained to prevent replay attacks,
+	// so release references that are no longer needed.
+
+	if c.clientCond != nil {
+		c.clientMutex.Lock()
+		c.clientCond.Broadcast()
+		c.clientCond = nil
+		c.clientMutex.Unlock()
+	}
+
+	c.server.Store(nil)
+	c.pktCache.Store(nil)
+	c.kcpCrypto.Store(nil)
+	c.setClientConn(nil, nil)
+	c.setClientAddr(nil, nil)
+	c.setAuthedAddr(nil, nil)
+	c.udpFrontConn.Store(nil)
 }
 
 type frontendConnection interface {
@@ -219,14 +267,18 @@ func (c *udpFrontendConn) initConn(conn *net.UDPConn, addr *net.UDPAddr, clientI
 	if addr != nil {
 		client := c.proxy.getClient(clientID)
 		if client == nil {
-			warning("get client [%x] return nil", clientID)
+			warning("init conn failed: get client [%x] return nil", clientID)
+			return
+		}
+		if client.closed.Load() {
+			warning("init conn failed: client [%x] is closed", clientID)
 			return
 		}
 		client.udpFrontConn.Store(c)
 		oldSerialNumber := client.serialNumber.Load()
 		if newSerialNumber > oldSerialNumber {
 			if client.serialNumber.CompareAndSwap(oldSerialNumber, newSerialNumber) {
-				client.setAuthedAddr(cloneNetAddr(addr).(*net.UDPAddr))
+				client.setAuthedAddr(nil, cloneNetAddr(addr).(*net.UDPAddr))
 			}
 		}
 	}
@@ -414,8 +466,8 @@ func (c *udpFrontendConn) readFrom(buf []byte) (int, *clientState) {
 			// Promote authedAddr to effective client.
 			if !isAuthPacket {
 				if addr := client.authedAddr.Load(); addr != nil {
-					client.setClientAddr(addr)
-					client.setAuthedAddr(nil)
+					client.setClientAddr(nil, addr)
+					client.setAuthedAddr(nil, nil)
 					c.proxy.onNewClientConn(client)
 					if n <= kSafeToDropPacketLen {
 						continue
@@ -430,7 +482,7 @@ func (c *udpFrontendConn) readFrom(buf []byte) (int, *clientState) {
 			// Client ID mismatch — this should not happen.
 			if clientID != client.proxyAddr.clientID {
 				warning("client id mismatch: expected=%d, got=%d", client.proxyAddr.clientID, clientID)
-				client.setAuthedAddr(nil)
+				client.setAuthedAddr(nil, nil)
 				continue
 			}
 
@@ -465,6 +517,10 @@ func (c *udpFrontendConn) readFrom(buf []byte) (int, *clientState) {
 			warning("get client [%x] return nil", clientID)
 			continue
 		}
+		if client.closed.Load() {
+			debug("invalid udp packet: client [%x] is closed", clientID)
+			continue
+		}
 
 		client.udpFrontConn.Store(c)
 		oldSerialNumber := client.serialNumber.Load()
@@ -476,7 +532,7 @@ func (c *udpFrontendConn) readFrom(buf []byte) (int, *clientState) {
 		if client.serialNumber.CompareAndSwap(oldSerialNumber, newSerialNumber) {
 			debug("client [%x] [%d] authed from %s", clientID, newSerialNumber, addr)
 			// Store as authenticated but not yet activated address.
-			client.setAuthedAddr(cloneNetAddr(addr).(*net.UDPAddr))
+			client.setAuthedAddr(nil, cloneNetAddr(addr).(*net.UDPAddr))
 		} else {
 			debug("authenticate conflict: old_serial=%d, new_serial=%d", oldSerialNumber, newSerialNumber)
 			newSerialNumber = client.serialNumber.Load()
@@ -586,7 +642,11 @@ func (c *tcpFrontendConn) handshake(conn *net.TCPConn) {
 
 	client := c.proxy.getClient(clientID)
 	if client == nil {
-		warning("get client [%x] return nil", clientID)
+		warning("handshake failed: get client [%x] return nil", clientID)
+		return
+	}
+	if client.closed.Load() {
+		debug("handshake failed: client [%x] is closed", clientID)
 		return
 	}
 	oldSerialNumber := client.serialNumber.Load()
@@ -614,7 +674,7 @@ func (c *tcpFrontendConn) handshake(conn *net.TCPConn) {
 	_ = conn.SetReadBuffer(kProxyBufferSize)
 	_ = conn.SetWriteBuffer(kProxyBufferSize)
 
-	client.setClientConn(conn)
+	client.setClientConn(nil, conn)
 	c.proxy.onNewClientConn(client)
 	ok = true
 
@@ -628,9 +688,7 @@ func (c *tcpFrontendConn) readLoop(conn *net.TCPConn, client *clientState) {
 	ackCh := make(chan error)
 
 	defer func() {
-		if client.clientConn.CompareAndSwap(conn, nil) {
-			_ = conn.Close()
-		}
+		client.setClientConn(conn, nil)
 		close(ackCh)
 	}()
 
@@ -678,12 +736,13 @@ func (c *tcpFrontendConn) readFrom(buf []byte) (int, *clientState) {
 	client := c.proxy.soleClient
 	for {
 		conn := client.waitClientConn()
+		if conn == nil {
+			return 0, nil
+		}
 
 		n, err := recvUdpPacket(conn, buf)
 		if err != nil {
-			if client.clientConn.CompareAndSwap(conn, nil) {
-				_ = conn.Close()
-			}
+			client.setClientConn(conn, nil)
 			continue
 		}
 
@@ -702,9 +761,7 @@ func (c *tcpFrontendConn) writeTo(buf []byte, client *clientState) error {
 	}
 
 	if err := sendUdpPacket(conn, buf); err != nil {
-		if client.clientConn.CompareAndSwap(conn, nil) {
-			_ = conn.Close()
-		}
+		client.setClientConn(conn, nil)
 		return err
 	}
 
@@ -731,15 +788,18 @@ type serverProxy struct {
 
 func (p *serverProxy) newClientState(clientID uint64) (*clientState, error) {
 	client := &clientState{proxyAddr: proxyClientAddr{clientID}}
-	client.clientCond = sync.NewCond(&client.clientMutex)
 	client.pktCache.Store(&packetCache{})
+
+	if p.args.TCP {
+		client.clientCond = sync.NewCond(&client.clientMutex)
+	}
 
 	if p.args.KCP {
 		crypto, err := newRotatingCrypto(nil, p.kcpPass, p.kcpSalt, 0, 0, false)
 		if err != nil {
 			return nil, fmt.Errorf("new rotating crypto failed: %v", err)
 		}
-		client.kcpCrypto = crypto
+		client.kcpCrypto.Store(crypto)
 	}
 
 	return client, nil
@@ -829,8 +889,12 @@ func (p *serverProxy) ReadFrom(buf []byte) (int, net.Addr, error) {
 	for {
 		n, client = p.frontendConn.readFrom(buf)
 
-		if client.kcpCrypto != nil {
-			nn, err := client.kcpCrypto.openPacket(buf[:n])
+		if client == nil {
+			return 0, nil, io.EOF
+		}
+
+		if kcpCrypto := client.kcpCrypto.Load(); kcpCrypto != nil {
+			nn, err := kcpCrypto.openPacket(buf[:n])
 			if err != nil {
 				debug("open packet (len=%d) failed: %v", n, err)
 				continue
@@ -866,6 +930,10 @@ func (p *serverProxy) WriteTo(buf []byte, addr net.Addr) (int, error) {
 		warning("get client [%x] return nil", clientAddr.clientID)
 		return n, nil
 	}
+	if client.closed.Load() {
+		debug("skip write: client [%x] is closed", clientAddr.clientID)
+		return n, nil
+	}
 
 	if server := client.server.Load(); server != nil {
 		if server.clientChecker.isTimeout() {
@@ -887,9 +955,9 @@ func (p *serverProxy) WriteTo(buf []byte, addr net.Addr) (int, error) {
 		}
 	}
 
-	if client.kcpCrypto != nil {
+	if kcpCrypto := client.kcpCrypto.Load(); kcpCrypto != nil {
 		var err error
-		buf, err = client.kcpCrypto.sealPacket(buf, true)
+		buf, err = kcpCrypto.sealPacket(buf, true)
 		if err != nil {
 			warning("seal packet failed: %v", err)
 			return n, nil
