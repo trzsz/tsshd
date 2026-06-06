@@ -171,7 +171,7 @@ func (c *clientState) sendPacketCache(conn frontendConnection) bool {
 	if pktCache == nil {
 		return false
 	}
-	flushSize, flushCount := pktCache.sendCache(func(buf []byte) error {
+	totalSize, sampleCount, reactiveCount, proactiveCount := pktCache.sendCache(func(buf []byte) error {
 		if kcpCrypto := c.kcpCrypto.Load(); kcpCrypto != nil {
 			var err error
 			buf, err = kcpCrypto.sealPacket(buf, false)
@@ -182,13 +182,9 @@ func (c *clientState) sendPacketCache(conn frontendConnection) bool {
 		return conn.writeTo(buf, c)
 	})
 
-	hasCache := flushSize > 0 || flushCount > 0
+	debug("send packet cache: size=%d, sample=%d, reactive=%d, proactive=%d", totalSize, sampleCount, reactiveCount, proactiveCount)
 
-	if enableDebugLogging && hasCache {
-		debug("send packet cache count [%d] size [%d]", flushCount, flushSize)
-	}
-
-	return hasCache
+	return totalSize > 0
 }
 
 func (c *clientState) Close() {

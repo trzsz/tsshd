@@ -44,7 +44,10 @@ func TestPacketCache_Basic(t *testing.T) {
 	}
 
 	var got []byte
+	var mu sync.Mutex
 	p.sendCache(func(b []byte) error {
+		mu.Lock()
+		defer mu.Unlock()
 		got = append(got, b[0])
 		return nil
 	})
@@ -57,65 +60,173 @@ func TestPacketCache_Basic(t *testing.T) {
 	}
 }
 
-func TestPacketCache_FirstAndRecent(t *testing.T) {
+func TestPacketCache_ReactiveAndProactive(t *testing.T) {
 	var p packetCache
 
+	checker := newTimeoutChecker(0)
+	p.peerCheck.Store(checker)
+
+	// Recent peer activity -> reactive
+	checker.lastAliveTime.Store(time.Now().UnixMilli())
+	p.addPacket([]byte{1})
+	p.addPacket([]byte{2})
+
+	// No recent peer activity -> proactive
+	checker.lastAliveTime.Store(time.Now().Add(-time.Second).UnixMilli())
+	p.addPacket([]byte{3})
+	p.addPacket([]byte{4})
+
+	if len(p.reactive.buf) != 2 {
+		t.Fatalf("unexpected reactive count: got=%d want=2", len(p.reactive.buf))
+	}
+
+	if len(p.proactive.buf) != 2 {
+		t.Fatalf("unexpected proactive count: got=%d want=2", len(p.proactive.buf))
+	}
+
+	if p.reactive.buf[0][0] != 1 || p.reactive.buf[1][0] != 2 {
+		t.Fatalf("unexpected reactive packets")
+	}
+
+	if p.proactive.buf[0][0] != 3 || p.proactive.buf[1][0] != 4 {
+		t.Fatalf("unexpected proactive packets")
+	}
+}
+
+func TestPacketCache_SendCacheContainsBothGroups(t *testing.T) {
+	var p packetCache
+
+	checker := newTimeoutChecker(0)
+	p.peerCheck.Store(checker)
+
+	// reactive
+	checker.lastAliveTime.Store(time.Now().UnixMilli())
+	p.addPacket([]byte{1})
+	p.addPacket([]byte{2})
+
+	// proactive
+	checker.lastAliveTime.Store(time.Now().Add(-time.Second).UnixMilli())
+	p.addPacket([]byte{3})
+	p.addPacket([]byte{4})
+
+	var (
+		mu  sync.Mutex
+		got = make(map[byte]int)
+	)
+
+	p.sendCache(func(b []byte) error {
+		mu.Lock()
+		got[b[0]]++
+		mu.Unlock()
+		return nil
+	})
+
+	expect := []byte{1, 2, 3, 4}
+
+	for _, v := range expect {
+		if got[v] != 1 {
+			t.Fatalf("packet %d count mismatch: got=%d want=1", v, got[v])
+		}
+	}
+
+	if len(got) != len(expect) {
+		t.Fatalf("unexpected packet count: got=%d want=%d", len(got), len(expect))
+	}
+}
+
+func TestPacketCache_ReactiveRingBuffer(t *testing.T) {
+	var p packetCache
+
+	checker := newTimeoutChecker(0)
+	p.peerCheck.Store(checker)
+
+	checker.lastAliveTime.Store(time.Now().UnixMilli())
+
 	total := kPacketCacheSize * 3
+
 	for i := range total {
 		p.addPacket([]byte{byte(i)})
 	}
 
-	var got []byte
+	if len(p.reactive.buf) != kPacketCacheSize {
+		t.Fatalf("unexpected cache size: got=%d want=%d",
+			len(p.reactive.buf), kPacketCacheSize)
+	}
+
+	var (
+		mu  sync.Mutex
+		got []byte
+	)
+
 	p.sendCache(func(b []byte) error {
+		mu.Lock()
 		got = append(got, b[0])
+		mu.Unlock()
 		return nil
 	})
 
-	// first 100
-	for i := range kPacketCacheSize {
-		if got[i] != byte(i) {
-			t.Fatalf("first mismatch at %d, got[%d]", i, got[i])
-		}
+	if len(got) != kPacketCacheSize {
+		t.Fatalf("unexpected send count: got=%d want=%d",
+			len(got), kPacketCacheSize)
 	}
 
-	// last 100
-	start := total - kPacketCacheSize
-	for i := range kPacketCacheSize {
-		if got[kPacketCacheSize+i] != byte(start+i) {
-			t.Logf("%v", got)
-			t.Fatalf("recent mismatch at %d, got [%d]", kPacketCacheSize+i, got[kPacketCacheSize+i])
+	expect := make(map[byte]bool)
+
+	for i := total - kPacketCacheSize; i < total; i++ {
+		expect[byte(i)] = true
+	}
+
+	for _, v := range got {
+		if !expect[v] {
+			t.Fatalf("unexpected packet %d", v)
 		}
+		delete(expect, v)
+	}
+
+	if len(expect) != 0 {
+		t.Fatalf("missing packets: %v", expect)
 	}
 }
 
-func TestPacketCache_RecentPartial(t *testing.T) {
+func TestPacketCache_ReactivePartial(t *testing.T) {
 	var p packetCache
 
-	for i := range kPacketCacheSize {
+	checker := newTimeoutChecker(0)
+	p.peerCheck.Store(checker)
+
+	checker.lastAliveTime.Store(time.Now().UnixMilli())
+
+	total := kPacketCacheSize + kPacketCacheSize/2
+
+	for i := range total {
 		p.addPacket([]byte{byte(i)})
 	}
 
-	for i := range kPacketCacheSize / 2 {
-		p.addPacket([]byte{byte(100 + i)})
-	}
+	var (
+		mu  sync.Mutex
+		got []byte
+	)
 
-	var got []byte
 	p.sendCache(func(b []byte) error {
+		mu.Lock()
 		got = append(got, b[0])
+		mu.Unlock()
 		return nil
 	})
 
-	// first 100
-	for i := range kPacketCacheSize {
-		if got[i] != byte(i) {
-			t.Fatalf("first mismatch at %d, got %d", i, got[i])
-		}
+	// must be ring buffer size
+	if len(got) != kPacketCacheSize {
+		t.Fatalf("unexpected packet count: got=%d want=%d",
+			len(got), kPacketCacheSize)
 	}
 
-	// last 50
-	for i := range kPacketCacheSize / 2 {
-		if got[kPacketCacheSize+i] != byte(100+i) {
-			t.Fatalf("recent partial mismatch at %d, got %d", i, got[kPacketCacheSize+i])
+	// must be last kPacketCacheSize packets
+	start := total - kPacketCacheSize
+
+	for i := range got {
+		if got[i] != byte(start+i) {
+			t.Fatalf("mismatch at %d got=%d want=%d",
+				i, got[i], start+i)
 		}
 	}
 }
@@ -134,7 +245,10 @@ func TestPacketCache_ClearAndReuse(t *testing.T) {
 	}
 
 	var got []byte
+	var mu sync.Mutex
 	p.sendCache(func(b []byte) error {
+		mu.Lock()
+		defer mu.Unlock()
 		got = append(got, b[0])
 		return nil
 	})

@@ -170,6 +170,9 @@ func (s *sshUdpServer) activateServer(sessionName string) error {
 			return fmt.Errorf("active server is already in use")
 		}
 		s.client.server.Store(s)
+		if pktCache := s.client.pktCache.Load(); pktCache != nil {
+			pktCache.peerCheck.Store(s.clientChecker)
+		}
 		s.serving.Store(true)
 		return nil
 	}
@@ -215,6 +218,9 @@ func (s *sshUdpServer) activateServer(sessionName string) error {
 	}
 
 	s.client.server.Store(s)
+	if pktCache := s.client.pktCache.Load(); pktCache != nil {
+		pktCache.peerCheck.Store(s.clientChecker)
+	}
 	s.serving.Store(true)
 	return nil
 }

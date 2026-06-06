@@ -365,7 +365,7 @@ func (p *clientProxy) sendPacketCache() {
 		return
 	}
 
-	flushSize, flushCount := p.pktCache.sendCache(func(buf []byte) error {
+	totalSize, sampleCount, reactiveCount, proactiveCount := p.pktCache.sendCache(func(buf []byte) error {
 		if p.kcpCrypto != nil {
 			var err error
 			buf, err = p.kcpCrypto.sealPacket(buf, false)
@@ -376,9 +376,7 @@ func (p *clientProxy) sendPacketCache() {
 		return conn.Write(buf)
 	})
 
-	if p.client.enableDebugging && (flushSize > 0 || flushCount > 0) {
-		p.client.debug("send packet cache count [%d] size [%d]", flushCount, flushSize)
-	}
+	p.client.debug("send packet cache: size=%d, sample=%d, reactive=%d, proactive=%d", totalSize, sampleCount, reactiveCount, proactiveCount)
 }
 
 func (p *clientProxy) ReadFrom(buf []byte) (int, net.Addr, error) {
@@ -593,6 +591,7 @@ func startClientProxy(client *SshUdpClient, opts *UdpClientOptions) (*clientProx
 		serverChecker: newTimeoutChecker(opts.HeartbeatTimeout),
 	}
 	proxy.backendCond = sync.NewCond(&proxy.backendMutex)
+	proxy.pktCache.peerCheck.Store(proxy.serverChecker)
 
 	if opts.ServerInfo.Mode == kUdpModeKCP {
 		pass, err := hex.DecodeString(opts.ServerInfo.Pass)
