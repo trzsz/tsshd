@@ -177,6 +177,9 @@ func (s *sshUdpServer) activateServer(sessionName string) error {
 		return nil
 	}
 
+	// Serialize server activation with session attach/detach operations.
+	// This ensures the active server transition and cleanup of sessions
+	// owned by the previous server happen atomically.
 	attachMutex.Lock()
 	defer attachMutex.Unlock()
 
@@ -192,7 +195,7 @@ func (s *sshUdpServer) activateServer(sessionName string) error {
 		globalSocketInfo.sessionName = sessionName
 	}
 
-	s.detachAllSessions()
+	s.detachAllSessions(oldServer)
 
 	if oldServer != nil {
 		go func() {
@@ -235,11 +238,13 @@ func (s *sshUdpServer) Close() {
 	// Stop the client checker and its background goroutines.
 	s.clientChecker.Close()
 
-	// Close the bus stream
-	s.busMutex.Lock()
-	busStream := s.busStream
-	s.busMutex.Unlock()
-	if busStream != nil {
+	// Best-effort shutdown of the bus stream.
+	//
+	// Avoid acquiring busMutex here. During shutdown, it is more important
+	// to make forward progress than to wait for a potentially blocked
+	// goroutine holding the lock. Missing this close is acceptable because
+	// connection teardown will eventually release resources.
+	if busStream := s.busStream; busStream != nil {
 		_, err := doWithTimeout(func() (int, error) { return 0, busStream.Close() }, time.Second)
 		debug("client [%x] bus stream closed: %v", s.client.proxyAddr.clientID, err)
 	}

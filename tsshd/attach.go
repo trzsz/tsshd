@@ -396,16 +396,14 @@ func (s *sshUdpServer) attachSession(ioStream, errStream Stream, msg *startMessa
 		return nil, 0, fmt.Errorf("attach is not allowed: tsshd was not started with --attachable")
 	}
 
-	sessionMutex.Lock()
-	sess, ok := sessionMap[msg.ID]
-	sessionMutex.Unlock()
+	sess := getSessionByID(msg.ID)
 
-	if !ok {
-		return nil, 0, fmt.Errorf("session not found")
+	if sess == nil {
+		return nil, 0, fmt.Errorf("session [%d] not found", msg.ID)
 	}
 
 	if sess.closed.Load() {
-		return nil, 0, fmt.Errorf("session is closed")
+		return nil, 0, fmt.Errorf("session [%d] is closed", msg.ID)
 	}
 
 	pty := (sess.mwSess != nil && sess.mwSess.pty) || sess.pty != nil
@@ -413,6 +411,7 @@ func (s *sshUdpServer) attachSession(ioStream, errStream Stream, msg *startMessa
 		return nil, ErrNotPty, fmt.Errorf("not a pty session")
 	}
 
+	// Serialize session attachment with ownership updates.
 	attachMutex.Lock()
 	defer attachMutex.Unlock()
 
@@ -441,45 +440,52 @@ func (s *sshUdpServer) attachSession(ioStream, errStream Stream, msg *startMessa
 	sess.ioStream.swap(ioStream)
 	sess.errStream.swap(errStream)
 
-	// Mark cached output to be discarded before clientChecker updates.
-	// This prevents a race condition where a successful reconnection reported
-	// by clientChecker immediately flushes the cache before the flag is set.
 	if pty {
-		sess.discardOutput.Store(true)
-	}
+		sess.resizeMutex.Lock()
+		cols, rows := sess.cols, sess.rows
+		sess.resizeMutex.Unlock()
 
-	// The client checker is updated after stream setup to ensure streams
-	// are ready when the client checker reports the client reconnected.
-	sess.clientChecker.swap(s.clientChecker)
-
-	if pty {
-		if msg.Cols > 0 && msg.Rows > 0 {
-			sess.cols, sess.rows = msg.Cols, msg.Rows
+		if msg.Cols > 0 {
+			cols = msg.Cols
 		}
+		if msg.Rows > 0 {
+			rows = msg.Rows
+		}
+
 		// redraw screen
-		if err := sess.SetSize(sess.cols, sess.rows, true); err != nil {
+		if err := sess.SetSize(cols, rows, true, true, nil); err != nil {
 			warning("session [%d] redraw failed: %v", msg.ID, err)
 		}
 	}
+
+	// Update the client checker only after the attach process is fully
+	// initialized, including any redraw/output-discard setup.
+	//
+	// Once the client checker reports the client as reconnected, pending
+	// output may be flushed immediately. Delaying the swap avoids a race
+	// where cached output could be delivered before SetSize() has enabled
+	// output discard for the redraw operation.
+	sess.clientChecker.swap(s.clientChecker)
 
 	debug("session [%d] attached by client [%x]", msg.ID, s.client.proxyAddr.clientID)
 
 	return sess, 0, nil
 }
 
-func (s *sshUdpServer) detachAllSessions() {
+func (s *sshUdpServer) detachAllSessions(oldServer *sshUdpServer) {
 	if !s.args.Attachable {
 		return
 	}
 
-	sessionMutex.Lock()
-	var sessions []*sessionContext
-	for _, session := range sessionMap {
-		sessions = append(sessions, session)
-	}
-	sessionMutex.Unlock()
+	// Called with attachMutex held. This guarantees that session
+	// ownership cannot change while detaching sessions.
 
-	for _, sess := range sessions {
+	for _, sess := range getAllSessions() {
+		if sess.server.Load() != oldServer {
+			// Skip sessions that are not owned by the server being replaced.
+			continue
+		}
+
 		// detach in the reverse order of attach
 		sess.clientChecker.swap(nil)
 		if sess.errStream != nil {

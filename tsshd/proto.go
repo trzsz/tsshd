@@ -83,6 +83,7 @@ func (e *Error) Error() string {
 // ServerInfo includes all information used for client login
 type ServerInfo struct {
 	ServerVer  string `json:",omitempty"`
+	ProtoVer   int    `json:",omitempty"`
 	Port       int    `json:",omitempty"`
 	Mode       string `json:",omitempty"`
 	Pass       string `json:",omitempty"`
@@ -125,6 +126,7 @@ type debugMessage struct {
 
 type busMessage struct {
 	ClientVer        string        `json:",omitempty"`
+	ProtoVer         int           `json:",omitempty"`
 	AliveTimeout     time.Duration `json:",omitempty"`
 	IntervalTime     time.Duration `json:",omitempty"`
 	HeartbeatTimeout time.Duration `json:",omitempty"`
@@ -186,6 +188,7 @@ type resizeMessage struct {
 	Cols   int    `json:",omitempty"`
 	Rows   int    `json:",omitempty"`
 	Redraw bool   `json:",omitempty"`
+	Marker []byte `json:",omitempty"`
 }
 
 type stderrMessage struct {

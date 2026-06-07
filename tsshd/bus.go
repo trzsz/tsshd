@@ -36,12 +36,25 @@ var busClosingMu sync.Mutex
 var busClosingWG sync.WaitGroup
 
 func (s *sshUdpServer) sendBusMessage(command string, msg any) error {
+	// Synchronize with bus stream initialization before accessing it.
+	// A mutex is used instead of an atomic pointer to avoid polling or
+	// sleeping while waiting for the bus stream to become available.
+	//
+	// Do not hold the lock during the write operation, since writes may
+	// block and unnecessarily prevent other goroutines from accessing
+	// the bus stream state.
 	s.busMutex.Lock()
-	defer s.busMutex.Unlock()
-	if s.busStream == nil {
+	busStream := s.busStream
+	s.busMutex.Unlock()
+
+	if busStream == nil {
 		return fmt.Errorf("bus stream is nil")
 	}
-	return sendCommandAndMessage(s.busStream, command, msg)
+
+	// sendCommandAndMessage assembles the command and payload into a
+	// single buffer before writing, making the transmission atomic at
+	// the stream level.
+	return sendCommandAndMessage(busStream, command, msg)
 }
 
 func (s *sshUdpServer) initBusAndServer(stream Stream, msg *busMessage) error {
@@ -78,14 +91,16 @@ func (s *sshUdpServer) handleBusEvent(stream Stream) {
 		return
 	}
 
-	ver, err := parseTsshdVersion(msg.ClientVer)
-	if err != nil {
-		sendError(stream, fmt.Errorf("tsshd version invalid: %v", err))
-		return
-	}
-	if ver.compare(&tsshdVersion{0, 1, 6}) < 0 {
-		sendError(stream, fmt.Errorf("please upgrade tssh to continue"))
-		return
+	if msg.ProtoVer == 0 {
+		ver, err := parseTsshdVersion(msg.ClientVer)
+		if err != nil {
+			sendError(stream, fmt.Errorf("tsshd version invalid: %v", err))
+			return
+		}
+		if ver.compare(&tsshdVersion{0, 1, 6}) < 0 {
+			sendError(stream, fmt.Errorf("please upgrade tssh to continue"))
+			return
+		}
 	}
 
 	if err := s.initBusAndServer(stream, &msg); err != nil {

@@ -127,6 +127,7 @@ func initServer(args *tsshdArgs) (*ServerInfo, string, error) {
 
 	info := &ServerInfo{
 		ServerVer: kTsshdVersion,
+		ProtoVer:  kTsshdProtocol,
 		Port:      port,
 		MTU:       args.MTU,
 	}

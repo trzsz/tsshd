@@ -26,6 +26,8 @@ package tsshd
 
 import (
 	"bytes"
+	"crypto/rand"
+	"encoding/base64"
 	"fmt"
 	"io"
 	"net"
@@ -60,6 +62,7 @@ type agentRequest struct {
 type SshUdpClient struct {
 	proxyClient      *SshUdpClient
 	protoClient      protocolClient
+	protoVersion     int
 	clientProxy      *clientProxy
 	intervalTime     time.Duration
 	connectTimeout   time.Duration
@@ -113,17 +116,19 @@ func NewSshUdpClient(opts *UdpClientOptions) (udpClient *SshUdpClient, err error
 	enableDebugLogging, clientDebugFn = opts.EnableDebugging, opts.DebugFunc
 	enableWarningLogging, clientWarningFn = opts.EnableWarning, opts.WarningFunc
 
-	var ver *tsshdVersion
-	ver, err = parseTsshdVersion(opts.ServerInfo.ServerVer)
-	if err != nil {
-		return nil, fmt.Errorf("tsshd version invalid: %v", err)
-	}
-	if ver.compare(&tsshdVersion{0, 1, 6}) < 0 {
-		return nil, fmt.Errorf("please upgrade tsshd to continue")
+	if opts.ServerInfo.ProtoVer == 0 {
+		ver, err := parseTsshdVersion(opts.ServerInfo.ServerVer)
+		if err != nil {
+			return nil, fmt.Errorf("tsshd version invalid: %v", err)
+		}
+		if ver.compare(&tsshdVersion{0, 1, 6}) < 0 {
+			return nil, fmt.Errorf("please upgrade tsshd to continue")
+		}
 	}
 
 	udpClient = &SshUdpClient{
 		proxyClient:     opts.ProxyClient,
+		protoVersion:    min(opts.ServerInfo.ProtoVer, kTsshdProtocol),
 		sessionMap:      make(map[uint64]*SshUdpSession),
 		channelMap:      make(map[string]chan ssh.NewChannel),
 		intervalTime:    opts.IntervalTime,
@@ -195,6 +200,7 @@ func NewSshUdpClient(opts *UdpClientOptions) (udpClient *SshUdpClient, err error
 
 	if err := sendMessage(busStream, busMessage{
 		ClientVer:        kTsshdVersion,
+		ProtoVer:         udpClient.protoVersion,
 		SessionName:      opts.SessionName,
 		AliveTimeout:     opts.AliveTimeout,
 		IntervalTime:     opts.IntervalTime,
@@ -761,7 +767,7 @@ func (c *SshUdpClient) handleDiscardEvent() {
 		c.sessionMutex.Lock()
 		defer c.sessionMutex.Unlock()
 		for _, sess := range c.sessionMap {
-			sess.discardMarker.Store(&msg.DiscardMarker)
+			sess.inputMarker.Store(&msg.DiscardMarker)
 		}
 	}
 }
@@ -783,23 +789,25 @@ func (c *SshUdpClient) handleRekeyEvent() {
 
 // SshUdpSession represents a connection to a remote command or shell
 type SshUdpSession struct {
-	id            uint64
-	exitWG        sync.WaitGroup
-	client        *SshUdpClient
-	stream        Stream
-	pty           bool
-	height        int
-	width         int
-	envs          map[string]string
-	started       bool
-	closed        atomic.Bool
-	stdin         *io.PipeReader
-	stdout        *io.PipeWriter
-	stderr        *io.PipeWriter
-	code          int
-	x11           *x11Request
-	agent         *agentRequest
-	discardMarker atomic.Pointer[[]byte]
+	id           uint64
+	exitWG       sync.WaitGroup
+	client       *SshUdpClient
+	stream       Stream
+	pty          bool
+	height       int
+	width        int
+	envs         map[string]string
+	started      bool
+	closed       atomic.Bool
+	stdin        *io.PipeReader
+	stdout       *io.PipeWriter
+	stderr       *io.PipeWriter
+	code         int
+	x11          *x11Request
+	agent        *agentRequest
+	inputMarker  atomic.Pointer[[]byte]
+	outForwarder *clientOutputForwarder
+	errForwarder *clientOutputForwarder
 }
 
 // Wait waits for the remote command to exit
@@ -930,7 +938,8 @@ func (s *SshUdpSession) startSession(msg *startMessage) error {
 		go s.forwardInput()
 	}
 	if s.stdout != nil {
-		s.exitWG.Go(func() { s.forwardOutput("stdout", s.stream, s.stdout) })
+		s.outForwarder = s.newOutputForwarder("stdout", s.stream, s.stdout)
+		s.exitWG.Go(func() { s.outForwarder.forward() })
 	}
 	return nil
 }
@@ -969,7 +978,7 @@ func (s *SshUdpSession) forwardInput() {
 				}
 			}
 
-			if marker := s.discardMarker.Swap(nil); marker != nil {
+			if marker := s.inputMarker.Swap(nil); marker != nil {
 				if err := writeAll(s.stream, *marker); err != nil {
 					return
 				}
@@ -985,24 +994,14 @@ func (s *SshUdpSession) forwardInput() {
 	}
 }
 
-func (s *SshUdpSession) forwardOutput(name string, reader Stream, writer *io.PipeWriter) {
-	defer func() {
-		_ = writer.Close()
-		_ = reader.CloseRead()
-	}()
-	buffer := make([]byte, 32*1024)
-	for {
-		n, err := reader.Read(buffer)
-		if n > 0 {
-			if err := writeAll(writer, buffer[:n]); err != nil {
-				break
-			}
-		}
-		if err != nil {
-			break
-		}
+func (s *SshUdpSession) newOutputForwarder(name string, reader Stream, writer *io.PipeWriter) *clientOutputForwarder {
+	return &clientOutputForwarder{
+		name:   name,
+		sess:   s,
+		client: s.client,
+		reader: reader,
+		writer: writer,
 	}
-	s.client.debug("session [%d] %s completed", s.id, name)
 }
 
 func (s *SshUdpSession) exit(code int) {
@@ -1070,7 +1069,8 @@ func (s *SshUdpSession) StderrPipe() (io.Reader, error) {
 	}
 	reader, writer := io.Pipe()
 	s.stderr = writer
-	s.exitWG.Go(func() { s.forwardOutput("stderr", stream, s.stderr) })
+	s.errForwarder = s.newOutputForwarder("stderr", stream, s.stderr)
+	s.exitWG.Go(func() { s.errForwarder.forward() })
 	return reader, nil
 }
 
@@ -1163,19 +1163,47 @@ func (s *SshUdpSession) RequestSubsystem(name string) error {
 	return s.startSession(&msg)
 }
 
-// RedrawScreen clear and redraw the screen right now
-func (s *SshUdpSession) RedrawScreen() {
+// RedrawScreen forces the terminal application to repaint the screen.
+// If discardPreviousOutput is true, any buffered output generated before
+// the redraw will be discarded so that only the refreshed screen state
+// is sent to the client.
+func (s *SshUdpSession) RedrawScreen(discardPreviousOutput bool) error {
 	if s.height <= 0 || s.width <= 0 {
-		return
+		return fmt.Errorf("invalid terminal size: width=%d height=%d", s.width, s.height)
 	}
+
+	var marker []byte
+	if discardPreviousOutput && s.client.protoVersion >= 1 {
+		// The marker should not contain '\n' or '\r'.
+		// Otherwise it may be split by the server's output caching logic,
+		// causing part of the marker to be sent while the remaining bytes
+		// are discarded together with cached output.
+		bytes := make([]byte, 30)
+		if _, err := rand.Read(bytes); err != nil {
+			return fmt.Errorf("generate discard marker failed: %v", err)
+		}
+		marker = fmt.Appendf(nil, "[TSSHD-MARKER-%s]", base64.StdEncoding.EncodeToString(bytes))
+		s.client.debug("discard previous output marker: %s", string(marker))
+
+		if s.outForwarder != nil {
+			s.outForwarder.marker.Store(&marker)
+		}
+		if s.errForwarder != nil {
+			s.errForwarder.marker.Store(&marker)
+		}
+	}
+
 	if err := s.client.sendBusMessage("resize", resizeMessage{
 		ID:     s.id,
 		Cols:   s.width,
 		Rows:   s.height,
 		Redraw: true,
+		Marker: marker,
 	}); err != nil {
-		s.client.warning("send redraw message failed: %v", err)
+		return fmt.Errorf("send redraw message failed: %v", err)
 	}
+
+	return nil
 }
 
 // GetTerminalWidth returns the width of the terminal

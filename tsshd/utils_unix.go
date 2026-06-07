@@ -40,6 +40,7 @@ import (
 
 	"github.com/creack/pty"
 	"github.com/google/shlex"
+	"golang.org/x/sys/unix"
 )
 
 type tsshdPty struct {
@@ -63,6 +64,26 @@ func (p *tsshdPty) GetExitCode() int {
 
 func (p *tsshdPty) Resize(cols, rows int) error {
 	return pty.Setsize(p.ptmx, &pty.Winsize{Cols: uint16(cols), Rows: uint16(rows)})
+}
+
+// Testing showed that sending SIGWINCH without an actual size change
+// does not reliably trigger a redraw in shells such as bash. When the
+// terminal size changes, the resize operation itself already generates
+// the necessary SIGWINCH signal, so an explicit signal is unnecessary.
+func (p *tsshdPty) Redraw() error {
+	pgid, err := unix.IoctlGetInt(int(p.ptmx.Fd()), unix.TIOCGPGRP)
+	if err != nil {
+		return fmt.Errorf("get foreground process group failed: %v", err)
+	}
+	if pgid <= 0 {
+		return fmt.Errorf("invalid foreground process group: %d", pgid)
+	}
+	// TIOCGPGRP returns the foreground process group of the PTY.
+	// Use a negative pid to send SIGWINCH to the entire process group.
+	if err = unix.Kill(-pgid, unix.SIGWINCH); err != nil {
+		return fmt.Errorf("send SIGWINCH to process group [%d] failed: %v", pgid, err)
+	}
+	return nil
 }
 
 func newTsshdPty(cmd *exec.Cmd, cols, rows int) (*tsshdPty, error) {

@@ -57,10 +57,14 @@ func (s *sshUdpServer) enablePendingInputDiscard() {
 		return
 	}
 
-	sessionMutex.Lock()
-	defer sessionMutex.Unlock()
+	// Serialize with attach operations to avoid updating sessions that
+	// are being migrated to another server.
+	attachMutex.Lock()
+	defer attachMutex.Unlock()
 
-	if len(sessionMap) == 0 {
+	sessions := getAllSessions()
+
+	if len(sessions) == 0 {
 		// No need to register and send the marker if there are no active sessions.
 		// Otherwise, concurrent session creation by the client might lead to garbled input.
 		return
@@ -71,12 +75,16 @@ func (s *sshUdpServer) enablePendingInputDiscard() {
 		byte(idx >> 24), byte(idx >> 16), byte(idx >> 8), byte(idx),
 	}
 
-	for _, sess := range sessionMap {
+	for _, sess := range sessions {
+		if sess.server.Load() != s {
+			// Skip sessions that are no longer owned by this server.
+			continue
+		}
 		sess.discardMarker.Store(&marker)
 	}
 
 	go func() {
-		debug("discard marker: %X", marker)
+		debug("discard input marker: %X", marker)
 		if err := s.sendBusMessage("discard", discardMessage{DiscardMarker: marker}); err != nil {
 			warning("send discard marker [%X] failed: %v", marker, err)
 		}
@@ -100,32 +108,33 @@ func getNextDiscardMarkerIndex() uint32 {
 }
 
 type sessionContext struct {
-	id              uint64
-	cols            int
-	rows            int
-	cmd             *exec.Cmd
-	pty             *tsshdPty
-	mwSess          *middlewareSession
-	outWG           sync.WaitGroup
-	stdin           io.WriteCloser
-	stdout          io.ReadCloser
-	stderr          io.ReadCloser
-	started         bool
-	closed          atomic.Bool
-	waitDone        chan struct{}
-	waitCancel      chan struct{}
-	waitMutex       sync.Mutex
-	resizeMutex     sync.Mutex
-	server          atomic.Pointer[sshUdpServer]
-	ioStream        *replaceableStream
-	errStream       *replaceableStream
-	clientChecker   *replaceableTimeoutChecker
-	discardedBuffer []byte
-	discardMarker   atomic.Pointer[[]byte]
-	discardOutput   atomic.Bool
-	screenBuf       chan []byte
-	screenObj       *te.Screen
-	screenMu        sync.Mutex
+	id             uint64
+	cols           int
+	rows           int
+	cmd            *exec.Cmd
+	pty            *tsshdPty
+	mwSess         *middlewareSession
+	outWG          sync.WaitGroup
+	stdin          io.WriteCloser
+	stdout         io.ReadCloser
+	stderr         io.ReadCloser
+	started        bool
+	closed         atomic.Bool
+	waitDone       chan struct{}
+	waitCancel     chan struct{}
+	waitMutex      sync.Mutex
+	resizeMutex    sync.Mutex
+	server         atomic.Pointer[sshUdpServer]
+	ioStream       *replaceableStream
+	errStream      *replaceableStream
+	clientChecker  *replaceableTimeoutChecker
+	discardedInput []byte
+	discardMarker  atomic.Pointer[[]byte]
+	outForwarder   *serverOutputForwarder
+	errForwarder   *serverOutputForwarder
+	screenBuf      chan []byte
+	screenObj      *te.Screen
+	screenMu       sync.Mutex
 }
 
 var sessionMutex sync.Mutex
@@ -217,13 +226,13 @@ func (c *sessionContext) showMotd(stream Stream) {
 }
 
 func (c *sessionContext) discardPendingInput(server *sshUdpServer, buf []byte, marker *[]byte) error {
-	c.discardedBuffer = append(c.discardedBuffer, buf...)
-	pos := bytes.Index(c.discardedBuffer, *marker)
+	c.discardedInput = append(c.discardedInput, buf...)
+	pos := bytes.Index(c.discardedInput, *marker)
 	if pos < 0 {
 		return nil
 	}
 
-	remainingBuffer := c.discardedBuffer[pos+len(*marker):]
+	remainingBuffer := c.discardedInput[pos+len(*marker):]
 	if len(remainingBuffer) > 0 {
 		if err := writeAll(c.stdin, remainingBuffer); err != nil {
 			return err
@@ -232,16 +241,16 @@ func (c *sessionContext) discardPendingInput(server *sshUdpServer, buf []byte, m
 
 	if pos > 0 {
 		if enableDebugLogging {
-			debug("discard input: %s", strconv.QuoteToASCII(string(c.discardedBuffer[:pos])))
+			debug("discard input: %s", strconv.QuoteToASCII(string(c.discardedInput[:pos])))
 		}
-		if err := server.sendBusMessage("discard", discardMessage{DiscardedInput: c.discardedBuffer[:pos]}); err != nil {
+		if err := server.sendBusMessage("discard", discardMessage{DiscardedInput: c.discardedInput[:pos]}); err != nil {
 			warning("send discard message failed: %v", err)
 		}
 	} else if enableDebugLogging {
 		debug("no pending input to discard")
 	}
 
-	c.discardedBuffer = nil
+	c.discardedInput = nil
 	c.discardMarker.CompareAndSwap(marker, nil)
 	return nil
 }
@@ -287,318 +296,15 @@ func (c *sessionContext) isKeepPendingOutput() bool {
 	return false
 }
 
-func (c *sessionContext) forwardOutput(name string, reader io.Reader, stream Stream) {
-	var returned bool
-	var handleMutex sync.Mutex
-	var writeError atomic.Bool
-	done := make(chan struct{})
-	ch := make(chan []byte, 1)
-
-	defer func() {
-		handleMutex.Lock()
-		returned = true
-		close(ch)
-		handleMutex.Unlock()
-
-		<-done
-	}()
-
-	go func() {
-		defer func() { _ = stream.CloseWrite(); close(done) }()
-		for buf := range ch {
-			if err := writeAll(stream, buf); err != nil {
-				writeError.Store(true)
-				warning("write to [%s] failed: %v", name, err)
-				return
-			}
-		}
-	}()
-
-	var cacheLines [][]byte
-	var tmuxOutputPrefix string
-	var discardLines, discardBytes, voidedCapacity uint64
-
-	cacheOutput := func(buf []byte) {
-		for len(buf) > 0 {
-			pos := bytes.IndexByte(buf, '\n')
-			if pos < 0 {
-				pos = bytes.IndexByte(buf, '\r')
-			}
-
-			var line []byte
-			if pos >= 0 {
-				line = buf[:pos+1]
-				buf = buf[pos+1:]
-			} else {
-				line = buf
-				buf = nil
-			}
-
-			if len(cacheLines) == 0 {
-				cacheLines = append(cacheLines, line)
-				continue
-			}
-			last := cacheLines[len(cacheLines)-1]
-			if b := last[len(last)-1]; b != '\n' && (b != '\r' || line[0] == '\n') && len(last) < 1000 {
-				cacheLines[len(cacheLines)-1] = append(last, line...)
-				continue
-			}
-			cacheLines = append(cacheLines, line)
-		}
-
-		maxLines := max(maxPendingOutputLines, c.rows*2)
-		if len(cacheLines) > maxLines {
-			if discardLines == 0 {
-				tmuxOutputPrefix = extractTmuxOutputPrefix(cacheLines)
-			}
-
-			dropLines := len(cacheLines) - maxLines
-			discardLines += uint64(dropLines)
-			for i := range dropLines {
-				discardBytes += uint64(len(cacheLines[i]))
-			}
-			cacheLines = cacheLines[dropLines:]
-
-			voidedCapacity += uint64(dropLines)
-			if voidedCapacity > uint64(maxLines) {
-				newCacheLines := make([][]byte, len(cacheLines), maxLines*2+10)
-				copy(newCacheLines, cacheLines)
-				cacheLines = newCacheLines
-				voidedCapacity = 0
-			}
-		}
+func (c *sessionContext) newOutputForwarder(name string, reader io.Reader, stream Stream) *serverOutputForwarder {
+	return &serverOutputForwarder{
+		name:       name,
+		sess:       c,
+		reader:     reader,
+		stream:     stream,
+		done:       make(chan struct{}),
+		writeBufCh: make(chan []byte, 1),
 	}
-
-	// chHasNewLine ensures the client receives a complete line before further output is cached.
-	var chHasNewLine bool
-
-	// noNewLineCount records consecutive reads that contain no '\n'.
-	// After 3 consecutive reads without newline, output will start being cached.
-	// This helps handle cases where some programs may output progress bars or status
-	// lines by repeatedly using carriage return ('\r') without emitting newline characters.
-	var noNewLineCount int
-
-	flushOutput := func() {
-		if len(cacheLines) == 0 || c.clientChecker.isTimeout() {
-			return
-		}
-
-		filteredCount := 0
-		if enableDebugLogging {
-			defer func() {
-				if filteredCount > 0 {
-					debug("filtered %d ESC[6n cursor position request(s)", filteredCount)
-				}
-			}()
-		}
-
-		for i := -1; i < len(cacheLines); i++ {
-			var line []byte
-			if i < 0 {
-				if discardLines == 0 {
-					continue
-				}
-				newline := "\r\n"
-				if len(cacheLines) > 0 && len(cacheLines[0]) > 0 && cacheLines[0][len(cacheLines[0])-1] == '\r' {
-					newline = "\r"
-				}
-				line = fmt.Appendf(nil,
-					"\r\033[0;33mWarning: tsshd discarded %d lines %d bytes of output during client disconnection at this point!\033[0m\033[K%s",
-					discardLines, discardBytes, newline)
-				if len(tmuxOutputPrefix) > 0 {
-					line = encodeTmuxOutput(tmuxOutputPrefix, line)
-				}
-			} else {
-				line = cacheLines[i]
-				if enableDebugLogging {
-					filteredCount += bytes.Count(line, []byte("\x1b[6n"))
-				}
-				line = bytes.ReplaceAll(line, []byte("\x1b[6n"), []byte(""))
-				if len(line) == 0 {
-					continue
-				}
-			}
-		out:
-			for {
-				select {
-				case ch <- line:
-					if i < 0 {
-						debug("discard output %d lines %d bytes", discardLines, discardBytes)
-						discardLines, discardBytes = 0, 0
-					}
-					break out
-				default:
-					if c.clientChecker.isTimeout() {
-						if i > 0 {
-							cacheLines = cacheLines[i:]
-						}
-						return
-					}
-					if writeError.Load() {
-						return
-					}
-					time.Sleep(10 * time.Millisecond)
-				}
-			}
-		}
-
-		cacheLines, chHasNewLine, noNewLineCount = nil, false, 0
-	}
-
-	clearOutput := func() {
-		for _, line := range cacheLines {
-			discardLines += 1
-			discardBytes += uint64(len(line))
-		}
-		if discardLines > 0 {
-			debug("discard output %d lines %d bytes", discardLines, discardBytes)
-			if server := c.server.Load(); server != nil {
-				server.sendBusMessage("discard", discardMessage{DiscardedOutputLines: discardLines, DiscardedOutputBytes: discardBytes})
-			}
-		}
-		discardLines, discardBytes = 0, 0
-		cacheLines, chHasNewLine, noNewLineCount = nil, false, 0
-	}
-
-	c.clientChecker.onReconnected(func() {
-		handleMutex.Lock()
-		defer handleMutex.Unlock()
-
-		if returned {
-			return // do not flush after forwardoutput has returned
-		}
-
-		flushOutput()
-	})
-
-	handleBuffer := func(buf []byte) {
-		handleMutex.Lock()
-		defer handleMutex.Unlock()
-
-		// Discard the cached output exactly once. The flag must be set again for future discards.
-		if c.discardOutput.CompareAndSwap(true, false) {
-			clearOutput()
-		}
-
-		if chHasNewLine && c.clientChecker.isTimeout() && !c.isKeepPendingOutput() {
-			cacheOutput(buf)
-			return
-		}
-
-		if len(cacheLines) > 0 {
-			cacheOutput(buf)
-			flushOutput()
-			return
-		}
-
-		var remaining []byte
-		if c.clientChecker.isTimeout() && !c.isKeepPendingOutput() {
-			pos := bytes.IndexByte(buf, '\n')
-			if pos >= 0 {
-				remaining = buf[pos+1:]
-				buf = buf[:pos+1]
-				chHasNewLine = true
-			} else {
-				if noNewLineCount < 3 {
-					noNewLineCount++
-				} else {
-					chHasNewLine = true
-					cacheOutput(buf)
-					return
-				}
-			}
-		}
-
-	out:
-		for {
-			select {
-			case ch <- buf:
-				break out
-			default:
-				if c.clientChecker.isTimeout() {
-					if c.isKeepPendingOutput() {
-						if c.clientChecker.waitUntilReconnected() != nil {
-							return
-						}
-						continue
-					}
-					select {
-					case b := <-ch:
-						buf = append(b, buf...)
-					default:
-					}
-					pos := bytes.IndexByte(buf, '\n')
-					if pos < 0 && noNewLineCount < 3 {
-						ch <- buf
-						noNewLineCount++
-						break out
-					}
-
-					if pos < 0 {
-						ch <- buf
-					} else {
-						ch <- buf[:pos+1]
-						left := buf[pos+1:]
-						if len(left) > 0 {
-							cacheOutput(left)
-						}
-					}
-
-					chHasNewLine = true
-					break out
-				}
-				if writeError.Load() {
-					return
-				}
-				time.Sleep(10 * time.Millisecond)
-			}
-		}
-
-		if len(remaining) > 0 {
-			cacheOutput(remaining)
-		}
-	}
-
-	handleError := func() {
-		handleMutex.Lock()
-		defer handleMutex.Unlock()
-
-		for len(cacheLines) > 0 && !writeError.Load() {
-			if c.clientChecker.isTimeout() {
-				if c.clientChecker.waitUntilReconnected() != nil {
-					break
-				}
-			}
-			flushOutput()
-		}
-	}
-
-	buffer := make([]byte, 32*1024)
-	for {
-		n, err := reader.Read(buffer)
-		if n > 0 {
-			buf := make([]byte, n)
-			copy(buf, buffer[:n])
-			if c.screenBuf != nil {
-				select {
-				case c.screenBuf <- buf:
-				default:
-					select {
-					case c.screenBuf <- buf:
-					case <-time.After(100 * time.Millisecond):
-						warning("screen update blocked for 100ms, dropping %d bytes", len(buf))
-					}
-				}
-			}
-			handleBuffer(buf)
-		}
-		if err != nil {
-			handleError()
-			break
-		}
-	}
-
-	debug("session [%d] %s completed", c.id, name)
 }
 
 func (c *sessionContext) forwardIO(server *sshUdpServer, ioStream, errStream Stream) {
@@ -612,7 +318,8 @@ func (c *sessionContext) forwardIO(server *sshUdpServer, ioStream, errStream Str
 	}
 
 	if c.stdout != nil {
-		c.outWG.Go(func() { c.forwardOutput("stdout", c.stdout, ioStream) })
+		c.outForwarder = c.newOutputForwarder("stdout", c.stdout, ioStream)
+		c.outWG.Go(func() { c.outForwarder.forward() })
 	}
 
 	if server.args.Attachable {
@@ -621,8 +328,9 @@ func (c *sessionContext) forwardIO(server *sshUdpServer, ioStream, errStream Str
 	}
 
 	if c.stderr != nil {
+		c.errForwarder = c.newOutputForwarder("stderr", c.stderr, errStream)
 		c.outWG.Go(func() {
-			c.forwardOutput("stderr", c.stderr, errStream)
+			c.errForwarder.forward()
 			_ = errStream.Close()
 		})
 	} else {
@@ -676,6 +384,10 @@ func (c *sessionContext) Close() {
 		return
 	}
 
+	sessionMutex.Lock()
+	delete(sessionMap, c.id)
+	sessionMutex.Unlock()
+
 	code := -1
 	if c.mwSess != nil {
 		if exitCode := c.mwSess.exitCode.Load(); exitCode != nil {
@@ -709,7 +421,7 @@ func (c *sessionContext) Close() {
 	}
 }
 
-func (c *sessionContext) SetSize(cols, rows int, redraw bool) error {
+func (c *sessionContext) SetSize(cols, rows int, redraw bool, discardOutput bool, discardMarker []byte) error {
 	if c.closed.Load() {
 		return nil
 	}
@@ -723,30 +435,78 @@ func (c *sessionContext) SetSize(cols, rows int, redraw bool) error {
 		resize = c.pty.Resize
 	}
 	if resize == nil {
-		return fmt.Errorf("session %d is not pty", c.id)
+		return fmt.Errorf("session [%d] is not pty", c.id)
 	}
 
 	c.resizeMutex.Lock()
 	defer c.resizeMutex.Unlock()
 
-	if redraw {
-		if err := resize(cols+1, rows); err != nil {
-			warning("redraw pty failed: %v", err)
+	if cols == 0 && rows == 0 { // (0,0) means redraw only without changing terminal size.
+		cols, rows = c.cols, c.rows
+	}
+
+	if cols == c.cols && rows == c.rows {
+		// Window size is unchanged.
+		if !redraw {
+			// Return immediately if a redraw is not required.
+			debug("session [%d] resize skipped: size unchanged (%d, %d)", c.id, cols, rows)
+			return nil
 		}
-		time.Sleep(10 * time.Millisecond) // fix redraw issue in `screen`
-		debug("session [%d] redraw: %d, %d", c.id, cols, rows)
-	} else {
-		debug("session [%d] resize: %d, %d", c.id, cols, rows)
+
+		// When the size is unchanged, force a redraw by briefly resizing
+		// the terminal and then restoring the original dimensions.
+		if err := resize(cols+1, rows); err != nil {
+			warning("session [%d] temporary resize for redraw failed: %v", c.id, err)
+		}
+
+		// fix redraw issue in `screen`
+		time.Sleep(10 * time.Millisecond)
+
+		if discardOutput || discardMarker != nil {
+			// When discarding output during a redraw, wait briefly after the
+			// temporary resize so that any output generated by the first resize
+			// is buffered before enabling output discard for the final resize.
+			// This helps ensure that only the output from the final redraw is
+			// forwarded to the client.
+			time.Sleep(50 * time.Millisecond)
+		}
 	}
 
+	// Discard any output generated before the final resize.
+	if discardMarker != nil {
+		if c.outForwarder != nil {
+			c.outForwarder.discardMarker.Store(&discardMarker)
+		}
+		if c.errForwarder != nil {
+			c.errForwarder.discardMarker.Store(&discardMarker)
+		}
+	} else if discardOutput {
+		if c.outForwarder != nil {
+			c.outForwarder.discardOutput.Store(true)
+		}
+		if c.errForwarder != nil {
+			c.errForwarder.discardOutput.Store(true)
+		}
+	}
+
+	// Apply the requested terminal size to the PTY.
 	if err := resize(cols, rows); err != nil {
-		return fmt.Errorf("resize pty failed: %v", err)
+		return fmt.Errorf("session [%d] resize to (%d, %d) failed: %v", c.id, cols, rows, err)
 	}
 
+	// Keep the screen snapshot dimensions in sync with the PTY size.
 	if c.screenObj != nil {
 		c.screenMu.Lock()
 		c.screenObj.Resize(rows, cols)
 		c.screenMu.Unlock()
+	}
+
+	if enableDebugLogging {
+		verb := "resize"
+		if redraw {
+			verb = "redraw"
+		}
+		debug("session [%d] %s from (%d, %d) to (%d, %d)", c.id, verb, c.cols, c.rows, cols, rows)
 	}
 
 	c.cols, c.rows = cols, rows
@@ -918,6 +678,24 @@ func newSessionContext(server *sshUdpServer, msg *startMessage) (*sessionContext
 	}
 	sessionMap[sess.id] = sess
 	return sess, nil
+}
+
+func getSessionByID(id uint64) *sessionContext {
+	sessionMutex.Lock()
+	defer sessionMutex.Unlock()
+
+	return sessionMap[id]
+}
+
+func getAllSessions() []*sessionContext {
+	sessionMutex.Lock()
+	defer sessionMutex.Unlock()
+
+	var sessions []*sessionContext
+	for _, sess := range sessionMap {
+		sessions = append(sessions, sess)
+	}
+	return sessions
 }
 
 type stderrStream struct {
@@ -1111,21 +889,6 @@ func getEnvironments(msg *startMessage) []string {
 	return envs
 }
 
-func getSubsystemCmd(name string) (*exec.Cmd, error) {
-	command := getSshdSubsystem(name)
-	if command == "" {
-		return nil, fmt.Errorf("subsystem [%s] does not exist in [%s]", name, sshdConfigPath)
-	}
-	args, err := splitCommandLine(command)
-	if err != nil {
-		return nil, fmt.Errorf("split subsystem [%s] [%s] failed: %v", name, command, err)
-	}
-	if len(args) == 0 || args[0] == "" {
-		return nil, fmt.Errorf("subsystem [%s] command is empty in [%s]", name, sshdConfigPath)
-	}
-	return exec.Command(args[0], args[1:]...), nil
-}
-
 func (s *sshUdpServer) handleStderrEvent(stream Stream) {
 	if enableDebugLogging {
 		debug("stderr goroutine for client [%x] started", s.client.proxyAddr.clientID)
@@ -1160,12 +923,27 @@ func (s *sshUdpServer) handleResizeEvent(stream Stream) error {
 	if msg.Cols <= 0 || msg.Rows <= 0 {
 		return fmt.Errorf("resize message invalid: %#v", msg)
 	}
-	sessionMutex.Lock()
-	defer sessionMutex.Unlock()
-	if sess, ok := sessionMap[msg.ID]; ok {
-		return sess.SetSize(msg.Cols, msg.Rows, msg.Redraw)
+
+	sess := getSessionByID(msg.ID)
+
+	if sess == nil {
+		return fmt.Errorf("session [%d] not found", msg.ID)
 	}
-	return fmt.Errorf("invalid session id: %d", msg.ID)
+
+	// Serialize with attach operations to ensure the session is still owned
+	// by this server before applying the resize. Otherwise a stale server
+	// could update session state after the session has been attached to a
+	// different server.
+	attachMutex.Lock()
+	defer attachMutex.Unlock()
+
+	if sess.server.Load() != s {
+		// Session ownership has moved to another server. Ignore stale
+		// resize events from the previous server.
+		return nil
+	}
+
+	return sess.SetSize(msg.Cols, msg.Rows, msg.Redraw, false, msg.Marker)
 }
 
 func (c *sessionContext) handleX11Request(msg *startMessage) {
@@ -1409,32 +1187,15 @@ func (c *sessionContext) handleChannelAccept(listener net.Listener, channelType 
 }
 
 func closeSession(id uint64) {
-	sessionMutex.Lock()
-
-	sess, ok := sessionMap[id]
-	if !ok {
-		sessionMutex.Unlock()
-		return
+	if sess := getSessionByID(id); sess != nil {
+		debug("closing the session [%d]", id)
+		sess.Close()
 	}
-
-	delete(sessionMap, id)
-	sessionMutex.Unlock()
-
-	debug("closing the session [%d]", id)
-	sess.Close()
 }
 
 func closeAllSessions() {
-	sessionMutex.Lock()
-	var sessions []*sessionContext
-	for _, session := range sessionMap {
-		sessions = append(sessions, session)
-	}
-	sessionMap = nil
-	sessionMutex.Unlock()
-
 	debug("closing all the sessions")
-	for _, session := range sessions {
-		session.Close()
+	for _, sess := range getAllSessions() {
+		sess.Close()
 	}
 }

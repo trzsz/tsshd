@@ -115,15 +115,15 @@ func handleInfoRequest(conn net.Conn) error {
 		Name: globalSocketInfo.sessionName,
 	}
 
-	sessionMutex.Lock()
-	for _, sess := range sessionMap {
+	for _, sess := range getAllSessions() {
 		var title string
 		if sess.screenObj != nil {
+			sess.screenMu.Lock()
 			title = sess.screenObj.Title
+			sess.screenMu.Unlock()
 		}
 		info.Sessions = append(info.Sessions, SessionInfo{ID: sess.id, Title: title})
 	}
-	sessionMutex.Unlock()
 
 	infoStr, err := json.Marshal(info)
 	if err != nil {
@@ -144,11 +144,9 @@ func handleViewRequest(conn net.Conn) error {
 		return fmt.Errorf("recv view request failed: %v", err)
 	}
 
-	sessionMutex.Lock()
-	session, ok := sessionMap[msg.ID]
-	sessionMutex.Unlock()
+	sess := getSessionByID(msg.ID)
 
-	if !ok {
+	if sess == nil {
 		_, err := fmt.Fprintf(conn, "ERROR: session [%d] not found\r\n", msg.ID)
 		if err != nil {
 			return fmt.Errorf("write view response failed: %v", err)
@@ -156,7 +154,7 @@ func handleViewRequest(conn net.Conn) error {
 		return nil
 	}
 
-	if session.screenObj == nil {
+	if sess.screenObj == nil {
 		_, err := fmt.Fprintf(conn, "ERROR: session [%d] was not started with attachable support\r\n", msg.ID)
 		if err != nil {
 			return fmt.Errorf("write view response failed: %v", err)
@@ -164,9 +162,9 @@ func handleViewRequest(conn net.Conn) error {
 		return nil
 	}
 
-	session.screenMu.Lock()
-	contents := session.screenObj.Display()
-	session.screenMu.Unlock()
+	sess.screenMu.Lock()
+	contents := sess.screenObj.Display()
+	sess.screenMu.Unlock()
 
 	for _, line := range contents {
 		if _, err := fmt.Fprintf(conn, "%s\r\n", line); err != nil {

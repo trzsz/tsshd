@@ -26,9 +26,11 @@ package tsshd
 
 import (
 	"os"
+	"path/filepath"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 func TestParseSshdConfig(t *testing.T) {
@@ -306,4 +308,21 @@ func TestEvalMatchLine(t *testing.T) {
 	assert.False(evalMatchLine("Address 192.0.2.*", "john", []string{"admin"}))
 	assert.False(evalMatchLine("User john Address 192.0.2.*", "john", []string{"admin"}))
 	assert.True(evalMatchLine("All", "john", []string{"admin"}))
+}
+
+func TestGetSubsystemCmd_EmptyCommand(t *testing.T) {
+	origPath := sshdConfigPath
+	origMap := sshdSubsystemMap
+	defer func() {
+		sshdConfigPath = origPath
+		sshdSubsystemMap = origMap
+	}()
+
+	sshdConfigPath = filepath.Join(t.TempDir(), "sshd_config")
+	sshdSubsystemMap = map[string]string{"sftp": `""`}
+
+	cmd, err := getSubsystemCmd("sftp")
+	require.Error(t, err)
+	require.Nil(t, cmd)
+	require.Contains(t, err.Error(), "command is empty")
 }
