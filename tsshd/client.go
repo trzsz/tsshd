@@ -69,6 +69,7 @@ type SshUdpClient struct {
 	exitWG           sync.WaitGroup
 	closed           atomic.Bool
 	quited           atomic.Bool
+	detached         atomic.Bool
 	busMutex         sync.Mutex
 	busStream        Stream
 	busClosed        chan struct{}
@@ -250,13 +251,16 @@ func (c *SshUdpClient) Wait() error {
 	return nil
 }
 
-// Close closes the client
+// Close terminates the client and releases underlying resources.
+//
+// Close is a *destructive operation*: it attempts to stop the remote session,
+// notify the server to exit, and finally closes the underlying transport stream.
 func (c *SshUdpClient) Close() (err error) {
 	if !c.closed.CompareAndSwap(false, true) {
 		return nil
 	}
 
-	if c.busStream != nil {
+	if c.busStream != nil && !c.detached.Load() {
 		_, err = doWithTimeout(func() (int, error) {
 			if err := c.sendBusCommand("close"); err != nil {
 				c.debug("send cmd [close] failed: %v", err)
@@ -276,7 +280,7 @@ func (c *SshUdpClient) Close() (err error) {
 		}, 300*time.Millisecond)
 	}
 
-	if c.protoClient != nil {
+	if c.protoClient != nil && !c.detached.Load() {
 		_, err = doWithTimeout(func() (int, error) {
 			err := c.protoClient.closeClient()
 			if err != nil {
@@ -297,6 +301,21 @@ func (c *SshUdpClient) Close() (err error) {
 	}
 
 	return
+}
+
+// Detach disconnects the client from the server while allowing the remote session
+// to continue running in the background.
+//
+// Detach is a *non-destructive operation*: it indicates that the client no longer
+// manages or tracks the remote session lifecycle.
+//
+// After Detach returns, subsequent calls to Close are safe and will NOT
+// terminate or interfere with the remote session.
+func (c *SshUdpClient) Detach() {
+	if !c.detached.CompareAndSwap(false, true) {
+		return
+	}
+	_ = c.Close()
 }
 
 func (c *SshUdpClient) newStream(cmd string) (Stream, error) {
@@ -615,12 +634,18 @@ func (c *SshUdpClient) isBusStreamInited() bool {
 }
 
 func (c *SshUdpClient) sendBusCommand(command string) error {
+	if c.detached.Load() {
+		return nil
+	}
 	c.busMutex.Lock()
 	defer c.busMutex.Unlock()
 	return sendCommand(c.busStream, command)
 }
 
 func (c *SshUdpClient) sendBusMessage(command string, msg any) error {
+	if c.detached.Load() {
+		return nil
+	}
 	c.busMutex.Lock()
 	defer c.busMutex.Unlock()
 	return sendCommandAndMessage(c.busStream, command, msg)
@@ -822,6 +847,10 @@ func (s *SshUdpSession) Close() error {
 		return nil
 	}
 
+	if s.client.detached.Load() {
+		return nil
+	}
+
 	isExited := func(timeout time.Duration) bool {
 		done := make(chan struct{})
 		go func() {
@@ -948,8 +977,11 @@ func (s *SshUdpSession) forwardInput() {
 	defer func() {
 		s.client.debug("session [%d] stdin completed", s.id)
 		_ = s.stdin.Close()
-		if err := s.stream.CloseWrite(); err != nil {
-			s.client.debug("session [%d] close write failed: %v", s.id, err)
+
+		if !s.client.detached.Load() {
+			if err := s.stream.CloseWrite(); err != nil {
+				s.client.debug("session [%d] close write failed: %v", s.id, err)
+			}
 		}
 	}()
 

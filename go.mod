@@ -7,7 +7,7 @@ require (
 	github.com/UserExistsError/conpty v0.1.4
 	github.com/creack/pty v1.1.24
 	github.com/google/shlex v0.0.0-20191202100458-e7afc7fbc510
-	github.com/quic-go/quic-go v0.59.1
+	github.com/quic-go/quic-go v0.60.0
 	github.com/rcarmo/go-te v0.1.0
 	github.com/stretchr/testify v1.11.1
 	github.com/trzsz/shellescape v1.6.0
@@ -24,7 +24,7 @@ require (
 	github.com/klauspost/cpuid/v2 v2.3.0 // indirect
 	github.com/klauspost/reedsolomon v1.14.0 // indirect
 	github.com/kr/text v0.2.0 // indirect
-	github.com/mattn/go-runewidth v0.0.23 // indirect
+	github.com/mattn/go-runewidth v0.0.24 // indirect
 	github.com/pkg/errors v0.9.1 // indirect
 	github.com/pmezard/go-difflib v1.0.0 // indirect
 	github.com/rivo/uniseg v0.4.7 // indirect

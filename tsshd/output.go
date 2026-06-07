@@ -48,7 +48,9 @@ type clientOutputForwarder struct {
 func (f *clientOutputForwarder) forward() {
 	defer func() {
 		_ = f.writer.Close()
-		_ = f.reader.CloseRead()
+		if !f.client.detached.Load() {
+			_ = f.reader.CloseRead()
+		}
 	}()
 
 	buffer := make([]byte, 32*1024)
