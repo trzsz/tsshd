@@ -170,7 +170,7 @@ func NewSshUdpClient(opts *UdpClientOptions) (udpClient *SshUdpClient, err error
 		return nil, err
 	}
 
-	udpClient.protoClient, err = newProtoClient(opts, udpClient.clientProxy, udpClient.clientProxy.remoteAddr)
+	udpClient.protoClient, err = newProtoClient(opts, udpClient)
 	if err != nil {
 		return nil, err
 	}

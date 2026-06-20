@@ -41,6 +41,7 @@ type streamHandler interface {
 type sshUdpServer struct {
 	args   *tsshdArgs
 	client *clientState
+	proxy  *serverProxy
 	proto  protocolServer
 	closed atomic.Bool
 
@@ -103,7 +104,7 @@ var newSshUdpServer = func(args *tsshdArgs, proxy *serverProxy, addr net.Addr, p
 		return nil
 	}
 
-	server := &sshUdpServer{args: args, client: client, proto: proto,
+	server := &sshUdpServer{args: args, client: client, proxy: proxy, proto: proto,
 		streamMap: make(map[uint64]Stream),
 	}
 

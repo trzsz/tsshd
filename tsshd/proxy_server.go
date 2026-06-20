@@ -737,13 +737,11 @@ type serverProxy struct {
 	clientID     uint64
 	soleClient   *clientState
 	clientMutex  sync.RWMutex
+	kcpCrypto    *rotatingCrypto
 	// This map is intentionally not cleaned up to prevent replay attacks.
 	// Only optimize if memory usage becomes a real issue, and even then,
 	// serialNumber must be retained for replay protection.
 	clientMap map[uint64]*clientState
-	// KCP key
-	kcpPass []byte
-	kcpSalt []byte
 }
 
 func (p *serverProxy) newClientState(clientID uint64) (*clientState, error) {
@@ -753,8 +751,8 @@ func (p *serverProxy) newClientState(clientID uint64) (*clientState, error) {
 		client.clientCond = sync.NewCond(&client.clientMutex)
 	}
 
-	if p.args.KCP {
-		crypto, err := newRotatingCrypto(nil, p.kcpPass, p.kcpSalt, 0, 0, false)
+	if p.args.KCP && p.args.Attachable {
+		crypto, err := newRotatingCrypto(nil, p.kcpCrypto.keyPass, p.kcpCrypto.keySalt, 0, 0, false)
 		if err != nil {
 			return nil, fmt.Errorf("new rotating crypto failed: %v", err)
 		}
@@ -894,10 +892,6 @@ func (p *serverProxy) WriteTo(buf []byte, addr net.Addr) (int, error) {
 		warning("get client [%x] return nil", clientAddr.clientID)
 		return n, nil
 	}
-	if client.closed.Load() {
-		debug("skip write: client [%x] is closed", clientAddr.clientID)
-		return n, nil
-	}
 
 	if kcpCrypto := client.kcpCrypto.Load(); kcpCrypto != nil {
 		var err error
@@ -906,6 +900,13 @@ func (p *serverProxy) WriteTo(buf []byte, addr net.Addr) (int, error) {
 			warning("seal packet failed: %v", err)
 			return n, nil
 		}
+	}
+
+	// If kcpCrypto is cleared, 'closed' is guaranteed to be true.
+	// Checking 'closed' after fetching kcpCrypto avoids a race condition that leaks plaintext data.
+	if client.closed.Load() {
+		debug("skip write: client [%x] is closed", clientAddr.clientID)
+		return n, nil
 	}
 
 	if err := p.frontendConn.writeTo(buf, client); err != nil {
@@ -970,19 +971,6 @@ func startServerProxy(args *tsshdArgs, info *ServerInfo, conn frontendConnection
 		args:         args,
 		frontendConn: conn,
 		cipherBlock:  &cipherBlock,
-	}
-
-	if args.KCP {
-		proxy.kcpPass = make([]byte, 48)
-		if _, err := crypto_rand.Read(proxy.kcpPass); err != nil {
-			return nil, fmt.Errorf("rand pass failed: %v", err)
-		}
-		proxy.kcpSalt = make([]byte, 48)
-		if _, err := crypto_rand.Read(proxy.kcpSalt); err != nil {
-			return nil, fmt.Errorf("rand salt failed: %v", err)
-		}
-		info.Pass = fmt.Sprintf("%x", proxy.kcpPass)
-		info.Salt = fmt.Sprintf("%x", proxy.kcpSalt)
 	}
 
 	if !args.Attachable || args.Socket {

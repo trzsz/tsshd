@@ -367,15 +367,6 @@ func (p *clientProxy) ReadFrom(buf []byte) (int, net.Addr, error) {
 				continue
 			}
 
-			if p.kcpCrypto != nil {
-				nn, err := p.kcpCrypto.openPacket(buf[:n])
-				if err != nil {
-					p.client.debug("open packet (len=%d) failed: %v", n, err)
-					continue
-				}
-				n = nn
-			}
-
 			p.serverChecker.updateNow()
 
 			if p.client.enableDebugging && p.udpTraffic.recFlag.Load() {
@@ -401,15 +392,6 @@ func (p *clientProxy) WriteTo(buf []byte, _ net.Addr) (int, error) {
 	}
 
 	if conn := p.backendConn.Load(); conn != nil {
-		if p.kcpCrypto != nil {
-			var err error
-			buf, err = p.kcpCrypto.sealPacket(buf, true)
-			if err != nil {
-				p.client.warning("seal packet failed: %v", err)
-				return len(buf), nil
-			}
-		}
-
 		if err := conn.Write(buf); err != nil {
 			p.client.debug("backend write failed: %v", err)
 			p.clearBackendConn(conn)
@@ -540,21 +522,6 @@ func startClientProxy(client *SshUdpClient, opts *UdpClientOptions) (*clientProx
 		serverChecker: newTimeoutChecker(opts.HeartbeatTimeout),
 	}
 	proxy.backendCond = sync.NewCond(&proxy.backendMutex)
-
-	if opts.ServerInfo.Mode == kUdpModeKCP {
-		pass, err := hex.DecodeString(opts.ServerInfo.Pass)
-		if err != nil {
-			return nil, fmt.Errorf("decode pass [%s] failed: %w", opts.ServerInfo.Pass, err)
-		}
-		salt, err := hex.DecodeString(opts.ServerInfo.Salt)
-		if err != nil {
-			return nil, fmt.Errorf("decode salt [%s] failed: %w", opts.ServerInfo.Pass, err)
-		}
-		proxy.kcpCrypto, err = newRotatingCrypto(client, pass, salt, kRekeyBytesThreshold, kRekeyTimeThreshold, false)
-		if err != nil {
-			return nil, fmt.Errorf("new rotating crypto failed: %w", err)
-		}
-	}
 
 	if client.enableDebugging {
 		proxy.serverChecker.onTimeout(func() {

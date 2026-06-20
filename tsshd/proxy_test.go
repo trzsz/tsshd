@@ -121,7 +121,8 @@ func runProxyEchoTest(t *testing.T, args *tsshdArgs) {
 
 	for range clientCount {
 		wg.Go(func() {
-			proxy, err := startClientProxy(&SshUdpClient{activeChecker: newTimeoutChecker(0)}, opts)
+			client := &SshUdpClient{activeChecker: newTimeoutChecker(0)}
+			proxy, err := startClientProxy(client, opts)
 			if err != nil {
 				t.Fatalf("start client proxy failed: %v", err)
 			}
@@ -131,7 +132,8 @@ func runProxyEchoTest(t *testing.T, args *tsshdArgs) {
 				t.Fatalf("renew transport path failed: %v", err)
 			}
 
-			proto, err := newProtoClient(opts, proxy, proxy.remoteAddr)
+			client.clientProxy = proxy
+			proto, err := newProtoClient(opts, client)
 			if err != nil {
 				t.Fatalf("new proto client failed: %v", err)
 			}

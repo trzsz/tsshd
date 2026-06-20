@@ -480,23 +480,35 @@ func (c *quicClient) newStream(connectTimeout time.Duration) (Stream, error) {
 	return &quicStream{stream, c.conn}, err
 }
 
-func newProtoClient(opts *UdpClientOptions, proxy *clientProxy, remoteAddr net.Addr) (protocolClient, error) {
+func newProtoClient(opts *UdpClientOptions, client *SshUdpClient) (protocolClient, error) {
 	switch opts.ServerInfo.Mode {
 	case "":
 		return nil, fmt.Errorf("%s", "Please upgrade tsshd")
 	case kUdpModeKCP:
-		return newKcpClient(opts, proxy, remoteAddr, proxy.kcpCrypto.keyPass, proxy.kcpCrypto.keySalt, true)
+		return newKcpClient(opts, client, client.clientProxy, client.clientProxy.remoteAddr)
 	case kUdpModeQUIC:
-		return newQuicClient(opts, proxy, remoteAddr)
+		return newQuicClient(opts, client.clientProxy, client.clientProxy.remoteAddr)
 	default:
 		return nil, fmt.Errorf("unknown tsshd mode: %s", opts.ServerInfo.Mode)
 	}
 }
 
-func newKcpClient(opts *UdpClientOptions, udpConn net.PacketConn, remoteAddr net.Addr, pass, salt []byte, delegToProxy bool) (*kcpClient, error) {
-	crypto, err := newRotatingCrypto(nil, pass, salt, 0, 0, delegToProxy)
+func newKcpClient(opts *UdpClientOptions, client *SshUdpClient, udpConn net.PacketConn, remoteAddr net.Addr) (*kcpClient, error) {
+	pass, err := hex.DecodeString(opts.ServerInfo.Pass)
+	if err != nil {
+		return nil, fmt.Errorf("decode pass [%s] failed: %w", opts.ServerInfo.Pass, err)
+	}
+	salt, err := hex.DecodeString(opts.ServerInfo.Salt)
+	if err != nil {
+		return nil, fmt.Errorf("decode salt [%s] failed: %w", opts.ServerInfo.Pass, err)
+	}
+
+	crypto, err := newRotatingCrypto(client, pass, salt, kRekeyBytesThreshold, kRekeyTimeThreshold, false)
 	if err != nil {
 		return nil, fmt.Errorf("new rotating crypto failed: %w", err)
+	}
+	if client != nil {
+		client.clientProxy.kcpCrypto = crypto
 	}
 	block := kcp.NewAEADCrypt(crypto)
 
