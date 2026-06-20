@@ -54,12 +54,10 @@ type sshUdpServer struct {
 	clientChecker *timeoutChecker
 
 	// bus related
-	serving              atomic.Bool
-	busMutex             sync.Mutex
-	busStream            Stream
-	clientAliveTime      aliveTime
-	pendingClearPktCache bool
-	shouldSample         atomic.Bool
+	serving         atomic.Bool
+	busMutex        sync.Mutex
+	busStream       Stream
+	clientAliveTime atomic.Int64
 
 	// session related
 	stderrMutex       sync.Mutex
@@ -130,6 +128,11 @@ func (s *sshUdpServer) initClientChecker(timeout time.Duration) {
 		})
 		s.clientChecker.onReconnected(func() {
 			debug("resumed after receiving client [%x] input", s.client.proxyAddr.clientID)
+			time.AfterFunc(10*time.Second, func() {
+				if !s.clientChecker.isTimeout() {
+					s.client.udpTraffic.recFlag.Store(false)
+				}
+			})
 		})
 	}
 
@@ -160,6 +163,11 @@ func (s *sshUdpServer) initClientChecker(timeout time.Duration) {
 		// reused or remain in a half-open state after the client times out.
 		s.client.setClientConn(oldClientConn, nil)
 		debug("client [%x] transport cleared due to timeout", s.client.proxyAddr.clientID)
+
+		if enableDebugLogging && !s.client.udpTraffic.recFlag.Load() {
+			s.client.udpTraffic.resetStats()
+			s.client.udpTraffic.recFlag.Store(true)
+		}
 	})
 }
 
@@ -170,9 +178,6 @@ func (s *sshUdpServer) activateServer(sessionName string) error {
 			return fmt.Errorf("active server is already in use")
 		}
 		s.client.server.Store(s)
-		if pktCache := s.client.pktCache.Load(); pktCache != nil {
-			pktCache.peerCheck.Store(s.clientChecker)
-		}
 		s.serving.Store(true)
 		return nil
 	}
@@ -221,9 +226,6 @@ func (s *sshUdpServer) activateServer(sessionName string) error {
 	}
 
 	s.client.server.Store(s)
-	if pktCache := s.client.pktCache.Load(); pktCache != nil {
-		pktCache.peerCheck.Store(s.clientChecker)
-	}
 	s.serving.Store(true)
 	return nil
 }
@@ -410,5 +412,5 @@ func (s *sshUdpServer) closeActiveStreams() {
 }
 
 func (s *sshUdpServer) isClientAlive() bool {
-	return time.Since(time.UnixMilli(s.clientAliveTime.latest())) < s.clientChecker.heartbeatTimeout
+	return time.Since(time.UnixMilli(s.clientAliveTime.Load())) < s.clientChecker.heartbeatTimeout
 }

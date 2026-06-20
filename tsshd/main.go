@@ -362,7 +362,7 @@ func monitorServerLiveness(args *tsshdArgs) {
 		}
 
 		// Check the last received client heartbeat. Exit if it exceeds aliveTimeout.
-		if time.Since(time.UnixMilli(server.clientAliveTime.latest())) > server.aliveTimeout {
+		if time.Since(time.UnixMilli(server.clientAliveTime.Load())) > server.aliveTimeout {
 			warning("tsshd keep alive timeout")
 			exitWithCode(kExitCodeAliveTimeout)
 			return

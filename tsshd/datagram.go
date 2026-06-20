@@ -484,7 +484,7 @@ func forwardUDP(pconn *packetConn, conn io.ReadWriteCloser, msg *dialUdpMessage)
 		var warnOnce sync.Once
 		_ = pconn.Consume(func(buf []byte) error {
 			if _, err := conn.Write(buf); err != nil {
-				if isClosedError(err) {
+				if IsClosedError(err) {
 					debug("udp forwarding write to [%s] [%s] closed: %v", msg.Net, msg.Addr, err)
 					return err
 				}
@@ -502,7 +502,7 @@ func forwardUDP(pconn *packetConn, conn io.ReadWriteCloser, msg *dialUdpMessage)
 		for {
 			n, err := conn.Read(buffer)
 			if err != nil {
-				if isClosedError(err) {
+				if IsClosedError(err) {
 					select {
 					case <-clientDone:
 						// The client actively closed the connection. Return silently to reduce log noise.
@@ -517,7 +517,7 @@ func forwardUDP(pconn *packetConn, conn io.ReadWriteCloser, msg *dialUdpMessage)
 				return
 			}
 			if err := pconn.Write(buffer[:n]); err != nil {
-				if isClosedError(err) {
+				if IsClosedError(err) {
 					debug("udp forwarding [%s] [%s] write closed: %v", msg.Net, msg.Addr, err)
 					return
 				}
@@ -565,7 +565,7 @@ func (s *udpForwardSession) writePacket(data []byte) {
 
 func (s *udpForwardSession) doWrite(data []byte) {
 	if err := s.forwardConn.Write(data); err != nil {
-		if isClosedError(err) {
+		if IsClosedError(err) {
 			debug("udp forwarding [%s] [%s] write closed: %v", s.listenerNet, s.listenerAddr, err)
 			return
 		}
@@ -725,7 +725,7 @@ func (s *sshUdpServer) handleListenUdpEvent(stream Stream) {
 	for {
 		n, addr, err := listenerConn.ReadFrom(buf)
 		if err != nil {
-			if isClosedError(err) {
+			if IsClosedError(err) {
 				debug("udp listener [%s] [%s] closed: %v", msg.Net, msg.Addr, err)
 				break
 			}
@@ -754,7 +754,7 @@ func (s *sshUdpServer) handleListenUdpEvent(stream Stream) {
 		if err := sendMessage(stream, acceptUdpMessage{id}); err != nil {
 			_ = s.takeUdpFwdPendingSession(id)
 			s.releaseUdpForwardSession(session)
-			if isClosedError(err) {
+			if IsClosedError(err) {
 				debug("udp listener [%s] [%s] send accept udp message closed: %v", msg.Net, msg.Addr, err)
 				return
 			}
@@ -789,7 +789,7 @@ func (s *sshUdpServer) handleAcceptUdpEvent(stream Stream) {
 	var warnOnce sync.Once
 	_ = session.forwardConn.Consume(func(buf []byte) error {
 		if _, err := session.listenerConn.WriteTo(buf, session.peerAddr); err != nil {
-			if isClosedError(err) {
+			if IsClosedError(err) {
 				if enableDebugLogging {
 					debug("udp listener [%s] [%s] write to [%s] closed: %v", session.listenerNet, session.listenerAddr, session.getPeerAddr(), err)
 				}

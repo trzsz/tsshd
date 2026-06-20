@@ -191,7 +191,7 @@ func (s *sshUdpServer) handleListenEvent(stream Stream) {
 	for {
 		conn, err := listener.Accept()
 		if err != nil {
-			if isClosedError(err) {
+			if IsClosedError(err) {
 				debug("listener [%s] [%s] closed: %v", msg.Net, msg.Addr, err)
 				break
 			}
@@ -204,7 +204,7 @@ func (s *sshUdpServer) handleListenEvent(stream Stream) {
 			if conn := s.takeAcceptConn(id); conn != nil {
 				_ = conn.Close()
 			}
-			if isClosedError(err) {
+			if IsClosedError(err) {
 				debug("listener [%s] [%s] send accept message closed: %v", msg.Net, msg.Addr, err)
 				return
 			}

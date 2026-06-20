@@ -117,14 +117,10 @@ type clientProxy struct {
 	serverID      uint64
 	renewMutex    sync.Mutex
 	serialNumber  uint64
-	pktCache      packetCache
-	cachingPkt    atomic.Bool
-	shouldSample  atomic.Bool
 	kcpCrypto     *rotatingCrypto
 	serverChecker *timeoutChecker
-	readPktCount  atomic.Uint64
-	writePktCount atomic.Uint64
 	closed        atomic.Bool
+	udpTraffic    *trafficStats
 }
 
 func (p *clientProxy) clearBackendConn(oldConn *serverConnHolder) {
@@ -138,10 +134,6 @@ func (p *clientProxy) clearBackendConn(oldConn *serverConnHolder) {
 
 	if oldConn != nil {
 		_ = oldConn.Close()
-
-		if p.client.enableDebugging {
-			p.client.debug("old transport closed. read packets: %d, write packets: %d", p.readPktCount.Swap(0), p.writePktCount.Swap(0))
-		}
 	}
 }
 
@@ -192,8 +184,9 @@ func (p *clientProxy) renewTransportPath(proxyClient *SshUdpClient, connectTimeo
 		}()
 	}
 
-	// Send cached packets if any
-	go p.sendPacketCache()
+	if p.client.protoClient != nil {
+		p.client.protoClient.reset()
+	}
 
 	// Block until reconnection is confirmed by the arrival of valid QUIC/KCP packets,
 	// or abort if no server response is received before the heartbeat deadline.
@@ -359,26 +352,6 @@ func (p *clientProxy) isAuthSuccessful(buf []byte) bool {
 	return p.serialNumber == serialNumber
 }
 
-func (p *clientProxy) sendPacketCache() {
-	conn := p.backendConn.Load()
-	if conn == nil {
-		return
-	}
-
-	totalSize, sampleCount, reactiveCount, proactiveCount := p.pktCache.sendCache(func(buf []byte) error {
-		if p.kcpCrypto != nil {
-			var err error
-			buf, err = p.kcpCrypto.sealPacket(buf, false)
-			if err != nil {
-				return err
-			}
-		}
-		return conn.Write(buf)
-	})
-
-	p.client.debug("send packet cache: size=%d, sample=%d, reactive=%d, proactive=%d", totalSize, sampleCount, reactiveCount, proactiveCount)
-}
-
 func (p *clientProxy) ReadFrom(buf []byte) (int, net.Addr, error) {
 	p.readMutex.Lock()
 	defer p.readMutex.Unlock()
@@ -405,8 +378,9 @@ func (p *clientProxy) ReadFrom(buf []byte) (int, net.Addr, error) {
 
 			p.serverChecker.updateNow()
 
-			if p.client.enableDebugging {
-				p.readPktCount.Add(1)
+			if p.client.enableDebugging && p.udpTraffic.recFlag.Load() {
+				p.udpTraffic.recvCount.Add(1)
+				p.udpTraffic.recvBytes.Add(uint64(n))
 			}
 
 			return n, p.remoteAddr, nil
@@ -422,56 +396,31 @@ func (p *clientProxy) ReadFrom(buf []byte) (int, net.Addr, error) {
 }
 
 func (p *clientProxy) WriteTo(buf []byte, _ net.Addr) (int, error) {
-	for {
-		if p.closed.Load() {
-			return 0, io.EOF
-		}
-
-		if p.serverChecker.isTimeout() {
-			if p.client.enableDebugging && p.cachingPkt.CompareAndSwap(false, true) {
-				p.client.debug("switching to packet caching mode")
-			}
-			p.pktCache.addPacket(buf)
-			return len(buf), nil
-		} else if p.client.enableDebugging && p.cachingPkt.CompareAndSwap(true, false) {
-			p.client.debug("switching to direct transmission mode")
-		}
-
-		if p.client.activeChecker.isTimeout() {
-			// Cache all packets until fully recovers, while concurrently sending them to the new transport.
-			p.pktCache.addPacket(buf)
-		} else if p.shouldSample.Load() && p.shouldSample.CompareAndSwap(true, false) {
-			p.pktCache.addSample(buf)
-		}
-
-		if conn := p.backendConn.Load(); conn != nil {
-			if p.kcpCrypto != nil {
-				var err error
-				buf, err = p.kcpCrypto.sealPacket(buf, true)
-				if err != nil {
-					p.client.warning("seal packet failed: %v", err)
-					return len(buf), nil
-				}
-			}
-
-			if err := conn.Write(buf); err != nil {
-				p.client.debug("backend write failed: %v", err)
-				p.clearBackendConn(conn)
-			} else if p.client.enableDebugging {
-				p.writePktCount.Add(1)
-			}
-
-			// Do not return an error here, otherwise QUIC/KCP may drop all subsequent packets.
-			return len(buf), nil
-		}
-
-		// wait for reconnect or timeout then cache
-		p.backendMutex.Lock()
-		for p.backendConn.Load() == nil && !p.closed.Load() && !p.serverChecker.isTimeout() {
-			p.backendCond.Wait()
-		}
-		p.backendMutex.Unlock()
+	if p.closed.Load() {
+		return 0, io.EOF
 	}
+
+	if conn := p.backendConn.Load(); conn != nil {
+		if p.kcpCrypto != nil {
+			var err error
+			buf, err = p.kcpCrypto.sealPacket(buf, true)
+			if err != nil {
+				p.client.warning("seal packet failed: %v", err)
+				return len(buf), nil
+			}
+		}
+
+		if err := conn.Write(buf); err != nil {
+			p.client.debug("backend write failed: %v", err)
+			p.clearBackendConn(conn)
+		} else if p.client.enableDebugging && p.udpTraffic.recFlag.Load() {
+			p.udpTraffic.sendCount.Add(1)
+			p.udpTraffic.sendBytes.Add(uint64(len(buf)))
+		}
+	}
+
+	// Do not return an error here, otherwise QUIC/KCP may drop all subsequent packets.
+	return len(buf), nil
 }
 
 func (p *clientProxy) Close() error {
@@ -591,7 +540,6 @@ func startClientProxy(client *SshUdpClient, opts *UdpClientOptions) (*clientProx
 		serverChecker: newTimeoutChecker(opts.HeartbeatTimeout),
 	}
 	proxy.backendCond = sync.NewCond(&proxy.backendMutex)
-	proxy.pktCache.peerCheck.Store(proxy.serverChecker)
 
 	if opts.ServerInfo.Mode == kUdpModeKCP {
 		pass, err := hex.DecodeString(opts.ServerInfo.Pass)
@@ -608,34 +556,30 @@ func startClientProxy(client *SshUdpClient, opts *UdpClientOptions) (*clientProx
 		}
 	}
 
-	go func() {
-		// Periodically sample traffic packets.
-		// These samples are replayed upon reconnection to proactively trigger QUIC/KCP session recovery.
-		ticker := time.NewTicker(opts.HeartbeatTimeout / kSampleCacheSize)
-		defer ticker.Stop()
-		for range ticker.C {
-			if proxy.closed.Load() {
-				return
-			}
-			proxy.shouldSample.Store(true)
-		}
-	}()
-
-	proxy.serverChecker.onTimeout(func() {
-		client.debug("blocked due to no server output for [%v]", opts.HeartbeatTimeout)
-		proxy.backendMutex.Lock()
-		proxy.backendCond.Broadcast()
-		proxy.backendMutex.Unlock()
-	})
-
 	if client.enableDebugging {
+		proxy.serverChecker.onTimeout(func() {
+			client.debug("blocked due to no server output for [%v]", opts.HeartbeatTimeout)
+		})
 		proxy.serverChecker.onReconnected(func() {
 			client.debug("resumed after receiving server output")
 		})
-	}
 
-	if opts.ProxyClient != nil {
-		opts.ProxyClient.activeChecker.onReconnected(proxy.sendPacketCache)
+		proxy.udpTraffic = &trafficStats{}
+
+		go func() {
+			ticker := time.NewTicker(200 * time.Millisecond)
+			defer ticker.Stop()
+			for range ticker.C {
+				if proxy.closed.Load() {
+					return
+				}
+				if proxy.udpTraffic.recFlag.Load() {
+					if msg := proxy.udpTraffic.flushLog(); msg != "" {
+						client.debug("%s", msg)
+					}
+				}
+			}
+		}()
 	}
 
 	return proxy, nil

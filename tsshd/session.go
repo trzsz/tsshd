@@ -1164,7 +1164,7 @@ func (c *sessionContext) handleChannelAccept(listener net.Listener, channelType 
 	for {
 		conn, err := listener.Accept()
 		if err != nil {
-			if isClosedError(err) {
+			if IsClosedError(err) {
 				debug("listen channel closed: %v", err)
 				break
 			}

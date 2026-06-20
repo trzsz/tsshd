@@ -29,6 +29,7 @@ import (
 	"crypto/cipher"
 	crypto_rand "crypto/rand"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -37,6 +38,8 @@ import (
 	"sync/atomic"
 	"time"
 )
+
+var errClientDisconnected = errors.New("client disconnected")
 
 type proxyClientAddr struct {
 	clientID uint64
@@ -51,22 +54,19 @@ func (a *proxyClientAddr) String() string {
 }
 
 type clientState struct {
-	sealed        atomic.Bool
-	closed        atomic.Bool
-	server        atomic.Pointer[sshUdpServer]
-	proxyAddr     proxyClientAddr
-	serialNumber  atomic.Uint64
-	clientConn    atomic.Pointer[net.TCPConn]
-	clientAddr    atomic.Pointer[net.UDPAddr]
-	authedAddr    atomic.Pointer[net.UDPAddr]
-	udpFrontConn  atomic.Pointer[udpFrontendConn]
-	clientMutex   sync.Mutex
-	clientCond    *sync.Cond
-	pktCache      atomic.Pointer[packetCache]
-	cachingPkt    atomic.Bool
-	kcpCrypto     atomic.Pointer[rotatingCrypto]
-	readPktCount  atomic.Uint64
-	writePktCount atomic.Uint64
+	sealed       atomic.Bool
+	closed       atomic.Bool
+	server       atomic.Pointer[sshUdpServer]
+	proxyAddr    proxyClientAddr
+	serialNumber atomic.Uint64
+	clientConn   atomic.Pointer[net.TCPConn]
+	clientAddr   atomic.Pointer[net.UDPAddr]
+	authedAddr   atomic.Pointer[net.UDPAddr]
+	udpFrontConn atomic.Pointer[udpFrontendConn]
+	clientMutex  sync.Mutex
+	clientCond   *sync.Cond
+	kcpCrypto    atomic.Pointer[rotatingCrypto]
+	udpTraffic   *trafficStats
 }
 
 func (c *clientState) remoteAddr() string {
@@ -115,9 +115,6 @@ func (c *clientState) setClientConn(oldConn, newConn *net.TCPConn) {
 
 	if oldConn != nil {
 		_ = oldConn.Close()
-		if enableDebugLogging {
-			debug("old transport closed. read packets: %d, write packets: %d", c.readPktCount.Swap(0), c.writePktCount.Swap(0))
-		}
 	}
 }
 
@@ -139,9 +136,6 @@ func (c *clientState) setClientAddr(oldAddr, newAddr *net.UDPAddr) {
 	if oldAddr != nil {
 		if conn != nil {
 			conn.delClientMap(oldAddr)
-		}
-		if enableDebugLogging {
-			debug("old transport closed. read packets: %d, write packets: %d", c.readPktCount.Swap(0), c.writePktCount.Swap(0))
 		}
 	}
 }
@@ -166,27 +160,6 @@ func (c *clientState) setAuthedAddr(oldAddr, newAddr *net.UDPAddr) {
 	}
 }
 
-func (c *clientState) sendPacketCache(conn frontendConnection) bool {
-	pktCache := c.pktCache.Load()
-	if pktCache == nil {
-		return false
-	}
-	totalSize, sampleCount, reactiveCount, proactiveCount := pktCache.sendCache(func(buf []byte) error {
-		if kcpCrypto := c.kcpCrypto.Load(); kcpCrypto != nil {
-			var err error
-			buf, err = kcpCrypto.sealPacket(buf, false)
-			if err != nil {
-				return err
-			}
-		}
-		return conn.writeTo(buf, c)
-	})
-
-	debug("send packet cache: size=%d, sample=%d, reactive=%d, proactive=%d", totalSize, sampleCount, reactiveCount, proactiveCount)
-
-	return totalSize > 0
-}
-
 func (c *clientState) Close() {
 	if !c.closed.CompareAndSwap(false, true) {
 		return
@@ -203,7 +176,6 @@ func (c *clientState) Close() {
 	}
 
 	c.server.Store(nil)
-	c.pktCache.Store(nil)
 	c.kcpCrypto.Store(nil)
 	c.setClientConn(nil, nil)
 	c.setClientAddr(nil, nil)
@@ -545,11 +517,7 @@ func (c *udpFrontendConn) readFrom(buf []byte) (int, *clientState) {
 func (c *udpFrontendConn) writeTo(buf []byte, client *clientState) error {
 	addr := client.clientAddr.Load()
 	if addr == nil {
-		// Drop the packet immediately instead of waiting for the client to reconnect.
-		// In attachable mode, waiting for the old client to reconnect may block new clients from sending packets.
-		// In all modes, waiting could block subsequent packets and prevent caching of packets during disconnections.
-		// In scenarios with frequent reconnections, a lack of cached packets may fail to reactivate the KCP/QUIC session.
-		return fmt.Errorf("client [%x] addr is nil", client.proxyAddr.clientID)
+		return errClientDisconnected
 	}
 
 	_, err := c.waitConn().WriteTo(buf, addr)
@@ -749,11 +717,7 @@ func (c *tcpFrontendConn) readFrom(buf []byte) (int, *clientState) {
 func (c *tcpFrontendConn) writeTo(buf []byte, client *clientState) error {
 	conn := client.clientConn.Load()
 	if conn == nil {
-		// Drop the packet immediately instead of waiting for the client to reconnect.
-		// In attachable mode, waiting for the old client to reconnect may block new clients from sending packets.
-		// In all modes, waiting could block subsequent packets and prevent caching of packets during disconnections.
-		// In scenarios with frequent reconnections, a lack of cached packets may fail to reactivate the KCP/QUIC session.
-		return fmt.Errorf("client conn is nil")
+		return errClientDisconnected
 	}
 
 	if err := sendUdpPacket(conn, buf); err != nil {
@@ -784,7 +748,6 @@ type serverProxy struct {
 
 func (p *serverProxy) newClientState(clientID uint64) (*clientState, error) {
 	client := &clientState{proxyAddr: proxyClientAddr{clientID}}
-	client.pktCache.Store(&packetCache{})
 
 	if p.args.TCP {
 		client.clientCond = sync.NewCond(&client.clientMutex)
@@ -796,6 +759,10 @@ func (p *serverProxy) newClientState(clientID uint64) (*clientState, error) {
 			return nil, fmt.Errorf("new rotating crypto failed: %v", err)
 		}
 		client.kcpCrypto.Store(crypto)
+	}
+
+	if enableDebugLogging {
+		client.udpTraffic = &trafficStats{}
 	}
 
 	return client, nil
@@ -871,7 +838,7 @@ func (p *serverProxy) onNewClientConn(client *clientState) {
 		// from being delivered after reconnection.
 		server.enablePendingInputDiscard()
 
-		go client.sendPacketCache(p.frontendConn)
+		server.proto.reset()
 	}
 }
 
@@ -905,8 +872,9 @@ func (p *serverProxy) ReadFrom(buf []byte) (int, net.Addr, error) {
 		server.clientChecker.updateNow()
 	}
 
-	if enableDebugLogging {
-		client.readPktCount.Add(1)
+	if enableDebugLogging && client.udpTraffic.recFlag.Load() {
+		client.udpTraffic.recvCount.Add(1)
+		client.udpTraffic.recvBytes.Add(uint64(n))
 	}
 
 	return n, &client.proxyAddr, nil
@@ -931,26 +899,6 @@ func (p *serverProxy) WriteTo(buf []byte, addr net.Addr) (int, error) {
 		return n, nil
 	}
 
-	if server := client.server.Load(); server != nil {
-		if server.clientChecker.isTimeout() {
-			if enableDebugLogging && client.cachingPkt.CompareAndSwap(false, true) {
-				debug("client [%x] switching to packet caching mode", client.proxyAddr.clientID)
-			}
-			if pktCache := client.pktCache.Load(); pktCache != nil {
-				pktCache.addPacket(buf)
-			}
-			return n, nil
-		} else if enableDebugLogging && client.cachingPkt.CompareAndSwap(true, false) {
-			debug("client [%x] switching to direct transmission mode", client.proxyAddr.clientID)
-		}
-
-		if server.shouldSample.Load() && server.shouldSample.CompareAndSwap(true, false) {
-			if pktCache := client.pktCache.Load(); pktCache != nil {
-				pktCache.addSample(buf)
-			}
-		}
-	}
-
 	if kcpCrypto := client.kcpCrypto.Load(); kcpCrypto != nil {
 		var err error
 		buf, err = kcpCrypto.sealPacket(buf, true)
@@ -961,9 +909,12 @@ func (p *serverProxy) WriteTo(buf []byte, addr net.Addr) (int, error) {
 	}
 
 	if err := p.frontendConn.writeTo(buf, client); err != nil {
-		debug("frontend write failed: %v", err)
-	} else if enableDebugLogging {
-		client.writePktCount.Add(1)
+		if err != errClientDisconnected {
+			debug("frontend write failed: %v", err)
+		}
+	} else if enableDebugLogging && client.udpTraffic.recFlag.Load() {
+		client.udpTraffic.sendCount.Add(1)
+		client.udpTraffic.sendBytes.Add(uint64(len(buf)))
 	}
 
 	return n, nil

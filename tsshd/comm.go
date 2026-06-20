@@ -37,7 +37,7 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/quic-go/quic-go"
+	"github.com/trzsz/quic-go"
 )
 
 var enableDebugLogging bool = false
@@ -54,6 +54,9 @@ var initWarningSenderOnce sync.Once
 
 var debugLogFile *os.File
 var cleanupDebugLog atomic.Bool
+
+const kHeartbeatLogLimit uint64 = 10
+const kHeartbeatInitCount uint64 = 1000
 
 func initDebugLogging() {
 	enableDebugLogging = true
@@ -206,7 +209,9 @@ func doWithTimeout[T any](task func() (T, error), timeout time.Duration) (T, err
 	}
 }
 
-func isClosedError(err error) bool {
+// IsClosedError reports whether err indicates an expected transport
+// closure rather than an unexpected I/O failure.
+func IsClosedError(err error) bool {
 	if err == nil {
 		return false
 	}
@@ -447,33 +452,6 @@ func (tc *timeoutChecker) Close() {
 		return
 	}
 	close(tc.closeChan)
-}
-
-const kAliveTimeCap = 5
-
-type aliveTime struct {
-	mutex sync.Mutex
-	last  int
-	buf   [kAliveTimeCap]int64
-}
-
-func (t *aliveTime) addMilli(milli int64) {
-	t.mutex.Lock()
-	defer t.mutex.Unlock()
-	t.last = (t.last + 1) % kAliveTimeCap
-	t.buf[t.last] = milli
-}
-
-func (r *aliveTime) latest() int64 {
-	r.mutex.Lock()
-	defer r.mutex.Unlock()
-	return r.buf[r.last]
-}
-
-func (r *aliveTime) oldest() int64 {
-	r.mutex.Lock()
-	defer r.mutex.Unlock()
-	return r.buf[(r.last+1)%kAliveTimeCap]
 }
 
 // newFileUnlinker returns a cleanup function that closes the provided closer

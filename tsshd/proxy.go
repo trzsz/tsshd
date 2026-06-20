@@ -31,7 +31,6 @@ import (
 	"fmt"
 	"io"
 	"net"
-	"sync"
 	"sync/atomic"
 	"time"
 
@@ -113,168 +112,36 @@ func recvUdpPacket(conn io.Reader, data []byte) (int, error) {
 	return n, nil
 }
 
-const kSampleCacheSize = 10
-const kPacketCacheSize = 100
-
-type packetGroup struct {
-	buf [][]byte
-	idx int
+type trafficStats struct {
+	recFlag   atomic.Bool
+	sendCount atomic.Uint64
+	sendBytes atomic.Uint64
+	recvCount atomic.Uint64
+	recvBytes atomic.Uint64
+	lastMilli atomic.Int64
 }
 
-func (p *packetGroup) addPacket(data []byte) {
-	if len(p.buf) < kPacketCacheSize {
-		if p.buf == nil {
-			p.buf = make([][]byte, 0, kPacketCacheSize)
-		}
-		p.buf = append(p.buf, data)
-		return
+func (s *trafficStats) resetStats() {
+	s.sendCount.Store(0)
+	s.sendBytes.Store(0)
+	s.recvCount.Store(0)
+	s.recvBytes.Store(0)
+	s.lastMilli.Store(time.Now().UnixMilli())
+}
+
+func (s *trafficStats) flushLog() string {
+	sc := s.sendCount.Swap(0)
+	sb := s.sendBytes.Swap(0)
+	rc := s.recvCount.Swap(0)
+	rb := s.recvBytes.Swap(0)
+
+	if sc == 0 && rc == 0 {
+		s.lastMilli.Store(time.Now().UnixMilli())
+		return ""
 	}
 
-	p.buf[p.idx] = data
-	p.idx = p.idx + 1
-	if p.idx >= kPacketCacheSize {
-		p.idx = 0
-	}
-}
+	now := time.Now().UnixMilli()
+	last := s.lastMilli.Swap(now)
 
-func (p *packetGroup) sendCache(writeFn func([]byte) error) (size, count uint64, err error) {
-	for i := range len(p.buf) {
-		buf := p.buf[(p.idx+i)%kPacketCacheSize]
-		if e := writeFn(buf); e != nil {
-			err = e
-		}
-		size += uint64(len(buf))
-		count++
-		time.Sleep(time.Millisecond)
-	}
-	return
-}
-
-type packetCache struct {
-	mutex      sync.Mutex
-	totalSize  uint64
-	totalCount uint64
-	sampleIdx  int
-	sampleBuf  [kSampleCacheSize][]byte
-	reactive   packetGroup
-	proactive  packetGroup
-	peerCheck  atomic.Pointer[timeoutChecker]
-}
-
-func (p *packetCache) addSample(buf []byte) {
-	p.mutex.Lock()
-	defer p.mutex.Unlock()
-
-	data := make([]byte, len(buf))
-	copy(data, buf)
-
-	p.sampleBuf[p.sampleIdx] = data
-	p.sampleIdx = p.sampleIdx + 1
-	if p.sampleIdx >= kSampleCacheSize {
-		p.sampleIdx = 0
-	}
-}
-
-func (p *packetCache) addPacket(buf []byte) {
-	p.mutex.Lock()
-	defer p.mutex.Unlock()
-
-	p.totalSize += uint64(len(buf))
-	p.totalCount++
-
-	data := make([]byte, len(buf))
-	copy(data, buf)
-
-	// ACK packets can dominate the cache during reconnection.
-	//
-	// A typical failure scenario is:
-	//
-	//   1. A heartbeat packet is cached but fails to reach the peer.
-	//   2. After reconnecting, a large amount of buffered output arrives.
-	//   3. KCP generates many ACK packets.
-	//   4. The ACK packets fill the proxy cache and evict the heartbeat packet.
-	//   5. On the next reconnect attempt, only cached ACK packets are resent.
-	//   6. More output arrives, generating even more ACK packets.
-	//
-	// This cycle can continue until a non-ACK packet (such as a heartbeat)
-	// happens to remain in the cache. Since heartbeat packet may be generated
-	// only once every 60 seconds, recovery can be delayed significantly.
-	//
-	// To improve recovery speed, packets are separated into two groups:
-	//
-	//   - reactive: sent shortly after receiving peer traffic, likely ACKs
-	//   - proactive: sent without recent peer activity, likely heartbeats
-	//     or application-generated packets
-	//
-	// Proactive packets are kept separate so they are less likely to be
-	// displaced by large bursts of ACK traffic.
-	if c := p.peerCheck.Load(); c != nil && time.Now().UnixMilli()-c.lastAliveTime.Load() > 300 {
-		p.proactive.addPacket(data)
-	} else {
-		p.reactive.addPacket(data)
-	}
-}
-
-func (p *packetCache) sendCache(writeFn func([]byte) error) (uint64, uint64, uint64, uint64) {
-	p.mutex.Lock()
-	defer p.mutex.Unlock()
-
-	var once sync.Once
-	var wg sync.WaitGroup
-
-	var totalSize, sampleCount, reactiveCount, proactiveCount atomic.Uint64
-
-	wg.Go(func() {
-		size, count, err := p.proactive.sendCache(writeFn)
-		if err != nil {
-			once.Do(func() { debug("send cache failed: %v", err) })
-		}
-		totalSize.Add(size)
-		proactiveCount.Store(count)
-	})
-
-	wg.Go(func() {
-		size, count, err := p.reactive.sendCache(writeFn)
-		if err != nil {
-			once.Do(func() { debug("send cache failed: %v", err) })
-		}
-		totalSize.Add(size)
-		reactiveCount.Store(count)
-	})
-
-	wg.Go(func() {
-		for i := range kSampleCacheSize {
-			buf := p.sampleBuf[(p.sampleIdx+i)%kSampleCacheSize]
-			if len(buf) == 0 {
-				continue
-			}
-			if err := writeFn(buf); err != nil {
-				once.Do(func() { debug("send cache failed: %v", err) })
-			}
-			totalSize.Add(uint64(len(buf)))
-			sampleCount.Add(1)
-			time.Sleep(time.Millisecond)
-		}
-	})
-
-	wg.Wait()
-
-	return totalSize.Load(), sampleCount.Load(), reactiveCount.Load(), proactiveCount.Load()
-}
-
-func (p *packetCache) clearCache() (totalSize, totalCount uint64) {
-	p.mutex.Lock()
-	defer p.mutex.Unlock()
-
-	for i := range kSampleCacheSize {
-		p.sampleBuf[i] = nil
-	}
-
-	p.reactive.buf, p.reactive.idx = nil, 0
-
-	p.proactive.buf, p.proactive.idx = nil, 0
-
-	totalSize, totalCount = p.totalSize, p.totalCount
-	p.totalSize, p.totalCount = 0, 0
-	return
+	return fmt.Sprintf("udp traffic: duration=%dms, send=%d(%dB), recv=%d(%dB)", now-last, sc, sb, rc, rb)
 }

@@ -36,7 +36,7 @@ import (
 	_ "unsafe"
 )
 
-//go:linkname estimateMaxPayloadSize github.com/quic-go/quic-go.estimateMaxPayloadSize
+//go:linkname estimateMaxPayloadSize github.com/trzsz/quic-go.estimateMaxPayloadSize
 func estimateMaxPayloadSize(mtu int64) int64
 
 type udpPacketConn struct {
@@ -259,7 +259,7 @@ func TestQUIC_RespectMTU(t *testing.T) {
 			for {
 				n, err := stream.Read(buf)
 				if err != nil {
-					if isClosedError(err) {
+					if IsClosedError(err) {
 						return
 					}
 					streamErrCh <- fmt.Errorf("server stream read error: %w", err)
@@ -464,7 +464,7 @@ func TestQUIC_CertValidation(t *testing.T) {
 		for {
 			n, err := stream.Read(buf)
 			if err != nil {
-				if isClosedError(err) {
+				if IsClosedError(err) {
 					return
 				}
 				serverErrCh <- fmt.Errorf("server stream read error: %w", err)

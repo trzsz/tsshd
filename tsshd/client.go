@@ -88,7 +88,8 @@ type SshUdpClient struct {
 	activeAckChan    chan int64
 	reconnectMutex   sync.Mutex
 	reconnectError   atomic.Pointer[error]
-	pendingClearPkt  atomic.Bool
+	maxHeartbeatCnt  atomic.Uint64
+	needLogHeartbeat atomic.Bool
 	keepPendingInput atomic.Bool
 }
 
@@ -182,14 +183,13 @@ func NewSshUdpClient(opts *UdpClientOptions) (udpClient *SshUdpClient, err error
 		udpClient.activeChecker.onReconnected(func() {
 			since := time.Since(time.UnixMilli(udpClient.activeChecker.getAliveTime()))
 			udpClient.debug("transport resumed: since_last_activity=%v", since)
+			time.AfterFunc(10*time.Second, func() {
+				if !udpClient.activeChecker.isTimeout() {
+					udpClient.clientProxy.udpTraffic.recFlag.Store(false)
+				}
+			})
 		})
 	}
-	udpClient.activeChecker.onReconnected(func() {
-		// Mark packet cache for deferred clearing.
-		// The cache is NOT cleared immediately on reconnection because
-		// the transport may appear reconnected while still being unstable.
-		udpClient.pendingClearPkt.Store(true)
-	})
 	udpClient.activeChecker.onTimeout(udpClient.tryToReconnect)
 
 	busStream, err := doWithTimeout(func() (Stream, error) {
@@ -533,9 +533,23 @@ func (c *SshUdpClient) tryToReconnect() {
 	c.reconnectMutex.Lock()
 	defer c.reconnectMutex.Unlock()
 
+	// If UDP packets from the server are still being received,
+	// the heartbeat timeout may be caused by temporary traffic bursts,
+	// network congestion, or packet loss rather than an actual disconnect.
+	//
+	// Wait until server UDP packets actually time out.
+	// If the heartbeat is still timed out by then, initiate a reconnection.
+	for !c.clientProxy.serverChecker.isTimeout() {
+		if !c.activeChecker.isTimeout() {
+			c.debug("heartbeat timeout was transient, reconnect canceled")
+			return
+		}
+		time.Sleep(min(c.intervalTime, 1*time.Second))
+	}
+
 	if c.proxyClient != nil {
 		// prioritize allowing the proxy to reconnect first
-		time.Sleep(c.proxyClient.intervalTime)
+		time.Sleep(min(c.proxyClient.intervalTime, 1*time.Second))
 
 		// wait for the proxy to reconnect first
 		if c.proxyClient.activeChecker.isTimeout() {
@@ -548,13 +562,22 @@ func (c *SshUdpClient) tryToReconnect() {
 
 	for c.activeChecker.isTimeout() && !c.IsClosed() {
 		c.debug("attempting new transport path")
+
+		if c.enableDebugging {
+			if !c.clientProxy.udpTraffic.recFlag.Load() {
+				c.clientProxy.clearBackendConn(nil)
+				c.clientProxy.udpTraffic.resetStats()
+				c.clientProxy.udpTraffic.recFlag.Store(true)
+			}
+		}
+
 		if err := c.clientProxy.renewTransportPath(c.proxyClient, c.connectTimeout); err != nil {
 			if c.IsClosed() {
 				return
 			}
 			c.debug("reconnect failed: %v", err)
 			c.reconnectError.Store(&err)
-			time.Sleep(c.intervalTime) // don't reconnect too frequently
+			time.Sleep(min(c.intervalTime, 10*time.Second)) // don't reconnect too frequently
 			continue
 		}
 
@@ -564,7 +587,7 @@ func (c *SshUdpClient) tryToReconnect() {
 		// After a successful reconnection, activeChecker.isTimeout() does not immediately become false.
 		// We wait here until the heartbeat normalizes (activeChecker.isTimeout() == false).
 		for {
-			time.Sleep(c.intervalTime)
+			time.Sleep(min(c.intervalTime, 1*time.Second))
 			if !c.activeChecker.isTimeout() {
 				return
 			}
@@ -578,9 +601,16 @@ func (c *SshUdpClient) tryToReconnect() {
 }
 
 func (c *SshUdpClient) keepAlive(intervalTime time.Duration) {
-	var serverAliveTime aliveTime
 	ticker := time.NewTicker(intervalTime)
 	defer ticker.Stop()
+
+	heartbeatCount := kHeartbeatInitCount
+	c.maxHeartbeatCnt.Add(kHeartbeatLogLimit)
+	client := c.proxyClient
+	for client != nil {
+		client.maxHeartbeatCnt.Add(kHeartbeatLogLimit / 2)
+		client = client.proxyClient
+	}
 
 	for range ticker.C {
 		if c.IsClosed() {
@@ -589,9 +619,9 @@ func (c *SshUdpClient) keepAlive(intervalTime time.Duration) {
 
 		aliveTime := time.Now().UnixMilli()
 		if c.enableDebugging {
-			timeout, stabilizing := c.activeChecker.isTimeout(), c.pendingClearPkt.Load()
-			if timeout || stabilizing {
-				c.debug("keep alive [%d] sending: timeout=%v, stabilizing=%v", aliveTime, timeout, stabilizing)
+			timeout := c.activeChecker.isTimeout()
+			if timeout || heartbeatCount <= c.maxHeartbeatCnt.Load() || c.needLogHeartbeat.Load() {
+				c.debug("keep alive [%d] sending: timeout=%v, heartbeat=%d", aliveTime, timeout, heartbeatCount)
 			}
 		}
 
@@ -604,26 +634,35 @@ func (c *SshUdpClient) keepAlive(intervalTime time.Duration) {
 		ackTime := <-c.activeAckChan
 
 		if c.enableDebugging {
-			timeout, stabilizing, rtt := c.activeChecker.isTimeout(), c.pendingClearPkt.Load(), time.Since(time.UnixMilli(ackTime))
-			if timeout || stabilizing || rtt > (2*intervalTime) {
-				c.debug("keep alive [%d] confirmed: timeout=%v, stabilizing=%v, rtt=%v", ackTime, timeout, stabilizing, rtt)
+			timeout := c.activeChecker.isTimeout()
+			rtt := time.Since(time.UnixMilli(ackTime))
+
+			// If the RTT exceeds heartbeatTimeout, it indicates that
+			// the client was previously disconnected and has now reconnected.
+			if rtt > c.activeChecker.heartbeatTimeout {
+				heartbeatCount = 0
+				// When the local client requires logging, force all proxies in the chain to log as well.
+				client := c.proxyClient
+				for client != nil {
+					client.needLogHeartbeat.Store(true)
+					client = client.proxyClient
+				}
 			}
+
+			if timeout || heartbeatCount <= c.maxHeartbeatCnt.Load() || rtt > (2*intervalTime) || c.needLogHeartbeat.Load() {
+				c.debug("keep alive [%d] confirmed: timeout=%v, heartbeat=%d, rtt=%v", ackTime, timeout, heartbeatCount, rtt)
+			} else {
+				// The local client no longer needs to log, so disable forced logging for all proxies in the chain.
+				client := c.proxyClient
+				for client != nil {
+					client.needLogHeartbeat.Store(false)
+					client = client.proxyClient
+				}
+			}
+			heartbeatCount++
 		}
 
 		c.activeChecker.updateTime(ackTime)
-
-		if c.pendingClearPkt.Load() {
-			serverAliveTime.addMilli(ackTime)
-			// If the server has remained active for a sufficient number of intervals,
-			// consider the connection stable and clear the packet cache.
-			if time.Since(time.UnixMilli(serverAliveTime.oldest())) < time.Duration(kAliveTimeCap+1)*intervalTime {
-				totalSize, totalCount := c.clientProxy.pktCache.clearCache()
-				if c.enableDebugging && (totalSize > 0 || totalCount > 0) {
-					c.debug("drop packet cache count [%d] size [%d]", totalCount, totalSize)
-				}
-				c.pendingClearPkt.Store(false)
-			}
-		}
 	}
 }
 

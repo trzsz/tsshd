@@ -37,9 +37,9 @@ import (
 	"strconv"
 	"time"
 
-	"github.com/quic-go/quic-go"
+	"github.com/trzsz/kcp-go/v5"
+	"github.com/trzsz/quic-go"
 	"github.com/trzsz/smux"
-	"github.com/xtaci/kcp-go/v5"
 )
 
 const kNoErrorMsg = "_TSSHD_NO_ERROR_"
@@ -419,6 +419,7 @@ func recvResponse(stream Stream, resp errorResponder) error {
 }
 
 type protocolClient interface {
+	reset()
 	closeClient() error
 	getUdpForwarder() *udpForwarder
 	newStream(connectTimeout time.Duration) (Stream, error)
@@ -428,6 +429,10 @@ type kcpClient struct {
 	conn      *kcp.UDPSession
 	session   *smux.Session
 	forwarder *udpForwarder
+}
+
+func (c *kcpClient) reset() {
+	c.conn.ResetRTO()
 }
 
 func (c *kcpClient) closeClient() error {
@@ -450,6 +455,10 @@ func (c *kcpClient) newStream(connectTimeout time.Duration) (Stream, error) {
 type quicClient struct {
 	conn      *quic.Conn
 	forwarder *udpForwarder
+}
+
+func (c *quicClient) reset() {
+	c.conn.ResetPTO()
 }
 
 func (c *quicClient) closeClient() error {

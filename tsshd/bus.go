@@ -67,7 +67,7 @@ func (s *sshUdpServer) initBusAndServer(stream Stream, msg *busMessage) error {
 	}
 
 	s.initClientChecker(msg.HeartbeatTimeout)
-	s.clientAliveTime.addMilli(time.Now().UnixMilli())
+	s.clientAliveTime.Store(time.Now().UnixMilli())
 	s.aliveTimeout, s.intervalTime = msg.AliveTimeout, msg.IntervalTime
 
 	if err := s.activateServer(msg.SessionName); err != nil {
@@ -111,26 +111,29 @@ func (s *sshUdpServer) handleBusEvent(stream Stream) {
 		return
 	}
 
-	go func() {
-		// Periodically sample traffic packets.
-		// These samples are replayed upon reconnection to proactively trigger QUIC/KCP session recovery.
-		ticker := time.NewTicker(max(msg.HeartbeatTimeout/kSampleCacheSize, 100*time.Millisecond))
-		defer ticker.Stop()
-		for range ticker.C {
-			if s.closed.Load() {
-				return
+	if enableDebugLogging {
+		go func() {
+			ticker := time.NewTicker(200 * time.Millisecond)
+			defer ticker.Stop()
+			for range ticker.C {
+				if s.closed.Load() {
+					return
+				}
+				if s.client.udpTraffic.recFlag.Load() {
+					if msg := s.client.udpTraffic.flushLog(); msg != "" {
+						debug("client [%x] %s", s.client.proxyAddr.clientID, msg)
+					}
+				}
 			}
-			s.shouldSample.Store(true)
-		}
-	}()
+		}()
+	}
 
-	intervalTimeMilli := int64(msg.IntervalTime / time.Millisecond)
-	heartbeatTimeoutMilli := int64(msg.HeartbeatTimeout / time.Millisecond)
+	heartbeatCount := kHeartbeatInitCount
 
 	for {
 		command, err := recvCommand(stream)
 		if err != nil {
-			if isClosedError(err) {
+			if IsClosedError(err) {
 				return
 			}
 			warning("recv bus command failed: %v", err)
@@ -156,7 +159,7 @@ func (s *sshUdpServer) handleBusEvent(stream Stream) {
 			s.handleCloseEvent()
 			return // return will close the bus stream
 		case "alive":
-			err = s.handleAliveEvent(stream, heartbeatTimeoutMilli, intervalTimeMilli)
+			err = s.handleAliveEvent(stream, msg.HeartbeatTimeout, &heartbeatCount)
 		case "setting":
 			err = s.handleSettingEvent(stream)
 		case "rekey":
@@ -205,7 +208,7 @@ func (s *sshUdpServer) handleCloseEvent() {
 	exitWithCode(kExitCodeNormal)
 }
 
-func (s *sshUdpServer) handleAliveEvent(stream Stream, heartbeatTimeoutMilli, intervalTimeMilli int64) error {
+func (s *sshUdpServer) handleAliveEvent(stream Stream, heartbeatTimeout time.Duration, heartbeatCount *uint64) error {
 	var msg aliveMessage
 	if err := recvMessage(stream, &msg); err != nil {
 		return fmt.Errorf("recv alive message failed: %v", err)
@@ -213,35 +216,21 @@ func (s *sshUdpServer) handleAliveEvent(stream Stream, heartbeatTimeoutMilli, in
 
 	now := time.Now().UnixMilli()
 
-	// If the time since the last recorded activity exceeds heartbeatTimeout,
-	// it indicates that the client was previously disconnected and has now reconnected.
-	// Set the flag to clear the packet cache after the client stabilizes.
-	if now-s.clientAliveTime.latest() > heartbeatTimeoutMilli {
-		if enableDebugLogging {
-			debug("keep alive [%d] received: reconnected=%v, elapsed=%v", msg.Time, true,
-				time.Duration(now-s.clientAliveTime.latest())*time.Millisecond)
+	if enableDebugLogging {
+		elapsed := time.Duration(now-s.clientAliveTime.Load()) * time.Millisecond
+		// If the time since the last recorded activity exceeds heartbeatTimeout,
+		// it indicates that the client was previously disconnected and has now reconnected.
+		reconnect := elapsed > heartbeatTimeout
+		if reconnect {
+			*heartbeatCount = 0
 		}
-		s.pendingClearPktCache = true
-	} else if enableDebugLogging && s.pendingClearPktCache {
-		debug("keep alive [%d] received: stabilizing=%v, interval=%v", msg.Time, s.pendingClearPktCache,
-			time.Duration(now-s.clientAliveTime.latest())*time.Millisecond)
+		if reconnect || *heartbeatCount <= kHeartbeatLogLimit {
+			debug("keep alive [%d] received: reconnect=%v, heartbeat=%d, elapsed=%v", msg.Time, reconnect, *heartbeatCount, elapsed)
+		}
+		(*heartbeatCount)++
 	}
 
-	s.clientAliveTime.addMilli(now)
-
-	if s.pendingClearPktCache {
-		// If the client has remained active for a sufficient number of intervals,
-		// consider the connection stable and clear the packet cache.
-		if now-s.clientAliveTime.oldest() < (kAliveTimeCap+1)*intervalTimeMilli {
-			if pktCache := s.client.pktCache.Load(); pktCache != nil {
-				totalSize, totalCount := pktCache.clearCache()
-				if enableDebugLogging && (totalSize > 0 || totalCount > 0) {
-					debug("drop packet cache count [%d] size [%d]", totalCount, totalSize)
-				}
-			}
-			s.pendingClearPktCache = false
-		}
-	}
+	s.clientAliveTime.Store(now)
 
 	return s.sendBusMessage("alive", msg)
 }

@@ -36,8 +36,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/trzsz/kcp-go/v5"
 	"github.com/trzsz/smux"
-	"github.com/xtaci/kcp-go/v5"
 )
 
 func newTestKcpConfig(t *testing.T) (*UdpClientOptions, []byte, []byte) {
@@ -111,7 +111,7 @@ func TestKCP_PassSaltValidation(t *testing.T) {
 		for {
 			n, err := stream.Read(buf)
 			if err != nil {
-				if isClosedError(err) {
+				if IsClosedError(err) {
 					return
 				}
 				serverErrCh <- fmt.Errorf("server read failed: %w", err)
@@ -252,7 +252,7 @@ func TestKCP_OOB(t *testing.T) {
 		for {
 			n, err := stream.Read(buf)
 			if err != nil {
-				if isClosedError(err) {
+				if IsClosedError(err) {
 					return
 				}
 				serverErrCh <- fmt.Errorf("server read failed: %w", err)

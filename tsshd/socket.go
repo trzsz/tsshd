@@ -68,7 +68,7 @@ func startSocketServer(serverInfo *ServerInfo) {
 	for {
 		conn, err := listener.Accept()
 		if err != nil {
-			if isClosedError(err) {
+			if IsClosedError(err) {
 				return
 			}
 			warning("socket server accept failed: %v", err)
