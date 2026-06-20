@@ -198,7 +198,8 @@ func (p *clientProxy) renewTransportPath(proxyClient *SshUdpClient, connectTimeo
 	return nil
 }
 
-func (p *clientProxy) renewTcpPath(proxyClient *SshUdpClient, connectTimeout time.Duration) (conn *serverConnHolder, err error) {
+func (p *clientProxy) renewTcpPath(proxyClient *SshUdpClient, connectTimeout time.Duration) (*serverConnHolder, error) {
+	var conn *serverConnHolder
 	var setReadDeadline func(t time.Time) error
 	if proxyClient != nil {
 		tcpConn, err := proxyClient.DialTimeout(p.serverNet, p.serverAddr, connectTimeout)
@@ -255,7 +256,8 @@ func (p *clientProxy) renewTcpPath(proxyClient *SshUdpClient, connectTimeout tim
 	return conn, nil
 }
 
-func (p *clientProxy) renewUdpPath(proxyClient *SshUdpClient, connectTimeout time.Duration) (conn *serverConnHolder, err error) {
+func (p *clientProxy) renewUdpPath(proxyClient *SshUdpClient, connectTimeout time.Duration) (*serverConnHolder, error) {
+	var conn *serverConnHolder
 	if proxyClient != nil {
 		udpConn, err := proxyClient.DialUDP(p.serverNet, p.serverAddr, connectTimeout)
 		if err != nil {

@@ -379,7 +379,7 @@ func listenOnFreePort(args *tsshdArgs) (frontendConnection, int, error) {
 	return nil, 0, fmt.Errorf("listen udp on [%s] failed", tsshdPort)
 }
 
-func udpListenOnPort(addrs []*net.UDPAddr, port int) (fc frontendConnection, err error) {
+func udpListenOnPort(addrs []*net.UDPAddr, port int) (_ frontendConnection, err error) {
 	var connList []*net.UDPConn
 	defer func() {
 		if err != nil {
@@ -400,7 +400,7 @@ func udpListenOnPort(addrs []*net.UDPAddr, port int) (fc frontendConnection, err
 	return &udpFrontendConn{connList: connList}, nil
 }
 
-func tcpListenOnPort(addrs []*net.UDPAddr, port int) (fc frontendConnection, err error) {
+func tcpListenOnPort(addrs []*net.UDPAddr, port int) (_ frontendConnection, err error) {
 	var listenerList []*net.TCPListener
 	defer func() {
 		if err != nil {

@@ -146,15 +146,17 @@ func NewSshUdpClient(opts *UdpClientOptions) (udpClient *SshUdpClient, err error
 	defer func() {
 		if err != nil {
 			_ = udpClient.Close()
+			udpClient = nil
 		}
 	}()
 
 	udpClient.clientProxy, err = startClientProxy(udpClient, opts)
 	if err != nil {
-		return nil, err
+		return
 	}
 	beginTime := time.Now()
-	if err := udpClient.clientProxy.renewTransportPath(opts.ProxyClient, opts.ConnectTimeout); err != nil {
+	err = udpClient.clientProxy.renewTransportPath(opts.ProxyClient, opts.ConnectTimeout)
+	if err != nil {
 		if opts.ConnectTimeout > 2*time.Second && time.Since(beginTime) > (opts.ConnectTimeout-time.Second) {
 			net := "UDP"
 			if opts.ServerInfo.ProxyMode == kProxyModeTCP {
@@ -164,15 +166,15 @@ func NewSshUdpClient(opts *UdpClientOptions) (udpClient *SshUdpClient, err error
 			if pos := strings.LastIndex(opts.TsshdAddr, ":"); pos >= 0 {
 				port = opts.TsshdAddr[pos+1:]
 			}
-			return nil, fmt.Errorf("%v\r\n%s", err, fmt.Sprintf(
+			err = fmt.Errorf("%v\r\n%s", err, fmt.Sprintf(
 				"\033[0;36mHint:\033[0m This may be caused by a firewall blocking the %s port (%s) that tsshd is listening on.", net, port))
 		}
-		return nil, err
+		return
 	}
 
 	udpClient.protoClient, err = newProtoClient(opts, udpClient)
 	if err != nil {
-		return nil, err
+		return
 	}
 
 	if udpClient.enableDebugging {
@@ -192,28 +194,31 @@ func NewSshUdpClient(opts *UdpClientOptions) (udpClient *SshUdpClient, err error
 	}
 	udpClient.activeChecker.onTimeout(udpClient.tryToReconnect)
 
-	busStream, err := doWithTimeout(func() (Stream, error) {
-		return udpClient.newStream("bus")
-	}, opts.ConnectTimeout)
+	busStream, err := doWithTimeout(func() (Stream, error) { return udpClient.newStream("bus") }, opts.ConnectTimeout)
 	if err != nil {
-		return nil, fmt.Errorf("new bus stream failed: %v", err)
+		err = fmt.Errorf("new bus stream failed: %v", err)
+		return
 	}
 
-	if err := sendMessage(busStream, busMessage{
+	err = sendMessage(busStream, busMessage{
 		ClientVer:        kTsshdVersion,
 		ProtoVer:         udpClient.protoVersion,
 		SessionName:      opts.SessionName,
 		AliveTimeout:     opts.AliveTimeout,
 		IntervalTime:     opts.IntervalTime,
-		HeartbeatTimeout: opts.HeartbeatTimeout}); err != nil {
+		HeartbeatTimeout: opts.HeartbeatTimeout})
+	if err != nil {
 		_ = busStream.Close()
-		return nil, fmt.Errorf("send bus message failed: %w", err)
+		err = fmt.Errorf("send bus message failed: %w", err)
+		return
 	}
 
 	var resp busResponse
-	if err := recvResponse(busStream, &resp); err != nil {
+	err = recvResponse(busStream, &resp)
+	if err != nil {
 		_ = busStream.Close()
-		return nil, fmt.Errorf("bus stream init failed: %v", err)
+		err = fmt.Errorf("bus stream init failed: %v", err)
+		return
 	}
 	udpClient.debug("bus response next session id: %d", resp.NextSessionID)
 	udpClient.sessionID.Store(resp.NextSessionID)
@@ -224,7 +229,7 @@ func NewSshUdpClient(opts *UdpClientOptions) (udpClient *SshUdpClient, err error
 	udpClient.activeAckChan = make(chan int64, 1)
 	go udpClient.keepAlive(opts.IntervalTime)
 
-	return udpClient, nil
+	return
 }
 
 func (c *SshUdpClient) debug(format string, a ...any) {
@@ -257,7 +262,7 @@ func (c *SshUdpClient) Wait() error {
 // notify the server to exit, and finally closes the underlying transport stream.
 func (c *SshUdpClient) Close() (err error) {
 	if !c.closed.CompareAndSwap(false, true) {
-		return nil
+		return
 	}
 
 	if c.busStream != nil && !c.detached.Load() {
