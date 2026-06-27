@@ -93,10 +93,10 @@ func (p *tsshdPty) GetExitCode() int {
 }
 
 func (p *tsshdPty) Resize(cols, rows int) error {
-	if cols < 2 || rows < 1 {
+	if cols < 1 || rows < 1 {
 		return fmt.Errorf("terminal size (%d, %d) is too small", cols, rows)
 	}
-	return p.spty.Resize(cols-1, rows)
+	return p.spty.Resize(cols, rows)
 }
 
 func (p *tsshdPty) Redraw() error {
@@ -111,7 +111,7 @@ func newTsshdPty(cmd *exec.Cmd, cols, rows int) (*tsshdPty, error) {
 		}
 		cmdLine.WriteString(windows.EscapeArg(arg))
 	}
-	cpty, err := conpty.Start(cmdLine.String(), conpty.ConPtyDimensions(cols-1, rows), conpty.ConPtyEnv(cmd.Env))
+	cpty, err := conpty.Start(cmdLine.String(), conpty.ConPtyDimensions(cols, rows), conpty.ConPtyEnv(cmd.Env))
 	if err != nil {
 		return nil, err
 	}
