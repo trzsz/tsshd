@@ -78,6 +78,7 @@ type SshUdpClient struct {
 	sessionMap       map[uint64]*SshUdpSession
 	channelMutex     sync.Mutex
 	channelMap       map[string]chan ssh.NewChannel
+	rttCallback      func(int64)
 	quitCallback     func(string)
 	discardCallback  func([]byte, uint64, uint64)
 	enableDebugging  bool
@@ -109,6 +110,7 @@ type UdpClientOptions struct {
 	HeartbeatTimeout time.Duration
 	DebugFunc        func(int64, string)
 	WarningFunc      func(string)
+	RttCallback      func(rtt int64)
 	QuitCallback     func(reason string)
 	DiscardCallback  func(discardedInput []byte, discardedOutputLines, discardedOutputBytes uint64)
 }
@@ -135,6 +137,7 @@ func NewSshUdpClient(opts *UdpClientOptions) (udpClient *SshUdpClient, err error
 		channelMap:      make(map[string]chan ssh.NewChannel),
 		intervalTime:    opts.IntervalTime,
 		connectTimeout:  opts.ConnectTimeout,
+		rttCallback:     opts.RttCallback,
 		quitCallback:    opts.QuitCallback,
 		discardCallback: opts.DiscardCallback,
 		enableDebugging: opts.EnableDebugging,
@@ -637,6 +640,10 @@ func (c *SshUdpClient) keepAlive(intervalTime time.Duration) {
 		}
 
 		ackTime := <-c.activeAckChan
+
+		if c.rttCallback != nil {
+			go c.rttCallback(time.Now().UnixMilli() - ackTime)
+		}
 
 		if c.enableDebugging {
 			timeout := c.activeChecker.isTimeout()
