@@ -86,6 +86,17 @@ func (p *tsshdPty) Redraw() error {
 	return nil
 }
 
+func (p *tsshdPty) getPgid() (int, error) {
+	pgid, err := unix.IoctlGetInt(int(p.ptmx.Fd()), unix.TIOCGPGRP)
+	if err != nil {
+		return 0, fmt.Errorf("get foreground process group failed: %v", err)
+	}
+	if pgid <= 0 {
+		return 0, fmt.Errorf("invalid pgid (no foreground process): %d", pgid)
+	}
+	return pgid, nil
+}
+
 func newTsshdPty(cmd *exec.Cmd, cols, rows int) (*tsshdPty, error) {
 	ptmx, err := pty.StartWithSize(cmd, &pty.Winsize{Cols: uint16(cols), Rows: uint16(rows)})
 	if err != nil {
@@ -294,4 +305,96 @@ func getSocketPath(pid int) (string, error) {
 
 func connectSocket(path string) (net.Conn, error) {
 	return net.DialTimeout("unix", path, 1*time.Second)
+}
+
+func getProcInfos() (map[int]*procInfo, error) {
+	cmd := exec.Command("ps", "-eo", "stat,pid,ppid,pgid,comm")
+	output, err := cmd.Output()
+	if err != nil {
+		return nil, fmt.Errorf("ps command failed: %v", err)
+	}
+
+	lines := strings.Split(strings.TrimSpace(string(output)), "\n")
+	if len(lines) <= 1 {
+		return nil, fmt.Errorf("no process found")
+	}
+
+	procs := make(map[int]*procInfo)
+
+	for i := 1; i < len(lines); i++ { // skip the header line.
+		fields := strings.Fields(lines[i])
+		if len(fields) < 5 {
+			continue
+		}
+
+		if stat := fields[0]; strings.HasPrefix(stat, "Z") {
+			continue
+		}
+		pid, err := strconv.Atoi(fields[1])
+		if err != nil {
+			continue
+		}
+		ppid, err := strconv.Atoi(fields[2])
+		if err != nil {
+			continue
+		}
+		pgid, err := strconv.Atoi(fields[3])
+		if err != nil {
+			continue
+		}
+		// join the remaining fields for robustness.
+		name := strings.Join(fields[4:], " ")
+
+		procs[pid] = &procInfo{
+			pid:  pid,
+			ppid: ppid,
+			pgid: pgid,
+			name: name,
+		}
+	}
+
+	return procs, nil
+}
+
+func getForegroundProcess(pgid int) (string, error) {
+	procs, err := getProcInfos()
+	if err != nil {
+		return "", err
+	}
+
+	procs = findAllDescendants(procs, os.Getpid())
+
+	groupPgid := pgid
+	if groupPgid == 0 {
+		for _, p := range procs {
+			if p.pgid > groupPgid {
+				groupPgid = p.pgid
+			}
+		}
+	}
+
+	for _, p := range procs {
+		if p.pgid != groupPgid {
+			delete(procs, p.pid)
+		}
+	}
+
+	leaves := findLeafProcesses(procs)
+
+	var best *procInfo
+	for _, p := range leaves {
+		if best == nil {
+			best = p
+			continue
+		}
+		if p.pid < best.pid {
+			best = p
+		}
+	}
+
+	if best != nil {
+		return best.name, nil
+	}
+
+	return "", fmt.Errorf("no leaf process")
 }

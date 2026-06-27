@@ -515,3 +515,55 @@ func isDirExist(path string) bool {
 	}
 	return stat.IsDir()
 }
+
+type procInfo struct {
+	pid  int
+	ppid int
+	pgid int
+	name string
+}
+
+func findAllDescendants(procs map[int]*procInfo, rootPid int) map[int]*procInfo {
+	childrenMap := make(map[int][]int)
+	for _, p := range procs {
+		childrenMap[p.ppid] = append(childrenMap[p.ppid], p.pid)
+	}
+
+	descendants := make(map[int]*procInfo)
+
+	var queue []int
+	if children, ok := childrenMap[rootPid]; ok {
+		queue = append(queue, children...)
+	}
+
+	for len(queue) > 0 {
+		currPid := queue[0]
+		queue = queue[1:]
+
+		if p, ok := procs[currPid]; ok {
+			descendants[currPid] = p
+
+			if children, ok := childrenMap[currPid]; ok {
+				queue = append(queue, children...)
+			}
+		}
+	}
+
+	return descendants
+}
+
+func findLeafProcesses(procs map[int]*procInfo) []*procInfo {
+	hasChildren := make(map[int]bool)
+	for _, p := range procs {
+		hasChildren[p.ppid] = true
+	}
+
+	var leaves []*procInfo
+	for _, p := range procs {
+		if !hasChildren[p.pid] {
+			leaves = append(leaves, p)
+		}
+	}
+
+	return leaves
+}

@@ -122,6 +122,22 @@ func handleInfoRequest(conn net.Conn) error {
 			title = sess.screenObj.Title
 			sess.screenMu.Unlock()
 		}
+
+		if title == "" {
+			var pgid int
+			var err error
+			if sess.pty != nil {
+				pgid, err = sess.pty.getPgid()
+				if err != nil {
+					debug("get pgid failed: %v", err)
+				}
+			}
+			title, err = getForegroundProcess(pgid)
+			if err != nil {
+				debug("get foreground process failed: %v", err)
+			}
+		}
+
 		info.Sessions = append(info.Sessions, SessionInfo{ID: sess.id, Title: title})
 	}
 
