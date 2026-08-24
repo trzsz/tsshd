@@ -388,6 +388,8 @@ func (c *sessionContext) Close() {
 	delete(sessionMap, c.id)
 	sessionMutex.Unlock()
 
+	c.clientChecker.Close()
+
 	code := -1
 	if c.mwSess != nil {
 		if exitCode := c.mwSess.exitCode.Load(); exitCode != nil {
@@ -418,6 +420,13 @@ func (c *sessionContext) Close() {
 			_ = c.cmd.Process.Kill()
 			debug("session [%d] cmd killed", c.id)
 		}
+	}
+
+	if c.ioStream != nil {
+		_ = c.ioStream.Close()
+	}
+	if c.errStream != nil {
+		_ = c.errStream.Close()
 	}
 }
 

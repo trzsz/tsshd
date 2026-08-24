@@ -268,11 +268,12 @@ func (s *replaceableStream) RemoteAddr() net.Addr {
 }
 
 type replaceableTimeoutChecker struct {
-	mu        sync.Mutex
-	cancel    chan struct{}
-	checker   *timeoutChecker
-	gen       uint64
-	callbacks []func()
+	mu            sync.Mutex
+	cancel        chan struct{}
+	checker       *timeoutChecker
+	gen           uint64
+	callbacks     []func()
+	parentCancels []func()
 }
 
 func newReplaceableTimeoutChecker(checker *timeoutChecker) *replaceableTimeoutChecker {
@@ -287,8 +288,16 @@ func (c *replaceableTimeoutChecker) swap(newChecker *timeoutChecker) {
 	c.cancel = make(chan struct{})
 
 	oldChecker := c.checker
-	c.checker = newChecker
+	if oldChecker != nil {
+		for i, cancel := range c.parentCancels {
+			if cancel != nil {
+				cancel()
+				c.parentCancels[i] = nil
+			}
+		}
+	}
 
+	c.checker = newChecker
 	c.gen++
 
 	if newChecker == nil {
@@ -297,13 +306,29 @@ func (c *replaceableTimeoutChecker) swap(newChecker *timeoutChecker) {
 
 	if oldChecker == nil && !newChecker.isTimeout() {
 		for _, cb := range c.callbacks {
-			go cb()
+			if cb != nil {
+				go cb()
+			}
 		}
 	}
 
-	for _, cb := range c.callbacks {
-		newChecker.onReconnected(c.wrapCallback(cb, c.gen))
+	for i, cb := range c.callbacks {
+		if cb != nil {
+			c.parentCancels[i] = newChecker.onReconnected(c.wrapCallback(cb, c.gen))
+		}
 	}
+}
+
+func (c *replaceableTimeoutChecker) Close() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	for i, cancel := range c.parentCancels {
+		if cancel != nil {
+			cancel()
+			c.parentCancels[i] = nil
+		}
+	}
+	c.callbacks = nil
 }
 
 func (c *replaceableTimeoutChecker) isTimeout() bool {
@@ -353,15 +378,41 @@ func (c *replaceableTimeoutChecker) waitUntilReconnected() error {
 	}
 }
 
-func (c *replaceableTimeoutChecker) onReconnected(cb func()) {
+func (c *replaceableTimeoutChecker) onReconnected(cb func()) func() {
 	c.mu.Lock()
 	checker, gen := c.checker, c.gen
-	c.callbacks = append(c.callbacks, cb)
-	c.mu.Unlock()
 
+	var myIdx int = -1
+	for i, existing := range c.callbacks {
+		if existing == nil {
+			myIdx = i
+			c.callbacks[i] = cb
+			break
+		}
+	}
+	if myIdx == -1 {
+		myIdx = len(c.callbacks)
+		c.callbacks = append(c.callbacks, cb)
+		c.parentCancels = append(c.parentCancels, nil)
+	}
+
+	var cancelParent func()
 	if checker != nil {
 		wrapper := c.wrapCallback(cb, gen)
-		checker.onReconnected(wrapper)
+		cancelParent = checker.onReconnected(wrapper)
+		c.parentCancels[myIdx] = cancelParent
+	}
+	c.mu.Unlock()
+
+	return func() {
+		c.mu.Lock()
+		c.callbacks[myIdx] = nil
+		cancelP := c.parentCancels[myIdx]
+		c.parentCancels[myIdx] = nil
+		c.mu.Unlock()
+		if cancelP != nil {
+			cancelP()
+		}
 	}
 }
 

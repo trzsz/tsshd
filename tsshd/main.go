@@ -324,6 +324,8 @@ func RunMain(opts ...Option) (int, error) {
 
 	_ = os.Stdout.Close()
 
+
+
 	// start background liveness watchdog
 	go monitorServerLiveness(args)
 

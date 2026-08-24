@@ -352,23 +352,57 @@ func (tc *timeoutChecker) updateTime(msec int64) {
 	}
 }
 
-func (tc *timeoutChecker) onTimeout(cb func()) {
+func (tc *timeoutChecker) onTimeout(cb func()) func() {
 	tc.mutex.Lock()
 	defer tc.mutex.Unlock()
+	for i, existing := range tc.timeoutCallbacks {
+		if existing == nil {
+			tc.timeoutCallbacks[i] = cb
+			return func() {
+				tc.mutex.Lock()
+				tc.timeoutCallbacks[i] = nil
+				tc.mutex.Unlock()
+			}
+		}
+	}
+	i := len(tc.timeoutCallbacks)
 	tc.timeoutCallbacks = append(tc.timeoutCallbacks, cb)
+	return func() {
+		tc.mutex.Lock()
+		tc.timeoutCallbacks[i] = nil
+		tc.mutex.Unlock()
+	}
 }
 
-func (tc *timeoutChecker) onReconnected(cb func()) {
+func (tc *timeoutChecker) onReconnected(cb func()) func() {
 	tc.mutex.Lock()
 	defer tc.mutex.Unlock()
+	for i, existing := range tc.reconnectedCallbacks {
+		if existing == nil {
+			tc.reconnectedCallbacks[i] = cb
+			return func() {
+				tc.mutex.Lock()
+				tc.reconnectedCallbacks[i] = nil
+				tc.mutex.Unlock()
+			}
+		}
+	}
+	i := len(tc.reconnectedCallbacks)
 	tc.reconnectedCallbacks = append(tc.reconnectedCallbacks, cb)
+	return func() {
+		tc.mutex.Lock()
+		tc.reconnectedCallbacks[i] = nil
+		tc.mutex.Unlock()
+	}
 }
 
 func (tc *timeoutChecker) notifyTimeout() {
 	tc.mutex.Lock()
 	defer tc.mutex.Unlock()
 	for _, cb := range tc.timeoutCallbacks {
-		go cb()
+		if cb != nil {
+			go cb()
+		}
 	}
 }
 
@@ -376,7 +410,9 @@ func (tc *timeoutChecker) notifyReconnected() {
 	tc.mutex.Lock()
 	defer tc.mutex.Unlock()
 	for _, cb := range tc.reconnectedCallbacks {
-		go cb()
+		if cb != nil {
+			go cb()
+		}
 	}
 }
 
