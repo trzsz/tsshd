@@ -329,6 +329,7 @@ func (c *replaceableTimeoutChecker) Close() {
 		}
 	}
 	c.callbacks = nil
+	c.parentCancels = nil
 }
 
 func (c *replaceableTimeoutChecker) isTimeout() bool {
@@ -406,9 +407,14 @@ func (c *replaceableTimeoutChecker) onReconnected(cb func()) func() {
 
 	return func() {
 		c.mu.Lock()
-		c.callbacks[myIdx] = nil
-		cancelP := c.parentCancels[myIdx]
-		c.parentCancels[myIdx] = nil
+		if c.callbacks != nil {
+			c.callbacks[myIdx] = nil
+		}
+		var cancelP func()
+		if c.parentCancels != nil {
+			cancelP = c.parentCancels[myIdx]
+			c.parentCancels[myIdx] = nil
+		}
 		c.mu.Unlock()
 		if cancelP != nil {
 			cancelP()
