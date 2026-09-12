@@ -177,7 +177,7 @@ tssh 和 tsshd 的工作方式与 ssh 完全相同，没有计划支持本地回
 
   </details>
 
-- 用 Go 直接安装（ 要求 go 1.25 以上 ）
+- 用 Go 直接安装（ 要求 go 1.26 以上 ）
 
   <details><summary><code>go install github.com/trzsz/tsshd/cmd/tsshd@latest</code></summary>
 
@@ -193,7 +193,7 @@ tssh 和 tsshd 的工作方式与 ssh 完全相同，没有计划支持本地回
 
   </details>
 
-- 用 Go 自己编译（ 要求 go 1.25 以上 ）
+- 用 Go 自己编译（ 要求 go 1.26 以上 ）
 
   <details><summary><code>sudo make install</code></summary>
 

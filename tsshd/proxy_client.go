@@ -194,6 +194,7 @@ func (p *clientProxy) renewTransportPath(proxyClient *SshUdpClient, connectTimeo
 	if proxyClient == nil && len(p.proxyCmds) > 0 && p.proxyMode != kProxyModeTCP {
 		return fmt.Errorf("proxy command only supports tcp proxy mode")
 	}
+	p.client.debug("tsshd server: network=%s, address=%s", p.serverNet, p.serverAddr)
 	if p.proxyMode == kProxyModeTCP {
 		conn, err = p.renewTcpPath(proxyClient, connectTimeout)
 	} else {

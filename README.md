@@ -177,7 +177,7 @@ tssh and tsshd works exactly like ssh, there are no plans to support local echo 
 
   </details>
 
-- Install with Go ( Requires go 1.25 or later )
+- Install with Go ( Requires go 1.26 or later )
 
   <details><summary><code>go install github.com/trzsz/tsshd/cmd/tsshd@latest</code></summary>
 
@@ -193,7 +193,7 @@ tssh and tsshd works exactly like ssh, there are no plans to support local echo 
 
   </details>
 
-- Build from source ( Requires go 1.25 or later )
+- Build from source ( Requires go 1.26 or later )
 
   <details><summary><code>sudo make install</code></summary>
 

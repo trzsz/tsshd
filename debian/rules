@@ -9,7 +9,7 @@ override_dh_auto_configure:
 	mkdir -p $(HOME)
 
 %:
-	PATH="/usr/lib/go-1.25/bin:${PATH}" dh $@
+	PATH="/usr/lib/go-1.26/bin:${PATH}" dh $@
 
 override_dh_auto_clean:
 	dh_auto_clean
