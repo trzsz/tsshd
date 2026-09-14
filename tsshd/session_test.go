@@ -232,20 +232,14 @@ func TestSessionOutputForwardedBeforeClose(t *testing.T) {
 	}
 }
 
-func TestSessionOutputDescendantHoldsPipes(t *testing.T) {
-	setSessionOutputTimeouts(t, 50*time.Millisecond, 2*time.Second)
-
-	stdoutReader, stdoutWriter, err := os.Pipe()
+// newPipeTestSession leaves the parent writer open to model inherited output.
+func newPipeTestSession(t *testing.T) (*sessionContext, *os.File, *os.File) {
+	t.Helper()
+	reader, writer, err := os.Pipe()
 	require.NoError(t, err)
-	t.Cleanup(func() { _ = stdoutWriter.Close() })
-
-	stderrReader, stderrWriter, err := os.Pipe()
-	require.NoError(t, err)
-	t.Cleanup(func() { _ = stderrWriter.Close() })
-
+	t.Cleanup(func() { _ = reader.Close(); _ = writer.Close() })
 	sess, cleanup := newTestSessionContext(false, false, maxPendingOutputLines)
 	t.Cleanup(cleanup)
-
 	sess.id = 1
 	sess.cmd = exec.Command("true")
 	if runtime.GOOS == "windows" {
@@ -253,10 +247,21 @@ func TestSessionOutputDescendantHoldsPipes(t *testing.T) {
 	}
 	require.NoError(t, sess.cmd.Start())
 	sess.started = true
-
-	sess.stdout = newSessionOutputPipe(stdoutReader)
-	sess.stderr = newSessionOutputPipe(stderrReader)
+	sess.stdout = newSessionOutputPipe(reader)
 	sess.outDone = make(chan struct{})
+	return sess, reader, writer
+}
+
+func TestSessionOutputDescendantHoldsPipes(t *testing.T) {
+	setSessionOutputTimeouts(t, 50*time.Millisecond, 2*time.Second)
+
+	sess, stdoutReader, _ := newPipeTestSession(t)
+
+	stderrReader, stderrWriter, err := os.Pipe()
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = stderrWriter.Close() })
+
+	sess.stderr = newSessionOutputPipe(stderrReader)
 
 	stream := &mockStream{}
 	sess.forwardIO(&sshUdpServer{args: &tsshdArgs{}}, stream, &discardStream{})
@@ -283,23 +288,7 @@ func TestSessionOutputDrainPolicy(t *testing.T) {
 	t.Run("SustainedOutputExceedingIdle", func(t *testing.T) {
 		setSessionOutputTimeouts(t, 60*time.Millisecond, 2*time.Second)
 
-		stdoutReader, stdoutWriter, err := os.Pipe()
-		require.NoError(t, err)
-		t.Cleanup(func() { _ = stdoutWriter.Close() })
-
-		sess, cleanup := newTestSessionContext(false, false, maxPendingOutputLines)
-		t.Cleanup(cleanup)
-
-		sess.id = 1
-		sess.cmd = exec.Command("true")
-		if runtime.GOOS == "windows" {
-			sess.cmd = exec.Command("cmd", "/c", "exit 0")
-		}
-		require.NoError(t, sess.cmd.Start())
-		sess.started = true
-
-		sess.stdout = newSessionOutputPipe(stdoutReader)
-		sess.outDone = make(chan struct{})
+		sess, _, stdoutWriter := newPipeTestSession(t)
 
 		stream := &mockStream{}
 		sess.forwardIO(&sshUdpServer{args: &tsshdArgs{}}, stream, &discardStream{})
@@ -345,23 +334,7 @@ func TestSessionOutputDrainPolicy(t *testing.T) {
 				gate := make(chan struct{})
 				stream := newGatedStream(gate)
 
-				stdoutReader, stdoutWriter, err := os.Pipe()
-				require.NoError(t, err)
-				t.Cleanup(func() { _ = stdoutWriter.Close() })
-
-				sess, cleanup := newTestSessionContext(false, false, maxPendingOutputLines)
-				t.Cleanup(cleanup)
-
-				sess.id = 1
-				sess.cmd = exec.Command("true")
-				if runtime.GOOS == "windows" {
-					sess.cmd = exec.Command("cmd", "/c", "exit 0")
-				}
-				require.NoError(t, sess.cmd.Start())
-				sess.started = true
-
-				sess.stdout = newSessionOutputPipe(stdoutReader)
-				sess.outDone = make(chan struct{})
+				sess, _, stdoutWriter := newPipeTestSession(t)
 
 				server := &sshUdpServer{args: &tsshdArgs{Attachable: true}}
 				server.keepPendingOutput.Store(disconnected)

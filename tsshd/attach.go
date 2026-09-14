@@ -49,20 +49,17 @@ func finishStream(stream Stream) error {
 	if stream == nil {
 		return nil
 	}
-	var firstErr error
-	if err := stream.CloseRead(); err != nil && firstErr == nil {
-		firstErr = err
-	}
-	var err error
+	err := stream.CloseRead()
+	var closeErr error
 	if stderr, ok := stream.(*stderrStream); ok {
-		err = stderr.Close()
+		closeErr = stderr.Close()
 	} else {
-		err = stream.CloseWrite()
+		closeErr = stream.CloseWrite()
 	}
-	if err != nil && firstErr == nil {
-		firstErr = err
+	if err == nil {
+		err = closeErr
 	}
-	return firstErr
+	return err
 }
 
 var attachMutex sync.Mutex
@@ -83,10 +80,6 @@ type interruptibleStream struct {
 
 func (s *interruptibleStream) Close() error {
 	return s.close(true)
-}
-
-func (s *interruptibleStream) finish() error {
-	return s.close(false)
 }
 
 func (s *interruptibleStream) close(abort bool) error {

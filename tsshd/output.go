@@ -425,26 +425,14 @@ out:
 				}
 				pos := bytes.IndexByte(buf, '\n')
 				if pos < 0 && f.noNewLineCount < 3 {
-					select {
-					case f.writeBufCh <- buf:
-					case <-f.ctx.Done():
-						return
-					}
+					f.writeBufCh <- buf
 					f.noNewLineCount++
 					break out
 				}
 				if pos < 0 {
-					select {
-					case f.writeBufCh <- buf:
-					case <-f.ctx.Done():
-						return
-					}
+					f.writeBufCh <- buf
 				} else {
-					select {
-					case f.writeBufCh <- buf[:pos+1]:
-					case <-f.ctx.Done():
-						return
-					}
+					f.writeBufCh <- buf[:pos+1]
 					left := buf[pos+1:]
 					if len(left) > 0 {
 						f.cacheOutput(left)
