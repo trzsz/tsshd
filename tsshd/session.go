@@ -115,6 +115,7 @@ type sessionContext struct {
 	pty            *tsshdPty
 	mwSess         *middlewareSession
 	outWG          sync.WaitGroup
+	outDone        chan struct{}
 	stdin          io.WriteCloser
 	stdout         io.ReadCloser
 	stderr         io.ReadCloser
@@ -180,15 +181,40 @@ func (c *sessionContext) StartCmd() error {
 	if c.stdin, err = c.cmd.StdinPipe(); err != nil {
 		return fmt.Errorf("cmd stdin pipe failed: %v", err)
 	}
-	if c.stdout, err = c.cmd.StdoutPipe(); err != nil {
+
+	// Do not use cmd.StdoutPipe and cmd.StderrPipe here. exec.Cmd.Wait closes the
+	// pipes that it created by itself, which discards the output that is still
+	// buffered in the pipes and has not been forwarded yet. Create the pipes by
+	// ourselves, then the remaining output can still be read and forwarded after
+	// the child process has exited, see sessionContext.Wait.
+	stdoutReader, stdoutWriter, err := os.Pipe()
+	if err != nil {
 		return fmt.Errorf("cmd stdout pipe failed: %v", err)
 	}
-	if c.stderr, err = c.cmd.StderrPipe(); err != nil {
+	stderrReader, stderrWriter, err := os.Pipe()
+	if err != nil {
+		_ = stdoutReader.Close()
+		_ = stdoutWriter.Close()
 		return fmt.Errorf("cmd stderr pipe failed: %v", err)
 	}
+
+	// The write sides are inherited by the child process, close the copies held
+	// by the parent process in all cases, otherwise the read sides won't reach
+	// EOF and the file descriptors are leaked when the command fails to start.
+	defer func() {
+		_ = stdoutWriter.Close()
+		_ = stderrWriter.Close()
+	}()
+
+	c.cmd.Stdout, c.cmd.Stderr = stdoutWriter, stderrWriter
+
 	if err := c.cmd.Start(); err != nil {
+		_ = stdoutReader.Close()
+		_ = stderrReader.Close()
 		return fmt.Errorf("start cmd %v failed: %v", c.cmd.Args, err)
 	}
+
+	c.stdout, c.stderr = stdoutReader, stderrReader
 	c.started = true
 	debug("session [%d] start cmd success", c.id)
 	return nil
@@ -328,7 +354,10 @@ func (c *sessionContext) forwardIO(server *sshUdpServer, ioStream, errStream Str
 
 	if c.stdout != nil {
 		c.outForwarder = c.newOutputForwarder("stdout", c.stdout, ioStream)
-		c.outWG.Go(func() { c.outForwarder.forward() })
+		c.outWG.Go(func() {
+			c.outForwarder.forward()
+			c.closeOutputPipe(c.stdout)
+		})
 	}
 
 	if server.args.Attachable {
@@ -341,11 +370,22 @@ func (c *sessionContext) forwardIO(server *sshUdpServer, ioStream, errStream Str
 		c.outWG.Go(func() {
 			c.errForwarder.forward()
 			_ = errStream.Close()
+			c.closeOutputPipe(c.stderr)
 		})
 	} else {
 		_ = errStream.Close()
 		debug("session [%d] stderr closed", c.id)
 	}
+
+	// Notify the session when the output has been forwarded completely, so that
+	// the output streams are closed after that, see sessionContext.finishOutput.
+	go func() {
+		c.outWG.Wait()
+		close(c.outDone)
+		if c.screenBuf != nil {
+			close(c.screenBuf)
+		}
+	}()
 }
 
 func (c *sessionContext) Wait() {
@@ -357,20 +397,10 @@ func (c *sessionContext) Wait() {
 		return
 	}
 
-	done := make(chan struct{})
-	go func() {
-		c.outWG.Wait() // wait for the output first to prevent cmd.Wait close output too early
-		close(done)
-		if c.screenBuf != nil {
-			close(c.screenBuf)
-		}
-	}()
-
-	select {
-	case <-done:
-	case <-time.After(time.Second):
-	}
-
+	// Wait for the child process to exit first. The stdout and stderr pipes are
+	// created by tsshd instead of exec.Cmd (see StartCmd), so waiting for the
+	// process does not close the pipes, and the output still buffered in the
+	// pipes can be forwarded after the process has exited.
 	if c.mwSess != nil {
 		_ = c.mwSess.Wait()
 	} else if c.pty != nil {
@@ -379,13 +409,74 @@ func (c *sessionContext) Wait() {
 		_ = c.cmd.Wait()
 	}
 
+	// Wait for the output to be forwarded, to avoid dropping the remaining
+	// buffered output when the session and its output pipes are closed.
+	// Tsshd keeps forwarding the output in the background even if this
+	// short wait times out, see sessionContext.finishOutput.
 	select {
-	case <-done:
-	case <-time.After(3 * time.Second):
+	case <-c.outDone:
+	case <-time.After(outputDrainTimeout):
 		warning("child process has exited, but output streams did not close in time")
 	}
 
 	debug("session [%d] wait completed", c.id)
+}
+
+// outputDrainTimeout is how long to wait for the output to be forwarded after
+// the child process has exited, before the session is closed.
+var outputDrainTimeout = 3 * time.Second
+
+// outputCloseGrace is the maximum time to keep forwarding the output after the
+// session has ended. It matches the grace period that sshUdpServer.handleStream
+// grants to the transport layer for delivering the last packets.
+var outputCloseGrace = time.Minute
+
+// closeOutputPipe closes the stdout or stderr pipe created in StartCmd, after
+// the output has been forwarded completely. The pty is shared by stdin, stdout
+// and stderr, so it is closed by tsshdPty.Close instead.
+func (c *sessionContext) closeOutputPipe(pipe io.ReadCloser) {
+	if c.pty != nil {
+		return
+	}
+	_ = pipe.Close()
+}
+
+// abortOutput closes the output pipes to unblock the output forwarders that are
+// still reading from them. It is called when the output can no longer be
+// forwarded, for example when a descendant process that inherited the pipes is
+// still holding them after the session has ended.
+func (c *sessionContext) abortOutput() {
+	if c.stdout != nil {
+		c.closeOutputPipe(c.stdout)
+	}
+	if c.stderr != nil {
+		c.closeOutputPipe(c.stderr)
+	}
+}
+
+// finishOutput keeps forwarding the output in the background until it is done,
+// then closes the output streams. The output that is still buffered when the
+// child process exits should not be dropped, since the client may still be able
+// to receive it, especially on a slow or unstable network.
+//
+// A descendant process that inherited the output pipes may keep them open for a
+// long time, so the pipes are closed to unblock the output forwarders after the
+// same grace period that the transport layer has, and the output streams are
+// closed even if the output has not been forwarded completely.
+func (c *sessionContext) finishOutput() {
+	select {
+	case <-c.outDone:
+	case <-time.After(outputCloseGrace):
+		warning("session [%d] output is not forwarded in time, closing the output pipes", c.id)
+		c.abortOutput()
+	}
+
+	if c.ioStream != nil {
+		_ = c.ioStream.Close()
+	}
+	if c.errStream != nil {
+		_ = c.errStream.Close()
+	}
 }
 
 func (c *sessionContext) Close() {
@@ -427,6 +518,11 @@ func (c *sessionContext) Close() {
 			_ = c.cmd.Process.Kill()
 			debug("session [%d] cmd killed", c.id)
 		}
+
+		// Do not close the output streams while the remaining output is still
+		// being forwarded, otherwise the output is dropped, see finishOutput.
+		go c.finishOutput()
+		return
 	}
 
 	if c.ioStream != nil {
@@ -564,8 +660,17 @@ func (s *sshUdpServer) handleSessionEvent(stream Stream) {
 		errID = msg.ErrID
 	}
 	var errStream Stream
+	stderrOwned := false
 	if es := s.takeStderrStream(errID); es != nil {
-		defer func() { _ = es.Close() }()
+		// The session closes the stderr stream after the stderr output has been
+		// forwarded completely, see sessionContext.forwardIO. Close it here only
+		// if the session is not going to take over the stderr stream, otherwise
+		// the client would see the end of stderr too early.
+		defer func() {
+			if !stderrOwned {
+				_ = es.Close()
+			}
+		}()
 		errStream = es
 	} else {
 		errStream = &discardStream{}
@@ -577,6 +682,7 @@ func (s *sshUdpServer) handleSessionEvent(stream Stream) {
 			sendErrorCode(stream, code, fmt.Sprintf("attach to session [%d] failed: %v", msg.ID, err))
 			return
 		}
+		stderrOwned = true
 
 		sess.cancellableWait()
 		return
@@ -616,6 +722,7 @@ func (s *sshUdpServer) handleSessionEvent(stream Stream) {
 	}
 
 	sess.forwardIO(s, stream, errStream)
+	stderrOwned = true
 
 	if s.args.Attachable {
 		// Each session is started only once since duplicate session IDs are rejected,
@@ -664,6 +771,7 @@ func newSessionContext(server *sshUdpServer, msg *startMessage) (*sessionContext
 		mwSess:        mwSess,
 		cols:          msg.Cols,
 		rows:          msg.Rows,
+		outDone:       make(chan struct{}),
 		clientChecker: newReplaceableTimeoutChecker(server.clientChecker),
 	}
 	sess.server.Store(server)
