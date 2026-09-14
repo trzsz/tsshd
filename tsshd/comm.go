@@ -316,7 +316,16 @@ func (tc *timeoutChecker) waitReconnect(ctx context.Context) error {
 
 		ch := tc.reconnectedCh.Load()
 		for ch == nil {
-			time.Sleep(10 * time.Millisecond)
+			timer := time.NewTimer(10 * time.Millisecond)
+			select {
+			case <-timer.C:
+			case <-tc.closeChan:
+				timer.Stop()
+				return fmt.Errorf("timeout closed")
+			case <-ctx.Done():
+				timer.Stop()
+				return ctx.Err()
+			}
 			ch = tc.reconnectedCh.Load()
 			if !tc.isTimeout() {
 				return nil

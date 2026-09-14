@@ -26,6 +26,7 @@ package tsshd
 
 import (
 	"bytes"
+	"context"
 	"fmt"
 	"io"
 	"sync"
@@ -126,13 +127,14 @@ type serverOutputForwarder struct {
 	sess   *sessionContext
 	reader io.Reader
 	stream Stream
+	ctx    context.Context
+	cancel context.CancelFunc
 
-	handleMutex sync.Mutex
-	returned    bool
-	writeError  atomic.Bool
-	done        chan struct{}
-	writeBufCh  chan []byte
-
+	handleMutex      sync.Mutex
+	returned         bool
+	writeError       atomic.Bool
+	done             chan struct{}
+	writeBufCh       chan []byte
 	cacheLines       [][]byte
 	tmuxOutputPrefix string
 
@@ -151,6 +153,12 @@ type serverOutputForwarder struct {
 
 	discardOutput atomic.Bool
 	discardMarker atomic.Pointer[[]byte]
+}
+
+func (f *serverOutputForwarder) abort() {
+	f.cancel()
+	f.writeError.Store(true)
+	_ = abortStream(f.stream)
 }
 
 func (f *serverOutputForwarder) writerLoop() {
@@ -240,6 +248,9 @@ func (f *serverOutputForwarder) flushOutput() {
 	}
 
 	for i := -1; i < len(f.cacheLines); i++ {
+		if f.ctx.Err() != nil {
+			return
+		}
 		var line []byte
 		if i < 0 {
 			if f.discardLines == 0 {
@@ -275,6 +286,9 @@ func (f *serverOutputForwarder) flushOutput() {
 				}
 				break out
 			default:
+				if f.ctx.Err() != nil {
+					return
+				}
 				if f.sess.clientChecker.isTimeout() {
 					if i > 0 {
 						f.cacheLines = f.cacheLines[i:]
@@ -284,7 +298,13 @@ func (f *serverOutputForwarder) flushOutput() {
 				if f.writeError.Load() {
 					return
 				}
-				time.Sleep(10 * time.Millisecond)
+				timer := time.NewTimer(10 * time.Millisecond)
+				select {
+				case <-timer.C:
+				case <-f.ctx.Done():
+					timer.Stop()
+					return
+				}
 			}
 		}
 	}
@@ -327,6 +347,9 @@ func (f *serverOutputForwarder) handleBuffer(buf []byte) {
 	f.handleMutex.Lock()
 	defer f.handleMutex.Unlock()
 
+	if f.ctx.Err() != nil {
+		return
+	}
 	// The client requested discarding all previous output.
 	// Clear any cached output on the server side and echo the marker
 	// back to the client so it can discard any already-delivered data.
@@ -381,13 +404,16 @@ func (f *serverOutputForwarder) handleBuffer(buf []byte) {
 
 out:
 	for {
+		if f.ctx.Err() != nil {
+			return
+		}
 		select {
 		case f.writeBufCh <- buf:
 			break out
 		default:
 			if f.sess.clientChecker.isTimeout() {
 				if f.sess.isKeepPendingOutput() {
-					if f.sess.clientChecker.waitUntilReconnected() != nil {
+					if f.sess.clientChecker.waitReconnect(f.ctx) != nil {
 						return
 					}
 					continue
@@ -399,28 +425,44 @@ out:
 				}
 				pos := bytes.IndexByte(buf, '\n')
 				if pos < 0 && f.noNewLineCount < 3 {
-					f.writeBufCh <- buf
+					select {
+					case f.writeBufCh <- buf:
+					case <-f.ctx.Done():
+						return
+					}
 					f.noNewLineCount++
 					break out
 				}
-
 				if pos < 0 {
-					f.writeBufCh <- buf
+					select {
+					case f.writeBufCh <- buf:
+					case <-f.ctx.Done():
+						return
+					}
 				} else {
-					f.writeBufCh <- buf[:pos+1]
+					select {
+					case f.writeBufCh <- buf[:pos+1]:
+					case <-f.ctx.Done():
+						return
+					}
 					left := buf[pos+1:]
 					if len(left) > 0 {
 						f.cacheOutput(left)
 					}
 				}
-
 				f.chHasNewLine = true
 				break out
 			}
 			if f.writeError.Load() {
 				return
 			}
-			time.Sleep(10 * time.Millisecond)
+			timer := time.NewTimer(10 * time.Millisecond)
+			select {
+			case <-timer.C:
+			case <-f.ctx.Done():
+				timer.Stop()
+				return
+			}
 		}
 	}
 
@@ -433,9 +475,16 @@ func (f *serverOutputForwarder) handleError() {
 	f.handleMutex.Lock()
 	defer f.handleMutex.Unlock()
 
+	if f.ctx.Err() != nil {
+		return
+	}
+
 	for len(f.cacheLines) > 0 && !f.writeError.Load() {
+		if f.ctx.Err() != nil {
+			return
+		}
 		if f.sess.clientChecker.isTimeout() {
-			if f.sess.clientChecker.waitUntilReconnected() != nil {
+			if f.sess.clientChecker.waitReconnect(f.ctx) != nil {
 				break
 			}
 		}
@@ -444,6 +493,7 @@ func (f *serverOutputForwarder) handleError() {
 }
 
 func (f *serverOutputForwarder) forward() {
+	defer f.cancel()
 	defer func() {
 		f.handleMutex.Lock()
 		f.returned = true
@@ -480,4 +530,85 @@ func (f *serverOutputForwarder) forward() {
 	}
 
 	debug("session [%d] %s completed", f.sess.id, f.name)
+}
+
+type sessionOutputPipe struct {
+	raw      io.ReadCloser
+	mu       sync.Mutex
+	reading  bool
+	idle     time.Duration
+	deadline time.Time
+	timer    *time.Timer
+}
+
+func newSessionOutputPipe(raw io.ReadCloser) *sessionOutputPipe {
+	return &sessionOutputPipe{raw: raw}
+}
+
+func (p *sessionOutputPipe) armIdleLocked() {
+	if p.idle <= 0 {
+		return
+	}
+	p.deadline = time.Now().Add(p.idle)
+	if p.timer == nil {
+		p.timer = time.AfterFunc(p.idle, p.onTimeout)
+	} else {
+		p.timer.Reset(p.idle)
+	}
+}
+
+func (p *sessionOutputPipe) beginDrain(idle time.Duration) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.idle = idle
+	if p.reading {
+		p.armIdleLocked()
+	}
+}
+
+func (p *sessionOutputPipe) onTimeout() {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if !p.reading || p.deadline.IsZero() {
+		return
+	}
+	now := time.Now()
+	if now.Before(p.deadline) {
+		p.timer.Reset(p.deadline.Sub(now))
+		return
+	}
+	p.reading = false
+	p.deadline = time.Time{}
+	_ = p.raw.Close()
+}
+
+func (p *sessionOutputPipe) Read(buf []byte) (int, error) {
+	p.mu.Lock()
+	p.reading = true
+	p.armIdleLocked()
+	raw := p.raw
+	p.mu.Unlock()
+
+	n, err := raw.Read(buf)
+
+	p.mu.Lock()
+	p.reading = false
+	p.deadline = time.Time{}
+	if p.timer != nil {
+		p.timer.Stop()
+	}
+	p.mu.Unlock()
+
+	return n, err
+}
+
+func (p *sessionOutputPipe) Close() error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.reading = false
+	p.deadline = time.Time{}
+	if p.timer != nil {
+		p.timer.Stop()
+	}
+	return p.raw.Close()
 }

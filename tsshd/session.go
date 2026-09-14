@@ -27,6 +27,7 @@ package tsshd
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"fmt"
 	"io"
 	"net"
@@ -116,6 +117,7 @@ type sessionContext struct {
 	mwSess         *middlewareSession
 	outWG          sync.WaitGroup
 	outDone        chan struct{}
+	outputDrained  atomic.Bool
 	stdin          io.WriteCloser
 	stdout         io.ReadCloser
 	stderr         io.ReadCloser
@@ -214,7 +216,8 @@ func (c *sessionContext) StartCmd() error {
 		return fmt.Errorf("start cmd %v failed: %v", c.cmd.Args, err)
 	}
 
-	c.stdout, c.stderr = stdoutReader, stderrReader
+	c.stdout = newSessionOutputPipe(stdoutReader)
+	c.stderr = newSessionOutputPipe(stderrReader)
 	c.started = true
 	debug("session [%d] start cmd success", c.id)
 	return nil
@@ -323,11 +326,14 @@ func (c *sessionContext) isKeepPendingOutput() bool {
 }
 
 func (c *sessionContext) newOutputForwarder(name string, reader io.Reader, stream Stream) *serverOutputForwarder {
+	ctx, cancel := context.WithCancel(context.Background())
 	return &serverOutputForwarder{
 		name:       name,
 		sess:       c,
 		reader:     reader,
 		stream:     stream,
+		ctx:        ctx,
+		cancel:     cancel,
 		done:       make(chan struct{}),
 		writeBufCh: make(chan []byte, 1),
 	}
@@ -369,16 +375,23 @@ func (c *sessionContext) forwardIO(server *sshUdpServer, ioStream, errStream Str
 		c.errForwarder = c.newOutputForwarder("stderr", c.stderr, errStream)
 		c.outWG.Go(func() {
 			c.errForwarder.forward()
-			_ = errStream.Close()
+			if c.errStream != nil {
+				_ = c.errStream.finish()
+			} else {
+				_ = errStream.Close()
+			}
 			c.closeOutputPipe(c.stderr)
 		})
 	} else {
-		_ = errStream.Close()
+		if c.errStream != nil {
+			_ = c.errStream.finish()
+		} else {
+			_ = errStream.Close()
+		}
 		debug("session [%d] stderr closed", c.id)
 	}
 
-	// Notify the session when the output has been forwarded completely, so that
-	// the output streams are closed after that, see sessionContext.finishOutput.
+	// Notify the session when the output has been forwarded completely.
 	go func() {
 		c.outWG.Wait()
 		close(c.outDone)
@@ -393,6 +406,7 @@ func (c *sessionContext) Wait() {
 	if runtime.GOOS == "windows" && c.mwSess == nil && c.pty != nil {
 		_ = c.pty.Wait()
 		c.outWG.Wait()
+		c.outputDrained.Store(true)
 		debug("session [%d] wait completed", c.id)
 		return
 	}
@@ -409,27 +423,50 @@ func (c *sessionContext) Wait() {
 		_ = c.cmd.Wait()
 	}
 
-	// Wait for the output to be forwarded, to avoid dropping the remaining
-	// buffered output when the session and its output pipes are closed.
-	// Tsshd keeps forwarding the output in the background even if this
-	// short wait times out, see sessionContext.finishOutput.
+	if c.closed.Load() {
+		return
+	}
+
+	timer := time.NewTimer(outputDrainLimit)
+	defer timer.Stop()
+	if c.mwSess != nil || c.pty != nil {
+		idleTimer := time.NewTimer(outputIdleTimeout)
+		defer idleTimer.Stop()
+		select {
+		case <-c.outDone:
+		case <-idleTimer.C:
+			if c.mwSess != nil {
+				_ = c.mwSess.Close()
+			} else {
+				_ = c.pty.Close()
+			}
+		}
+	} else {
+		if pipe, ok := c.stdout.(*sessionOutputPipe); ok {
+			pipe.beginDrain(outputIdleTimeout)
+		}
+		if pipe, ok := c.stderr.(*sessionOutputPipe); ok {
+			pipe.beginDrain(outputIdleTimeout)
+		}
+	}
+
 	select {
 	case <-c.outDone:
-	case <-time.After(outputDrainTimeout):
-		warning("child process has exited, but output streams did not close in time")
+		c.outputDrained.Store(true)
+	case <-timer.C:
+		warning("session [%d] output drain timed out, aborting remaining output", c.id)
 	}
 
 	debug("session [%d] wait completed", c.id)
 }
 
-// outputDrainTimeout is how long to wait for the output to be forwarded after
-// the child process has exited, before the session is closed.
-var outputDrainTimeout = 3 * time.Second
+// outputIdleTimeout is how long to wait for an idle output pipe after
+// the child process has exited, before closing the pipe.
+var outputIdleTimeout = 3 * time.Second
 
-// outputCloseGrace is the maximum time to keep forwarding the output after the
-// session has ended. It matches the grace period that sshUdpServer.handleStream
-// grants to the transport layer for delivering the last packets.
-var outputCloseGrace = time.Minute
+// outputDrainLimit is the maximum time to keep forwarding the output after
+// the child process has exited.
+var outputDrainLimit = time.Minute
 
 // closeOutputPipe closes the stdout or stderr pipe created in StartCmd, after
 // the output has been forwarded completely. The pty is shared by stdin, stdout
@@ -454,31 +491,6 @@ func (c *sessionContext) abortOutput() {
 	}
 }
 
-// finishOutput keeps forwarding the output in the background until it is done,
-// then closes the output streams. The output that is still buffered when the
-// child process exits should not be dropped, since the client may still be able
-// to receive it, especially on a slow or unstable network.
-//
-// A descendant process that inherited the output pipes may keep them open for a
-// long time, so the pipes are closed to unblock the output forwarders after the
-// same grace period that the transport layer has, and the output streams are
-// closed even if the output has not been forwarded completely.
-func (c *sessionContext) finishOutput() {
-	select {
-	case <-c.outDone:
-	case <-time.After(outputCloseGrace):
-		warning("session [%d] output is not forwarded in time, closing the output pipes", c.id)
-		c.abortOutput()
-	}
-
-	if c.ioStream != nil {
-		_ = c.ioStream.Close()
-	}
-	if c.errStream != nil {
-		_ = c.errStream.Close()
-	}
-}
-
 func (c *sessionContext) Close() {
 	if !c.closed.CompareAndSwap(false, true) {
 		return
@@ -495,7 +507,7 @@ func (c *sessionContext) Close() {
 		}
 	} else if c.pty != nil {
 		code = c.pty.GetExitCode()
-	} else {
+	} else if c.cmd != nil && c.cmd.ProcessState != nil {
 		code = c.cmd.ProcessState.ExitCode()
 	}
 	debug("session [%d] exiting with code: %d", c.id, code)
@@ -514,17 +526,32 @@ func (c *sessionContext) Close() {
 		} else if c.pty != nil {
 			_ = c.pty.Close()
 			debug("session [%d] pty closed", c.id)
-		} else {
+		} else if c.cmd != nil && c.cmd.Process != nil {
 			_ = c.cmd.Process.Kill()
 			debug("session [%d] cmd killed", c.id)
 		}
 
-		// Do not close the output streams while the remaining output is still
-		// being forwarded, otherwise the output is dropped, see finishOutput.
-		go c.finishOutput()
-		return
+		if c.outputDrained.Load() {
+			if c.ioStream != nil {
+				_ = c.ioStream.finish()
+			}
+			if c.errStream != nil {
+				_ = c.errStream.finish()
+			}
+			return
+		}
 	}
 
+	if c.stdin != nil {
+		_ = c.stdin.Close()
+	}
+	c.abortOutput()
+	if c.outForwarder != nil {
+		c.outForwarder.abort()
+	}
+	if c.errForwarder != nil {
+		c.errForwarder.abort()
+	}
 	if c.ioStream != nil {
 		_ = c.ioStream.Close()
 	}

@@ -25,6 +25,7 @@ SOFTWARE.
 package tsshd
 
 import (
+	"context"
 	"fmt"
 	"io"
 	"net"
@@ -32,6 +33,37 @@ import (
 	"sync/atomic"
 	"time"
 )
+
+func abortStream(stream Stream) error {
+	if stream == nil {
+		return nil
+	}
+	if stderr, ok := stream.(*stderrStream); ok {
+		_ = stderr.Close()
+		return stderr.Stream.Close()
+	}
+	return stream.Close()
+}
+
+func finishStream(stream Stream) error {
+	if stream == nil {
+		return nil
+	}
+	var firstErr error
+	if err := stream.CloseRead(); err != nil && firstErr == nil {
+		firstErr = err
+	}
+	var err error
+	if stderr, ok := stream.(*stderrStream); ok {
+		err = stderr.Close()
+	} else {
+		err = stream.CloseWrite()
+	}
+	if err != nil && firstErr == nil {
+		firstErr = err
+	}
+	return firstErr
+}
 
 var attachMutex sync.Mutex
 
@@ -50,11 +82,22 @@ type interruptibleStream struct {
 }
 
 func (s *interruptibleStream) Close() error {
+	return s.close(true)
+}
+
+func (s *interruptibleStream) finish() error {
+	return s.close(false)
+}
+
+func (s *interruptibleStream) close(abort bool) error {
 	if !s.closed.CompareAndSwap(false, true) {
 		return nil
 	}
 	close(s.closeCh)
-	return s.Stream.Close()
+	if abort {
+		return abortStream(s.Stream)
+	}
+	return finishStream(s.Stream)
 }
 
 func (s *interruptibleStream) Write(buf []byte) (int, error) {
@@ -105,7 +148,7 @@ func newInterruptibleStream(s Stream) *interruptibleStream {
 type replaceableStream struct {
 	mu     sync.Mutex
 	cond   *sync.Cond
-	stream Stream
+	stream *interruptibleStream
 	closed bool
 }
 
@@ -175,6 +218,14 @@ func (s *replaceableStream) do(fn func(Stream) error) error {
 }
 
 func (s *replaceableStream) Close() error {
+	return s.close(true)
+}
+
+func (s *replaceableStream) finish() error {
+	return s.close(false)
+}
+
+func (s *replaceableStream) close(abort bool) error {
 	s.mu.Lock()
 
 	if s.closed {
@@ -190,7 +241,7 @@ func (s *replaceableStream) Close() error {
 	s.mu.Unlock()
 
 	if oldStream != nil {
-		return oldStream.Close()
+		return oldStream.close(abort)
 	}
 	return nil
 }
@@ -300,29 +351,45 @@ func (c *replaceableTimeoutChecker) isTimeout() bool {
 }
 
 func (c *replaceableTimeoutChecker) waitUntilReconnected() error {
+	return c.waitReconnect(context.Background())
+}
+
+func (c *replaceableTimeoutChecker) waitReconnect(ctx context.Context) error {
 	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		default:
+		}
+
 		c.mu.Lock()
 		cancel, checker := c.cancel, c.checker
 		c.mu.Unlock()
 
 		if checker == nil {
-			<-cancel
-			continue
+			select {
+			case <-cancel:
+				continue
+			case <-ctx.Done():
+				return ctx.Err()
+			}
 		}
 
 		if !checker.isTimeout() {
 			return nil
 		}
 
+		childCtx, childCancel := context.WithCancel(ctx)
 		errCh := make(chan error, 1)
 
 		go func() {
 			defer close(errCh)
-			errCh <- checker.waitUntilReconnected()
+			errCh <- checker.waitReconnect(childCtx)
 		}()
 
 		select {
 		case err := <-errCh:
+			childCancel()
 			c.mu.Lock()
 			if c.checker == checker {
 				c.mu.Unlock()
@@ -330,6 +397,10 @@ func (c *replaceableTimeoutChecker) waitUntilReconnected() error {
 			}
 			c.mu.Unlock()
 		case <-cancel:
+			childCancel()
+		case <-ctx.Done():
+			childCancel()
+			return ctx.Err()
 		}
 	}
 }
