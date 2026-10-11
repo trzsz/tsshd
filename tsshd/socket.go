@@ -179,7 +179,7 @@ func handleViewRequest(conn net.Conn) error {
 	}
 
 	sess.screenMu.Lock()
-	contents := sess.screenObj.Display()
+	contents := sess.screenObj.DisplayAnsi()
 	sess.screenMu.Unlock()
 
 	for _, line := range contents {
