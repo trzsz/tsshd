@@ -353,7 +353,7 @@ func (c *SshUdpClient) NewSession() (*SshUdpSession, error) {
 		return nil, err
 	}
 	c.exitWG.Add(1)
-	udpSession := &SshUdpSession{client: c, stream: stream, envs: make(map[string]string)}
+	udpSession := &SshUdpSession{client: c, stream: stream, envs: make(map[string]string), code: -1}
 	udpSession.exitWG.Add(1)
 	c.sessionMutex.Lock()
 	defer c.sessionMutex.Unlock()
