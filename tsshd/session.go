@@ -973,7 +973,9 @@ func (s *sshUdpServer) handleResizeEvent(stream Stream) error {
 	sess := getSessionByID(msg.ID)
 
 	if sess == nil {
-		return fmt.Errorf("session [%d] not found", msg.ID)
+		// For short-lived commands (e.g., tssh --kcp xxx 'exit 0'), the session may have already exited.
+		debug("resize failed: session [%d] not found", msg.ID)
+		return nil
 	}
 
 	// Serialize with attach operations to ensure the session is still owned

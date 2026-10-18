@@ -280,7 +280,9 @@ func (r *rotatingCrypto) startRekey() {
 
 	go func() {
 		if err := r.doRekey(); err != nil {
-			r.client.warning("rekey failed: %v", err)
+			if !r.client.IsClosed() {
+				r.client.warning("rekey failed: %v", err)
+			}
 
 			r.mutex.Lock()
 			r.rekeyInFlight = false
