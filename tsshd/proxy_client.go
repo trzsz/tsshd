@@ -35,10 +35,14 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"os"
 	"os/exec"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/charmbracelet/x/ansi"
 )
 
 type tcpServerConn struct {
@@ -263,31 +267,54 @@ func (p *clientProxy) dialStream(proxyClient *SshUdpClient, connectTimeout time.
 		if err != nil {
 			return nil, fmt.Errorf("proxy command [%s] stdin pipe failed: %v", cmd.String(), err)
 		}
-		stdout, err := cmd.StdoutPipe()
+
+		stdoutReader, stdoutWriter, err := os.Pipe()
 		if err != nil {
+			_ = stdin.Close()
 			return nil, fmt.Errorf("proxy command [%s] stdout pipe failed: %v", cmd.String(), err)
 		}
+		// Close the parent's write end to avoid blocking EOF, even if Start fails.
+		defer func() { _ = stdoutWriter.Close() }()
+		cmd.Stdout = stdoutWriter
 
+		var stderrReader, stderrWriter *os.File
 		if p.client.enableDebugging {
-			stderr, err := cmd.StderrPipe()
+			stderrReader, stderrWriter, err = os.Pipe()
 			if err != nil {
+				_ = stdin.Close()
+				_ = stdoutReader.Close()
 				return nil, fmt.Errorf("proxy command [%s] stderr pipe failed: %v", cmd.String(), err)
 			}
-			go func() {
-				scanner := bufio.NewScanner(stderr)
-				for scanner.Scan() {
-					p.client.debug("proxy command stderr: %s", scanner.Text())
-				}
-			}()
+			// Close the parent's write end to avoid blocking EOF, even if Start fails.
+			defer func() { _ = stderrWriter.Close() }()
+			cmd.Stderr = stderrWriter
 		} else {
 			cmd.Stderr = io.Discard
 		}
 
 		if err := cmd.Start(); err != nil {
+			_ = stdin.Close()
+			_ = stdoutReader.Close()
+			if stderrReader != nil {
+				_ = stderrReader.Close()
+			}
 			return nil, fmt.Errorf("proxy command [%s] start failed: %v", cmd.String(), err)
 		}
 
-		conn := &proxyCmdConn{cmd: cmd, stdin: stdin, stdout: stdout}
+		if stderrReader != nil {
+			go func() {
+				defer func() { _ = stderrReader.Close() }()
+				scanner := bufio.NewScanner(stderrReader)
+				for scanner.Scan() {
+					line := strings.TrimSpace(ansi.Strip(scanner.Text()))
+					if line != "" {
+						p.client.debug("proxy command stderr: %s", line)
+					}
+				}
+			}()
+		}
+
+		conn := &proxyCmdConn{cmd: cmd, stdin: stdin, stdout: stdoutReader}
 
 		go func() {
 			if err := cmd.Wait(); err != nil && !conn.closed.Load() && p.client.enableDebugging {
