@@ -31,7 +31,6 @@ import (
 	"fmt"
 	"io"
 	"net"
-	"os"
 	"strconv"
 	"strings"
 	"sync"
@@ -138,7 +137,7 @@ func NewSshUdpClient(opts *UdpClientOptions) (udpClient *SshUdpClient, err error
 	udpClient = &SshUdpClient{
 		proxyClient:          opts.ProxyClient,
 		protoVersion:         min(opts.ServerInfo.ProtoVer, kTsshdProtocol),
-		compress:             opts.ServerInfo.Compress == kCompressZstd && os.Getenv("TSSH_UDP_COMPRESS") == kCompressZstd,
+		compress:             compressionWanted(opts.ServerInfo),
 		sessionMap:           make(map[uint64]*SshUdpSession),
 		channelMap:           make(map[string]chan ssh.NewChannel),
 		intervalTime:         opts.IntervalTime,
@@ -1053,9 +1052,7 @@ func (s *SshUdpSession) startSession(msg *startMessage) error {
 			ChannelType: kAgentChannelType,
 		}
 	}
-	if s.client.compress && !msg.Attach {
-		msg.Compress = kCompressZstd
-	}
+	requestCompression(msg, s.client.compress)
 	if err := sendMessage(s.stream, msg); err != nil {
 		return fmt.Errorf("send session message failed: %w", err)
 	}

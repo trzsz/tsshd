@@ -641,14 +641,11 @@ func (s *sshUdpServer) handleSessionEvent(stream Stream) {
 		return
 	}
 
-	// the attach mode replaces the stream, a compression context would not survive that
-	if msg.Compress == kCompressZstd && !s.args.Attachable {
-		if zs, err := newZstdWriteStream(stream); err != nil {
-			warning("session [%d] compression failed: %v", msg.ID, err)
-		} else {
-			stream = zs
-			debug("session [%d] output compressed with zstd", msg.ID)
-		}
+	if zs, err := compressOutput(&msg, s.args.Attachable, stream); err != nil {
+		warning("session [%d] compression failed: %v", msg.ID, err)
+	} else if zs != stream {
+		stream = zs
+		debug("session [%d] output compressed with zstd", msg.ID)
 	}
 
 	if sess.mwSess == nil && msg.Shell {

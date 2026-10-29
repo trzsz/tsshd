@@ -27,6 +27,7 @@ package tsshd
 import (
 	"errors"
 	"io"
+	"os"
 	"sync"
 
 	"github.com/klauspost/compress/zstd"
@@ -37,6 +38,36 @@ import (
 const kCompressZstd = "zstd"
 
 const kCompressWindow = 1 << 20
+
+// kCompressEnv turns the compression on in the client while it is experimental.
+const kCompressEnv = "TSSH_UDP_COMPRESS"
+
+// compressionWanted reports whether the client asks for compressed output: the server
+// must support it, older servers do not set ServerInfo.Compress.
+func compressionWanted(info *ServerInfo) bool {
+	return info.Compress == kCompressZstd && os.Getenv(kCompressEnv) == kCompressZstd
+}
+
+// requestCompression asks the server to compress the output of a session. Attaching to a
+// session is never compressed, see compressOutput.
+func requestCompression(msg *startMessage, wanted bool) {
+	if wanted && !msg.Attach {
+		msg.Compress = kCompressZstd
+	}
+}
+
+// compressOutput returns the stream the server writes the session output to. The attach
+// mode replaces the stream of a session, a compression context would not survive that.
+func compressOutput(msg *startMessage, attachable bool, stream Stream) (Stream, error) {
+	if msg.Compress != kCompressZstd || attachable {
+		return stream, nil
+	}
+	zs, err := newZstdWriteStream(stream)
+	if err != nil {
+		return stream, err
+	}
+	return zs, nil
+}
 
 // zstdWriteStream compresses what is written to the session stream, reads pass through.
 type zstdWriteStream struct {
