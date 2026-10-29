@@ -44,18 +44,21 @@ func compressionWanted(info *ServerInfo, requested string) bool {
 	return requested == kCompressZstd && info.Compress == kCompressZstd
 }
 
-// requestCompression asks the server to compress the output of a session. Attaching to a
-// session is never compressed, see compressOutput.
+// requestCompression asks the server to compress the output of a session, also when
+// attaching to one.
 func requestCompression(msg *startMessage, wanted bool) {
-	if wanted && !msg.Attach {
+	if wanted {
 		msg.Compress = kCompressZstd
 	}
 }
 
-// compressOutput returns the stream the server writes the session output to. The attach
-// mode replaces the stream of a session, a compression context would not survive that.
-func compressOutput(msg *startMessage, attachable bool, stream Stream) (Stream, error) {
-	if msg.Compress != kCompressZstd || attachable {
+// compressOutput returns the stream the server writes the session output to. Every client
+// gets its own encoder on its own stream: attaching swaps the client stream of a session,
+// the encoder of the previous client goes away with it and the new client starts fresh.
+// The encoder must not wrap the replaceable stream, which retries an interrupted write on
+// the new stream and would mix the output of two compression contexts.
+func compressOutput(msg *startMessage, stream Stream) (Stream, error) {
+	if msg.Compress != kCompressZstd {
 		return stream, nil
 	}
 	zs, err := newZstdWriteStream(stream)
@@ -104,9 +107,12 @@ func (s *zstdWriteStream) CloseWrite() error {
 	return s.Stream.CloseWrite()
 }
 
+// Close closes the stream before it finishes the encoder: a write blocked on a client that is
+// gone holds the encoder until the stream is closed. The output ends with CloseWrite instead.
 func (s *zstdWriteStream) Close() error {
+	err := s.Stream.Close()
 	s.finish()
-	return s.Stream.Close()
+	return err
 }
 
 // zstdReadStream decompresses what is read from the session stream, writes pass through.

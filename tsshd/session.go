@@ -636,9 +636,9 @@ func (s *sshUdpServer) handleSessionEvent(stream Stream) {
 	}
 
 	// The server decides whether the output is compressed and tells the client in the ack,
-	// so both sides always agree, e.g. an attachable server never compresses.
+	// so both sides always agree.
 	var resp startResponse
-	outStream, err := compressOutput(&msg, s.args.Attachable, stream)
+	outStream, err := compressOutput(&msg, stream)
 	if err != nil {
 		warning("session [%d] compression failed: %v", msg.ID, err)
 	} else if outStream != stream {

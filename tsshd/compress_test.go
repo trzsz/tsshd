@@ -257,7 +257,7 @@ func TestCompressionNegotiation(t *testing.T) {
 
 	msg = &startMessage{ID: 2, Attach: true}
 	requestCompression(msg, true)
-	assert.Empty(t, msg.Compress, "attaching replaces the stream, it is never compressed")
+	assert.Equal(t, kCompressZstd, msg.Compress, "an attaching client asks for its own compressed stream")
 
 	msg = &startMessage{ID: 3}
 	requestCompression(msg, false)
@@ -267,15 +267,19 @@ func TestCompressionNegotiation(t *testing.T) {
 func TestCompressOutput(t *testing.T) {
 	stream := &pipeStream{}
 
-	out, err := compressOutput(&startMessage{Compress: kCompressZstd}, false, stream)
+	out, err := compressOutput(&startMessage{Compress: kCompressZstd}, stream)
 	require.NoError(t, err)
 	assert.IsType(t, &zstdWriteStream{}, out)
 
-	out, err = compressOutput(&startMessage{Compress: kCompressZstd}, true, stream)
+	out, err = compressOutput(&startMessage{Compress: kCompressZstd, Attach: true}, stream)
 	require.NoError(t, err)
-	assert.Same(t, stream, out, "an attachable server does not compress")
+	assert.IsType(t, &zstdWriteStream{}, out, "an attaching client that asks gets its own encoder")
 
-	out, err = compressOutput(&startMessage{}, false, stream)
+	out, err = compressOutput(&startMessage{Attach: true}, stream)
+	require.NoError(t, err)
+	assert.Same(t, stream, out, "an older client attaching stays plain")
+
+	out, err = compressOutput(&startMessage{}, stream)
 	require.NoError(t, err)
 	assert.Same(t, stream, out, "a client that did not ask gets the plain stream")
 }
@@ -310,4 +314,140 @@ func TestCompressionFieldsAreCompatible(t *testing.T) {
 	var oldAck errorMessage
 	require.NoError(t, json.Unmarshal(data, &oldAck))
 	assert.Equal(t, kNoErrorMsg, oldAck.Msg)
+}
+
+func TestZstdStream_CloseWhileWriteBlocked(t *testing.T) {
+	// the client is gone: nobody reads, so the write blocks on the network
+	server, _, _ := newCompressedPair(t)
+	writeDone := make(chan error, 1)
+	go func() {
+		_, err := server.Write([]byte("output nobody reads"))
+		writeDone <- err
+	}()
+	time.Sleep(50 * time.Millisecond)
+
+	// closing the stream must unblock the write instead of waiting for it
+	closed := make(chan struct{})
+	go func() {
+		_ = server.Close()
+		close(closed)
+	}()
+	select {
+	case <-closed:
+	case <-time.After(3 * time.Second):
+		t.Fatal("Close hangs while a write is blocked")
+	}
+	select {
+	case err := <-writeDone:
+		assert.Error(t, err)
+	case <-time.After(3 * time.Second):
+		t.Fatal("the blocked write was not released by Close")
+	}
+}
+
+func TestZstdStream_AttachSwapsToFreshEncoder(t *testing.T) {
+	// client A is attached and reads compressed output through the replaceable session stream
+	serverA, clientA, _ := newCompressedPair(t)
+	session := newReplaceableStream(serverA)
+	go func() { _, _ = session.Write([]byte("before attach\r\n")) }()
+	assert.Equal(t, "before attach\r\n", string(readFullWithTimeout(t, clientA, len("before attach\r\n"))))
+
+	// client A is gone: nobody reads, the next output blocks on its stream
+	retried := redrawFrame(1)
+	writeDone := make(chan error, 1)
+	go func() {
+		_, err := session.Write(retried)
+		writeDone <- err
+	}()
+	time.Sleep(50 * time.Millisecond)
+
+	// client B attaches: the ack goes out plain, then B's stream with its own encoder is swapped in
+	serverConn, clientConn := net.Pipe()
+	t.Cleanup(func() { _ = serverConn.Close(); _ = clientConn.Close() })
+	serverB, clientRawB := &pipeStream{Conn: serverConn}, &pipeStream{Conn: clientConn}
+	outB, err := compressOutput(&startMessage{ID: 1, Attach: true, Compress: kCompressZstd}, serverB)
+	require.NoError(t, err)
+	go func() {
+		_ = sendResponse(serverB, &startResponse{Compress: kCompressZstd})
+		session.swap(outB)
+	}()
+
+	var resp startResponse
+	require.NoError(t, recvResponse(clientRawB, &resp))
+	require.Equal(t, kCompressZstd, resp.Compress)
+	clientB, err := newZstdReadStream(clientRawB)
+	require.NoError(t, err)
+
+	// the write that was stuck on A arrives whole at B and decodes with B's fresh context
+	assert.Equal(t, retried, readFullWithTimeout(t, clientB, len(retried)))
+	select {
+	case err := <-writeDone:
+		assert.NoError(t, err)
+	case <-time.After(3 * time.Second):
+		t.Fatal("the write stuck on the old client was not retried")
+	}
+
+	go func() { _, _ = session.Write([]byte("after attach\r\n")) }()
+	assert.Equal(t, "after attach\r\n", string(readFullWithTimeout(t, clientB, len("after attach\r\n"))))
+}
+
+// attachTestSession registers a detached session, like one whose client went away, on an
+// attachable server.
+func attachTestSession(t *testing.T, id uint64) (*sshUdpServer, *sessionContext) {
+	t.Helper()
+	server := &sshUdpServer{args: &tsshdArgs{Attachable: true}, client: &clientState{}, clientChecker: newTimeoutChecker(0)}
+	oriServer := activeSshUdpServer.Swap(server)
+	sess := &sessionContext{id: id, ioStream: newReplaceableStream(&discardStream{}),
+		errStream: newReplaceableStream(&discardStream{}), clientChecker: newReplaceableTimeoutChecker(newTimeoutChecker(0))}
+	sessionMutex.Lock()
+	if sessionMap == nil {
+		sessionMap = make(map[uint64]*sessionContext)
+	}
+	sessionMap[id] = sess
+	sessionMutex.Unlock()
+	t.Cleanup(func() {
+		sessionMutex.Lock()
+		delete(sessionMap, id)
+		sessionMutex.Unlock()
+		activeSshUdpServer.Store(oriServer)
+	})
+	return server, sess
+}
+
+func TestAttachSessionCompression(t *testing.T) {
+	for _, tt := range []struct {
+		name     string
+		compress string
+	}{
+		{"new client asks for compression", kCompressZstd},
+		{"old client stays plain", ""},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			server, sess := attachTestSession(t, 4242)
+			serverConn, clientConn := net.Pipe()
+			t.Cleanup(func() { _ = serverConn.Close(); _ = clientConn.Close() })
+
+			attached := make(chan error, 1)
+			go func() {
+				_, _, err := server.attachSession(&pipeStream{Conn: serverConn}, &discardStream{},
+					&startMessage{ID: 4242, Attach: true, Compress: tt.compress})
+				attached <- err
+			}()
+
+			clientStream := &pipeStream{Conn: clientConn}
+			var resp startResponse
+			require.NoError(t, recvResponse(clientStream, &resp))
+			assert.Equal(t, tt.compress, resp.Compress, "the ack tells the client what it gets")
+			require.NoError(t, <-attached)
+
+			var client io.Reader = clientStream
+			if resp.Compress == kCompressZstd {
+				zs, err := newZstdReadStream(clientStream)
+				require.NoError(t, err)
+				client = zs
+			}
+			go func() { _, _ = sess.ioStream.Write([]byte("redrawn screen\r\n")) }()
+			assert.Equal(t, "redrawn screen\r\n", string(readFullWithTimeout(t, client, len("redrawn screen\r\n"))))
+		})
+	}
 }
