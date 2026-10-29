@@ -27,7 +27,6 @@ package tsshd
 import (
 	"errors"
 	"io"
-	"os"
 	"sync"
 
 	"github.com/klauspost/compress/zstd"
@@ -39,13 +38,10 @@ const kCompressZstd = "zstd"
 
 const kCompressWindow = 1 << 20
 
-// kCompressEnv turns the compression on in the client while it is experimental.
-const kCompressEnv = "TSSH_UDP_COMPRESS"
-
-// compressionWanted reports whether the client asks for compressed output: the server
-// must support it, older servers do not set ServerInfo.Compress.
-func compressionWanted(info *ServerInfo) bool {
-	return info.Compress == kCompressZstd && os.Getenv(kCompressEnv) == kCompressZstd
+// compressionWanted reports whether the client asks for compressed output: the client
+// must request it and the server must support it, older servers do not set ServerInfo.Compress.
+func compressionWanted(info *ServerInfo, requested string) bool {
+	return requested == kCompressZstd && info.Compress == kCompressZstd
 }
 
 // requestCompression asks the server to compress the output of a session. Attaching to a
@@ -114,6 +110,11 @@ func (s *zstdWriteStream) Close() error {
 }
 
 // zstdReadStream decompresses what is read from the session stream, writes pass through.
+//
+// Close is left to the embedded stream. The decoder is not safe to close while another
+// goroutine is blocked in Read, which is what happens when a session is closed while its
+// output forwarder is still running. With decoder concurrency 1 there are no goroutines
+// behind it, so the garbage collector reclaims it once the forwarder returns.
 type zstdReadStream struct {
 	Stream
 	dec *zstd.Decoder
@@ -134,9 +135,4 @@ func (s *zstdReadStream) Read(p []byte) (int, error) {
 		err = io.EOF
 	}
 	return n, err
-}
-
-func (s *zstdReadStream) Close() error {
-	s.dec.Close()
-	return s.Stream.Close()
 }

@@ -220,16 +220,36 @@ func TestZstdStream_ConcurrentWrites(t *testing.T) {
 	}
 }
 
+func TestZstdStream_CloseWhileRead(t *testing.T) {
+	// SshUdpSession.Close closes the stream while the output forwarder is still blocked in Read
+	_, client, _ := newCompressedPair(t)
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		buf := make([]byte, 1024)
+		for {
+			if _, err := client.Read(buf); err != nil {
+				return
+			}
+		}
+	}()
+	time.Sleep(20 * time.Millisecond)
+	require.NoError(t, client.Close())
+	select {
+	case <-done:
+	case <-time.After(3 * time.Second):
+		t.Fatal("Read did not return after Close")
+	}
+}
+
 func TestCompressionNegotiation(t *testing.T) {
 	newServer := &ServerInfo{ServerVer: kTsshdVersion, Compress: kCompressZstd}
 	oldServer := &ServerInfo{ServerVer: "0.1.10"}
 
-	t.Setenv(kCompressEnv, "")
-	assert.False(t, compressionWanted(newServer), "off unless the client turns it on")
-
-	t.Setenv(kCompressEnv, kCompressZstd)
-	assert.True(t, compressionWanted(newServer))
-	assert.False(t, compressionWanted(oldServer), "an old server cannot decompress")
+	assert.False(t, compressionWanted(newServer, ""), "off unless the client asks for it")
+	assert.True(t, compressionWanted(newServer, kCompressZstd))
+	assert.False(t, compressionWanted(oldServer, kCompressZstd), "an old server cannot compress")
 
 	msg := &startMessage{ID: 1, Pty: true}
 	requestCompression(msg, true)
@@ -279,6 +299,15 @@ func TestCompressionFieldsAreCompatible(t *testing.T) {
 	// an old server's info has no Compress field
 	var info ServerInfo
 	require.NoError(t, json.Unmarshal([]byte(`{"ServerVer":"0.1.10","ProtoVer":1}`), &info))
-	t.Setenv(kCompressEnv, kCompressZstd)
-	assert.False(t, compressionWanted(&info))
+	assert.False(t, compressionWanted(&info, kCompressZstd))
+
+	// an old server's bare ack means no compression, an old client reads the new ack as a bare one
+	var resp startResponse
+	require.NoError(t, json.Unmarshal([]byte(`{"Msg":"`+kNoErrorMsg+`"}`), &resp))
+	assert.Empty(t, resp.Compress)
+	data, err = json.Marshal(&startResponse{errorMessage{Msg: kNoErrorMsg}, kCompressZstd})
+	require.NoError(t, err)
+	var oldAck errorMessage
+	require.NoError(t, json.Unmarshal(data, &oldAck))
+	assert.Equal(t, kNoErrorMsg, oldAck.Msg)
 }

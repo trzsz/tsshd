@@ -117,6 +117,9 @@ type UdpClientOptions struct {
 	DiscardCallback      func(discardedInput []byte, discardedOutputLines, discardedOutputBytes uint64)
 	ProxyCommand         string
 	ShouldPauseReconnect func() (pause bool, reason string)
+	// Compress requests compression of the session output, e.g. kCompressZstd.
+	// It only takes effect if the server advertises the same in ServerInfo.
+	Compress string
 }
 
 // NewSshUdpClient creates a SshUdpClient
@@ -137,7 +140,7 @@ func NewSshUdpClient(opts *UdpClientOptions) (udpClient *SshUdpClient, err error
 	udpClient = &SshUdpClient{
 		proxyClient:          opts.ProxyClient,
 		protoVersion:         min(opts.ServerInfo.ProtoVer, kTsshdProtocol),
-		compress:             compressionWanted(opts.ServerInfo),
+		compress:             compressionWanted(opts.ServerInfo, opts.Compress),
 		sessionMap:           make(map[uint64]*SshUdpSession),
 		channelMap:           make(map[string]chan ssh.NewChannel),
 		intervalTime:         opts.IntervalTime,
@@ -1056,16 +1059,21 @@ func (s *SshUdpSession) startSession(msg *startMessage) error {
 	if err := sendMessage(s.stream, msg); err != nil {
 		return fmt.Errorf("send session message failed: %w", err)
 	}
-	if err := recvError(s.stream); err != nil {
+	var resp startResponse
+	if err := recvResponse(s.stream, &resp); err != nil {
 		return err
 	}
-	if msg.Compress == kCompressZstd {
+	switch resp.Compress {
+	case "":
+	case kCompressZstd:
 		zs, err := newZstdReadStream(s.stream)
 		if err != nil {
 			return err
 		}
 		s.stream = zs
 		s.client.debug("session [%d] output compressed with zstd", s.id)
+	default:
+		return fmt.Errorf("unsupported session output compression: %s", resp.Compress)
 	}
 	if s.stdin != nil {
 		go s.forwardInput()

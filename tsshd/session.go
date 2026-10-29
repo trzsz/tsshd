@@ -635,16 +635,24 @@ func (s *sshUdpServer) handleSessionEvent(stream Stream) {
 		return
 	}
 
-	if err := sendSuccess(stream); err != nil { // ack ok
+	// The server decides whether the output is compressed and tells the client in the ack,
+	// so both sides always agree, e.g. an attachable server never compresses.
+	var resp startResponse
+	outStream, err := compressOutput(&msg, s.args.Attachable, stream)
+	if err != nil {
+		warning("session [%d] compression failed: %v", msg.ID, err)
+	} else if outStream != stream {
+		resp.Compress = kCompressZstd
+	}
+
+	if err := sendResponse(stream, &resp); err != nil { // ack ok
 		warning("start session ack ok failed: %v", err)
 		sess.Close()
 		return
 	}
 
-	if zs, err := compressOutput(&msg, s.args.Attachable, stream); err != nil {
-		warning("session [%d] compression failed: %v", msg.ID, err)
-	} else if zs != stream {
-		stream = zs
+	if outStream != stream {
+		stream = outStream
 		debug("session [%d] output compressed with zstd", msg.ID)
 	}
 

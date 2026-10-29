@@ -143,7 +143,10 @@ func initServer(args *tsshdArgs) (*ServerInfo, string, error) {
 		ProtoVer:  kTsshdProtocol,
 		Port:      port,
 		MTU:       args.MTU,
-		Compress:  kCompressZstd,
+	}
+	if !args.Attachable {
+		// the attach mode replaces the session stream, a compression context would not survive that
+		info.Compress = kCompressZstd
 	}
 
 	proxy, err := startServerProxy(args, info, conn)

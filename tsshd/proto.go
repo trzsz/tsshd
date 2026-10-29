@@ -173,6 +173,18 @@ type startMessage struct {
 	Compress string `json:",omitempty"`
 }
 
+// startResponse acks a startMessage. Compress is the compression the server actually
+// enabled for the session output, empty if none. Old servers send a bare errorMessage,
+// which decodes into this with an empty Compress.
+type startResponse struct {
+	errorMessage
+	Compress string `json:",omitempty"`
+}
+
+func (d *startResponse) getErrorMessage() *errorMessage {
+	return &d.errorMessage
+}
+
 type exitMessage struct {
 	ID       uint64 `json:",omitempty"`
 	ExitCode int    `json:",omitempty"`
