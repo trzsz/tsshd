@@ -143,6 +143,7 @@ func initServer(args *tsshdArgs) (*ServerInfo, string, error) {
 		ProtoVer:  kTsshdProtocol,
 		Port:      port,
 		MTU:       args.MTU,
+		Compress:  kCompressZstd,
 	}
 
 	proxy, err := startServerProxy(args, info, conn)

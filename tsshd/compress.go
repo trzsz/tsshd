@@ -1,0 +1,111 @@
+/*
+MIT License
+
+Copyright (c) 2024-2026 The Trzsz SSH Authors.
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+*/
+
+package tsshd
+
+import (
+	"errors"
+	"io"
+	"sync"
+
+	"github.com/klauspost/compress/zstd"
+)
+
+// kCompressZstd compresses the session output (server to client) with one zstd stream per session.
+// The stream is flushed on every write, so the client can show the output at once.
+const kCompressZstd = "zstd"
+
+const kCompressWindow = 1 << 20
+
+// zstdWriteStream compresses what is written to the session stream, reads pass through.
+type zstdWriteStream struct {
+	Stream
+	mu  sync.Mutex
+	enc *zstd.Encoder
+}
+
+func newZstdWriteStream(stream Stream) (*zstdWriteStream, error) {
+	enc, err := zstd.NewWriter(stream, zstd.WithEncoderLevel(zstd.SpeedDefault),
+		zstd.WithWindowSize(kCompressWindow), zstd.WithEncoderConcurrency(1), zstd.WithLowerEncoderMem(true))
+	if err != nil {
+		return nil, err
+	}
+	return &zstdWriteStream{Stream: stream, enc: enc}, nil
+}
+
+func (s *zstdWriteStream) Write(p []byte) (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if _, err := s.enc.Write(p); err != nil {
+		return 0, err
+	}
+	if err := s.enc.Flush(); err != nil {
+		return 0, err
+	}
+	return len(p), nil
+}
+
+func (s *zstdWriteStream) finish() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	_ = s.enc.Close()
+}
+
+func (s *zstdWriteStream) CloseWrite() error {
+	s.finish()
+	return s.Stream.CloseWrite()
+}
+
+func (s *zstdWriteStream) Close() error {
+	s.finish()
+	return s.Stream.Close()
+}
+
+// zstdReadStream decompresses what is read from the session stream, writes pass through.
+type zstdReadStream struct {
+	Stream
+	dec *zstd.Decoder
+}
+
+func newZstdReadStream(stream Stream) (*zstdReadStream, error) {
+	dec, err := zstd.NewReader(stream, zstd.WithDecoderConcurrency(1), zstd.WithDecoderLowmem(true),
+		zstd.WithDecoderMaxWindow(kCompressWindow))
+	if err != nil {
+		return nil, err
+	}
+	return &zstdReadStream{Stream: stream, dec: dec}, nil
+}
+
+func (s *zstdReadStream) Read(p []byte) (int, error) {
+	n, err := s.dec.Read(p)
+	if errors.Is(err, io.ErrUnexpectedEOF) {
+		err = io.EOF
+	}
+	return n, err
+}
+
+func (s *zstdReadStream) Close() error {
+	s.dec.Close()
+	return s.Stream.Close()
+}

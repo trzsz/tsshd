@@ -96,6 +96,7 @@ type ServerInfo struct {
 	ServerID   uint64 `json:",omitempty"`
 	ProxyMode  string `json:",omitempty"`
 	MTU        uint16 `json:",omitempty"`
+	Compress   string `json:",omitempty"`
 }
 
 type SessionInfo struct {
@@ -168,6 +169,8 @@ type startMessage struct {
 	Subs   string               `json:",omitempty"`
 	Attach bool                 `json:",omitempty"`
 	ErrID  uint64               `json:",omitempty"`
+	// Compress asks the server to compress the session output
+	Compress string `json:",omitempty"`
 }
 
 type exitMessage struct {

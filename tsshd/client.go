@@ -31,6 +31,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"os"
 	"strconv"
 	"strings"
 	"sync"
@@ -63,6 +64,7 @@ type SshUdpClient struct {
 	proxyClient          *SshUdpClient
 	protoClient          protocolClient
 	protoVersion         int
+	compress             bool
 	clientProxy          *clientProxy
 	intervalTime         time.Duration
 	connectTimeout       time.Duration
@@ -136,6 +138,7 @@ func NewSshUdpClient(opts *UdpClientOptions) (udpClient *SshUdpClient, err error
 	udpClient = &SshUdpClient{
 		proxyClient:          opts.ProxyClient,
 		protoVersion:         min(opts.ServerInfo.ProtoVer, kTsshdProtocol),
+		compress:             opts.ServerInfo.Compress == kCompressZstd && os.Getenv("TSSH_UDP_COMPRESS") == kCompressZstd,
 		sessionMap:           make(map[uint64]*SshUdpSession),
 		channelMap:           make(map[string]chan ssh.NewChannel),
 		intervalTime:         opts.IntervalTime,
@@ -1050,11 +1053,22 @@ func (s *SshUdpSession) startSession(msg *startMessage) error {
 			ChannelType: kAgentChannelType,
 		}
 	}
+	if s.client.compress && !msg.Attach {
+		msg.Compress = kCompressZstd
+	}
 	if err := sendMessage(s.stream, msg); err != nil {
 		return fmt.Errorf("send session message failed: %w", err)
 	}
 	if err := recvError(s.stream); err != nil {
 		return err
+	}
+	if msg.Compress == kCompressZstd {
+		zs, err := newZstdReadStream(s.stream)
+		if err != nil {
+			return err
+		}
+		s.stream = zs
+		s.client.debug("session [%d] output compressed with zstd", s.id)
 	}
 	if s.stdin != nil {
 		go s.forwardInput()
