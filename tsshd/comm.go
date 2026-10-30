@@ -382,6 +382,15 @@ func (tc *timeoutChecker) notifyReconnected() {
 
 func (tc *timeoutChecker) checkTimeout() {
 	for !tc.closed.Load() {
+		// The system clock may jump forward and then be corrected, or be set
+		// backward, leaving lastAliveTime far ahead of the current time.
+		// This could delay timeout detection indefinitely, so clamp future
+		// timestamps to at most one second ahead of the current time.
+		maxAliveTime := time.Now().UnixMilli() + 1000
+		if lastAliveTime := tc.lastAliveTime.Load(); lastAliveTime > maxAliveTime {
+			tc.lastAliveTime.CompareAndSwap(lastAliveTime, maxAliveTime)
+		}
+
 		sleepTime := time.Until(time.UnixMilli(tc.lastAliveTime.Load()).Add(tc.heartbeatTimeout))
 		if sleepTime > 0 {
 			select {
