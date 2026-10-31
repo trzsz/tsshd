@@ -111,7 +111,7 @@ func (s *sshUdpServer) handleBusEvent(stream Stream) {
 		return
 	}
 
-	if enableDebugLogging {
+	if enableDebugLogging.Load() {
 		go func() {
 			ticker := time.NewTicker(200 * time.Millisecond)
 			defer ticker.Stop()
@@ -141,7 +141,7 @@ func (s *sshUdpServer) handleBusEvent(stream Stream) {
 		}
 
 		if server := activeSshUdpServer.Load(); server != s {
-			if enableDebugLogging {
+			if enableDebugLogging.Load() {
 				if err := s.sendBusMessage("debug",
 					debugMessage{Msg: "server instance is no longer active", Time: time.Now().UnixMilli()}); err != nil {
 					debug("send debug message failed: %v", err)
@@ -201,7 +201,7 @@ func (s *sshUdpServer) handleCloseEvent() {
 
 	_, _ = doWithTimeout(func() (int, error) { busClosingWG.Wait(); return 0, nil }, time.Second)
 
-	if enableWarningLogging || enableDebugLogging {
+	if enableWarningLogging.Load() || enableDebugLogging.Load() {
 		// Give warning and debug logs some time to be delivered to the client.
 		time.Sleep(time.Second)
 	}
@@ -216,7 +216,7 @@ func (s *sshUdpServer) handleAliveEvent(stream Stream, heartbeatTimeout time.Dur
 
 	now := time.Now().UnixMilli()
 
-	if enableDebugLogging {
+	if enableDebugLogging.Load() {
 		elapsed := time.Duration(now-s.clientAliveTime.Load()) * time.Millisecond
 		// If the time since the last recorded activity exceeds heartbeatTimeout,
 		// it indicates that the client was previously disconnected and has now reconnected.

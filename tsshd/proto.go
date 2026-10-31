@@ -342,7 +342,7 @@ func recvMessage(stream io.Reader, msg any) error {
 		return fmt.Errorf("recv message read buffer failed: %w", err)
 	}
 	if err := json.Unmarshal(msgBuf, msg); err != nil {
-		if enableDebugLogging {
+		if enableDebugLogging.Load() {
 			debug("failed to unmarshal message: %s", strconv.QuoteToASCII(string(msgBuf)))
 		}
 		return fmt.Errorf("recv message unmarshal failed: %w", err)
@@ -458,6 +458,7 @@ func (c *kcpClient) newStream(connectTimeout time.Duration) (Stream, error) {
 type quicClient struct {
 	conn      *quic.Conn
 	forwarder *udpForwarder
+	closed    chan struct{}
 }
 
 func (c *quicClient) reset() {
@@ -466,7 +467,9 @@ func (c *quicClient) reset() {
 
 func (c *quicClient) closeClient() error {
 	c.forwarder.Close()
-	return c.conn.CloseWithError(0, "")
+	err := c.conn.CloseWithError(0, "")
+	<-c.closed
+	return err
 }
 
 func (c *quicClient) getUdpForwarder() *udpForwarder {
@@ -577,9 +580,31 @@ func newQuicClient(opts *UdpClientOptions, udpConn net.PacketConn, remoteAddr ne
 
 	ctx, cancel := context.WithTimeout(context.Background(), opts.ConnectTimeout)
 	defer cancel()
-	conn, err := quic.Dial(ctx, udpConn, remoteAddr, tlsConfig, &config)
-	if err != nil {
-		return nil, fmt.Errorf("quic dail [%v] failed: %w", remoteAddr.String(), err)
+	// Own the transport explicitly. quic.Dial closes its single-use transport
+	// before returning a handshake error, but clientProxy reads intentionally
+	// wait through backend failures/reconnections and do not implement deadlines.
+	// Close our packet connection first so Transport.Close can join its reader.
+	transport := &quic.Transport{Conn: udpConn}
+	closeTransport := func() {
+		_ = udpConn.Close()
+		_ = transport.Close()
 	}
-	return &quicClient{conn, &udpForwarder{conn: newQuicDatagramConn(conn, config.InitialPacketSize)}}, nil
+	conn, err := transport.Dial(ctx, remoteAddr, tlsConfig, &config)
+	if err != nil {
+		closeTransport()
+		return nil, fmt.Errorf("quic dial [%v] failed: %w", remoteAddr.String(), err)
+	}
+	client := &quicClient{
+		conn:      conn,
+		forwarder: &udpForwarder{conn: newQuicDatagramConn(conn, config.InitialPacketSize)},
+		closed:    make(chan struct{}),
+	}
+	go func() {
+		// Only terminal QUIC closure ends the proxy lifetime; transient backend
+		// failures must remain reconnectable, even after ConnectTimeout elapses.
+		<-conn.Context().Done()
+		closeTransport()
+		close(client.closed)
+	}()
+	return client, nil
 }

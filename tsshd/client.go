@@ -26,6 +26,7 @@ package tsshd
 
 import (
 	"bytes"
+	"context"
 	"crypto/rand"
 	"encoding/base64"
 	"fmt"
@@ -125,8 +126,11 @@ type UdpClientOptions struct {
 
 // NewSshUdpClient creates a SshUdpClient
 func NewSshUdpClient(opts *UdpClientOptions) (udpClient *SshUdpClient, err error) {
-	enableDebugLogging, clientDebugFn = opts.EnableDebugging, opts.DebugFunc
-	enableWarningLogging, clientWarningFn = opts.EnableWarning, opts.WarningFunc
+	debugFn, warningFn := opts.DebugFunc, opts.WarningFunc
+	enableDebugLogging.Store(opts.EnableDebugging)
+	clientDebugFn.Store(&debugFn)
+	enableWarningLogging.Store(opts.EnableWarning)
+	clientWarningFn.Store(&warningFn)
 
 	if opts.ServerInfo.ProtoVer == 0 {
 		ver, err := parseTsshdVersion(opts.ServerInfo.ServerVer)
@@ -191,10 +195,13 @@ func NewSshUdpClient(opts *UdpClientOptions) (udpClient *SshUdpClient, err error
 		return
 	}
 
-	udpClient.protoClient, err = newProtoClient(opts, udpClient)
+	protoClient, err := newProtoClient(opts, udpClient)
 	if err != nil {
 		return
 	}
+	// Failed protocol constructors can return a typed nil. Only publish a live
+	// client so deferred cleanup never calls methods through that nil pointer.
+	udpClient.protoClient = protoClient
 
 	if udpClient.enableDebugging {
 		udpClient.activeChecker.onTimeout(func() {
@@ -213,42 +220,83 @@ func NewSshUdpClient(opts *UdpClientOptions) (udpClient *SshUdpClient, err error
 	}
 	udpClient.activeChecker.onTimeout(udpClient.tryToReconnect)
 
-	busStream, err := doWithTimeout(func() (Stream, error) { return udpClient.newStream("bus") }, opts.ConnectTimeout)
+	busStream, resp, err := udpClient.initBusStream(opts)
 	if err != nil {
-		err = fmt.Errorf("new bus stream failed: %w", err)
-		return
-	}
-
-	err = sendMessage(busStream, busMessage{
-		ClientVer:        kTsshdVersion,
-		ProtoVer:         udpClient.protoVersion,
-		SessionName:      opts.SessionName,
-		AliveTimeout:     opts.AliveTimeout,
-		IntervalTime:     opts.IntervalTime,
-		HeartbeatTimeout: opts.HeartbeatTimeout})
-	if err != nil {
-		_ = busStream.Close()
-		err = fmt.Errorf("send bus message failed: %w", err)
-		return
-	}
-
-	var resp busResponse
-	err = recvResponse(busStream, &resp)
-	if err != nil {
-		_ = busStream.Close()
-		err = fmt.Errorf("bus stream init failed: %w", err)
 		return
 	}
 	udpClient.debug("bus response next session id: %d", resp.NextSessionID)
 	udpClient.sessionID.Store(resp.NextSessionID)
 
+	// Automatic KCP rekey can already be waiting for the bus. Publish all bus
+	// state under its mutex, and initialize the acknowledgement channel before
+	// starting the reader, which may receive an immediate server event.
+	udpClient.busMutex.Lock()
 	udpClient.busStream, udpClient.busClosed = busStream, make(chan struct{})
-	go udpClient.handleBusEvent()
-
 	udpClient.activeAckChan = make(chan int64, 1)
+	udpClient.busMutex.Unlock()
+	go udpClient.handleBusEvent()
 	go udpClient.keepAlive(opts.IntervalTime)
 
 	return
+}
+
+func (c *SshUdpClient) initBusStream(opts *UdpClientOptions) (stream Stream, resp busResponse, err error) {
+	defer func() {
+		if err != nil && stream != nil {
+			_ = stream.Close()
+			stream = nil
+		}
+	}()
+
+	// Stream setup (open, command, ack) and the bus round trip (message,
+	// server activation, response) each get their own ConnectTimeout, so a
+	// slow but healthy link is not penalized for needing two round trips.
+	err = c.withStartupTimeout("bus stream open", opts.ConnectTimeout, func() (err error) {
+		stream, err = c.newStream("bus")
+		if err != nil {
+			return fmt.Errorf("new bus stream failed: %w", err)
+		}
+		return nil
+	})
+	if err != nil {
+		return
+	}
+
+	err = c.withStartupTimeout("bus stream init", opts.ConnectTimeout, func() error {
+		if err := sendMessage(stream, busMessage{
+			ClientVer:        kTsshdVersion,
+			ProtoVer:         c.protoVersion,
+			SessionName:      opts.SessionName,
+			AliveTimeout:     opts.AliveTimeout,
+			IntervalTime:     opts.IntervalTime,
+			HeartbeatTimeout: opts.HeartbeatTimeout}); err != nil {
+			return fmt.Errorf("send bus message failed: %w", err)
+		}
+		if err := recvResponse(stream, &resp); err != nil {
+			return fmt.Errorf("bus stream init failed: %w", err)
+		}
+		return nil
+	})
+	return
+}
+
+// withStartupTimeout runs fn and closes the protocol client if it does not
+// finish within timeout. Closing interrupts blocked I/O (and smux.OpenStream)
+// rather than leaving a timeout-wrapper goroutine behind.
+func (c *SshUdpClient) withStartupTimeout(phase string, timeout time.Duration, fn func() error) error {
+	closed := make(chan struct{})
+	timer := time.AfterFunc(timeout, func() {
+		_ = c.protoClient.closeClient()
+		close(closed)
+	})
+	err := fn()
+	// Disarm cancellation before the caller continues, or join an
+	// already-running cancellation and report the timeout instead.
+	if !timer.Stop() {
+		<-closed
+		return fmt.Errorf("%s timeout [%v]: %w", phase, timeout, context.DeadlineExceeded)
+	}
+	return err
 }
 
 func (c *SshUdpClient) debug(format string, a ...any) {
@@ -347,6 +395,12 @@ func (c *SshUdpClient) newStream(cmd string) (Stream, error) {
 	if err != nil {
 		return nil, fmt.Errorf("new stream [%s] failed: %w", cmd, err)
 	}
+	// Bound the command acknowledgement so NewSession/Dial cannot hang forever
+	// on a stalled transport. The bus stream is bounded by initBusStream.
+	if cmd != "bus" && c.connectTimeout > 0 {
+		_ = stream.SetDeadline(time.Now().Add(c.connectTimeout))
+		defer func() { _ = stream.SetDeadline(time.Time{}) }()
+	}
 	if err := sendCommand(stream, cmd); err != nil {
 		_ = stream.Close()
 		return nil, fmt.Errorf("send command [%s] failed: %w", cmd, err)
@@ -356,6 +410,17 @@ func (c *SshUdpClient) newStream(cmd string) (Stream, error) {
 		return nil, fmt.Errorf("new stream [%s] error: %w", cmd, err)
 	}
 	return stream, nil
+}
+
+// setDialDeadline bounds the dial request and response by the remote dial
+// timeout plus one ConnectTimeout for the round trip. Without a dial timeout
+// the remote dial is unbounded by design, so no deadline is set.
+func (c *SshUdpClient) setDialDeadline(stream Stream, timeout time.Duration) (clear func()) {
+	if timeout <= 0 || c.connectTimeout <= 0 {
+		return func() {}
+	}
+	_ = stream.SetDeadline(time.Now().Add(timeout + c.connectTimeout))
+	return func() { _ = stream.SetDeadline(time.Time{}) }
 }
 
 // NewSession opens a new Session for this client
@@ -385,6 +450,7 @@ func (c *SshUdpClient) DialTimeout(network, addr string, timeout time.Duration) 
 		Addr:    addr,
 		Timeout: timeout,
 	}
+	clearDeadline := c.setDialDeadline(stream, timeout)
 	if err := sendMessage(stream, &msg); err != nil {
 		_ = stream.Close()
 		return nil, fmt.Errorf("send dial message failed: %w", err)
@@ -394,6 +460,7 @@ func (c *SshUdpClient) DialTimeout(network, addr string, timeout time.Duration) 
 		_ = stream.Close()
 		return nil, err
 	}
+	clearDeadline()
 	c.exitWG.Add(1)
 	return &sshUdpConn{Stream: stream, rAddr: resp.RemoteAddr, client: c}, nil
 }
@@ -423,6 +490,7 @@ func (c *SshUdpClient) dialUDP(network, addr string, timeout time.Duration, data
 		Addr:    addr,
 		Timeout: timeout,
 	}
+	clearDeadline := c.setDialDeadline(stream, timeout)
 	if err := sendMessage(stream, &msg); err != nil {
 		_ = stream.Close()
 		return nil, fmt.Errorf("send dial udp message failed: %w", err)
@@ -432,6 +500,7 @@ func (c *SshUdpClient) dialUDP(network, addr string, timeout time.Duration, data
 		_ = stream.Close()
 		return nil, err
 	}
+	clearDeadline()
 
 	conn := newPacketConn(stream, resp.ID, c.protoClient.getUdpForwarder(), c.clientProxy.serverChecker)
 	conn.datagramOnly = datagramOnly
@@ -1119,7 +1188,7 @@ func (s *SshUdpSession) forwardInput() {
 						return
 					}
 				} else {
-					if enableDebugLogging {
+					if enableDebugLogging.Load() {
 						s.client.debug("discard input: %s", strconv.QuoteToASCII(string(buf)))
 					}
 					if s.client.discardCallback != nil {

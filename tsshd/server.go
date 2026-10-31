@@ -123,7 +123,7 @@ var newSshUdpServer = func(args *tsshdArgs, proxy *serverProxy, addr net.Addr, p
 func (s *sshUdpServer) initClientChecker(timeout time.Duration) {
 	s.clientChecker = newTimeoutChecker(timeout)
 
-	if enableDebugLogging {
+	if enableDebugLogging.Load() {
 		s.clientChecker.onTimeout(func() {
 			debug("blocked due to no client [%x] input for [%v]", s.client.proxyAddr.clientID, s.clientChecker.heartbeatTimeout)
 		})
@@ -165,7 +165,7 @@ func (s *sshUdpServer) initClientChecker(timeout time.Duration) {
 		s.client.setClientConn(oldClientConn, nil)
 		debug("client [%x] transport cleared due to timeout", s.client.proxyAddr.clientID)
 
-		if enableDebugLogging && !s.client.udpTraffic.recFlag.Load() {
+		if enableDebugLogging.Load() && !s.client.udpTraffic.recFlag.Load() {
 			s.client.udpTraffic.resetStats()
 			s.client.udpTraffic.recFlag.Store(true)
 		}
@@ -353,7 +353,7 @@ func (s *sshUdpServer) handleStream(stream Stream) {
 		return
 	}
 
-	if enableDebugLogging && command != "dial" && command != "accept" && command != "dial-udp" && command != "accept-udp" {
+	if enableDebugLogging.Load() && command != "dial" && command != "accept" && command != "dial-udp" && command != "accept-udp" {
 		debug("stream [%x][%d] command [%s] starts", s.client.proxyAddr.clientID, id, command)
 		defer debug("stream [%x][%d] command [%s] closing", s.client.proxyAddr.clientID, id, command)
 	}

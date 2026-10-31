@@ -759,7 +759,7 @@ func (p *serverProxy) newClientState(clientID uint64) (*clientState, error) {
 		client.kcpCrypto.Store(crypto)
 	}
 
-	if enableDebugLogging {
+	if enableDebugLogging.Load() {
 		client.udpTraffic = &trafficStats{}
 	}
 
@@ -826,7 +826,7 @@ func (p *serverProxy) openAuthPacket(buf []byte) (bool, uint64, uint64) {
 }
 
 func (p *serverProxy) onNewClientConn(client *clientState) {
-	if enableDebugLogging {
+	if enableDebugLogging.Load() {
 		debug("client [%x] [%d] active from %s", client.proxyAddr.clientID, client.serialNumber.Load(), client.remoteAddr())
 	}
 
@@ -870,7 +870,7 @@ func (p *serverProxy) ReadFrom(buf []byte) (int, net.Addr, error) {
 		server.clientChecker.updateNow()
 	}
 
-	if enableDebugLogging && client.udpTraffic.recFlag.Load() {
+	if enableDebugLogging.Load() && client.udpTraffic.recFlag.Load() {
 		client.udpTraffic.recvCount.Add(1)
 		client.udpTraffic.recvBytes.Add(uint64(n))
 	}
@@ -913,7 +913,7 @@ func (p *serverProxy) WriteTo(buf []byte, addr net.Addr) (int, error) {
 		if err != errClientDisconnected {
 			debug("frontend write failed: %v", err)
 		}
-	} else if enableDebugLogging && client.udpTraffic.recFlag.Load() {
+	} else if enableDebugLogging.Load() && client.udpTraffic.recFlag.Load() {
 		client.udpTraffic.sendCount.Add(1)
 		client.udpTraffic.sendBytes.Add(uint64(len(buf)))
 	}

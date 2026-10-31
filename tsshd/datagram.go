@@ -806,13 +806,13 @@ func (s *sshUdpServer) handleAcceptUdpEvent(stream Stream) {
 	_ = session.forwardConn.Consume(func(buf []byte) error {
 		if _, err := session.listenerConn.WriteTo(buf, session.peerAddr); err != nil {
 			if IsClosedError(err) {
-				if enableDebugLogging {
+				if enableDebugLogging.Load() {
 					debug("udp listener [%s] [%s] write to [%s] closed: %v", session.listenerNet, session.listenerAddr, session.getPeerAddr(), err)
 				}
 				return err
 			}
 			warnOnce.Do(func() {
-				if enableWarningLogging {
+				if enableWarningLogging.Load() {
 					warning("udp listener [%s] [%s] write to [%s] failed: %v", session.listenerNet, session.listenerAddr, session.getPeerAddr(), err)
 				}
 			})

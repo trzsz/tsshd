@@ -280,13 +280,13 @@ func (c *sessionContext) discardPendingInput(server *sshUdpServer, buf []byte, m
 	}
 
 	if pos > 0 {
-		if enableDebugLogging {
+		if enableDebugLogging.Load() {
 			debug("discard input: %s", strconv.QuoteToASCII(string(c.discardedInput[:pos])))
 		}
 		if err := server.sendBusMessage("discard", discardMessage{DiscardedInput: c.discardedInput[:pos]}); err != nil {
 			warning("send discard message failed: %v", err)
 		}
-	} else if enableDebugLogging {
+	} else if enableDebugLogging.Load() {
 		debug("no pending input to discard")
 	}
 
@@ -547,7 +547,7 @@ func (c *sessionContext) SetSize(cols, rows int, redraw bool, discardOutput bool
 		c.screenMu.Unlock()
 	}
 
-	if enableDebugLogging {
+	if enableDebugLogging.Load() {
 		verb := "resize"
 		if redraw {
 			verb = "redraw"
@@ -578,7 +578,7 @@ func (c *sessionContext) cancellableWait() {
 }
 
 func (s *sshUdpServer) handleSessionEvent(stream Stream) {
-	if enableDebugLogging {
+	if enableDebugLogging.Load() {
 		debug("session goroutine for client [%x] started", s.client.proxyAddr.clientID)
 		defer debug("session goroutine for client [%x] returned", s.client.proxyAddr.clientID)
 	}
@@ -725,7 +725,7 @@ func newSessionContext(server *sshUdpServer, msg *startMessage) (*sessionContext
 				sess.screenMu.Lock()
 				err := stream.Feed(data)
 				sess.screenMu.Unlock()
-				if err != nil && enableDebugLogging {
+				if err != nil && enableDebugLogging.Load() {
 					content := strconv.QuoteToASCII(data)
 					if len(content) > 256 {
 						content = content[:256] + "..."
@@ -953,7 +953,7 @@ func getEnvironments(msg *startMessage) []string {
 }
 
 func (s *sshUdpServer) handleStderrEvent(stream Stream) {
-	if enableDebugLogging {
+	if enableDebugLogging.Load() {
 		debug("stderr goroutine for client [%x] started", s.client.proxyAddr.clientID)
 		defer debug("stderr goroutine for client [%x] returned", s.client.proxyAddr.clientID)
 	}

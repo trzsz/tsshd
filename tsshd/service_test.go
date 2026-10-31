@@ -31,9 +31,9 @@ import (
 )
 
 func TestParsePortRanges(t *testing.T) {
-	enableWarning := enableWarningLogging
-	enableWarningLogging = false
-	defer func() { enableWarningLogging = enableWarning }()
+	enableWarning := enableWarningLogging.Load()
+	enableWarningLogging.Store(false)
+	defer enableWarningLogging.Store(enableWarning)
 
 	assert := assert.New(t)
 	assert.Equal([][2]uint16{{22, 22}}, parsePortRanges("22"))

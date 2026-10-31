@@ -134,7 +134,7 @@ func initServer(args *tsshdArgs) (*ServerInfo, string, error) {
 		return nil, "", err
 	}
 
-	if enableDebugLogging {
+	if enableDebugLogging.Load() {
 		debug("tsshd listening: pid=%d, port=%d", os.Getpid(), port)
 	}
 

@@ -114,7 +114,7 @@ func getSubsystemCmd(name string) (*exec.Cmd, error) {
 func initSshdConfig() {
 	sshdConfigPath = getSshdConfigPath()
 
-	if enableDebugLogging {
+	if enableDebugLogging.Load() {
 		if _, err := os.Stat(sshdConfigPath); err == nil {
 			debug("sshd_config path: %s", sshdConfigPath)
 		}

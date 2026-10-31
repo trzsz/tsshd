@@ -75,7 +75,7 @@ func (f *clientOutputForwarder) forward() {
 					if f.marker.CompareAndSwap(marker, nil) {
 						// Add 1 to discardLines to account for the final line fragment before the marker
 						lines, bytes := f.discardLines+1, f.discardBytes
-						if enableDebugLogging {
+						if enableDebugLogging.Load() {
 							f.client.debug("session [%d] %s matched marker: %s", f.sess.id, f.name, string(*marker))
 							if bytes > 0 {
 								f.client.debug("discard output %d lines %d bytes", lines, bytes)
@@ -233,7 +233,7 @@ func (f *serverOutputForwarder) flushOutput() {
 	}
 
 	filteredCount := 0
-	if enableDebugLogging {
+	if enableDebugLogging.Load() {
 		defer func() {
 			if filteredCount > 0 {
 				debug("filtered %d ESC[6n cursor position request(s)", filteredCount)
@@ -259,7 +259,7 @@ func (f *serverOutputForwarder) flushOutput() {
 			}
 		} else {
 			line = f.cacheLines[i]
-			if enableDebugLogging {
+			if enableDebugLogging.Load() {
 				filteredCount += bytes.Count(line, []byte("\x1b[6n"))
 			}
 			line = bytes.ReplaceAll(line, []byte("\x1b[6n"), []byte(""))

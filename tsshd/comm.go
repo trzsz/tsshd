@@ -40,11 +40,13 @@ import (
 	"github.com/trzsz/quic-go"
 )
 
-var enableDebugLogging bool = false
-var enableWarningLogging bool = false
+// Logging switches are shared by the server and the client library (and by
+// concurrent clients in one process), so they are read and written atomically.
+var enableDebugLogging atomic.Bool
+var enableWarningLogging atomic.Bool
 
-var clientDebugFn func(int64, string)
-var clientWarningFn func(string)
+var clientDebugFn atomic.Pointer[func(int64, string)]
+var clientWarningFn atomic.Pointer[func(string)]
 
 var debugMsgChan chan *debugMessage
 var initDebugSenderOnce sync.Once
@@ -59,7 +61,7 @@ const kHeartbeatLogLimit uint64 = 10
 const kHeartbeatInitCount uint64 = 1000
 
 func initDebugLogging() {
-	enableDebugLogging = true
+	enableDebugLogging.Store(true)
 
 	var err error
 	debugLogFile, err = os.CreateTemp("", fmt.Sprintf("tsshd_debug_%d_*.log", os.Getpid()))
@@ -91,15 +93,15 @@ func writeDebugLog(now *time.Time, msg string) {
 }
 
 func debug(format string, a ...any) {
-	if !enableDebugLogging {
+	if !enableDebugLogging.Load() {
 		return
 	}
 
 	msg := fmt.Sprintf(format, a...)
 
-	if clientDebugFn != nil {
+	if fn := clientDebugFn.Load(); fn != nil && *fn != nil {
 		// should not reach here
-		clientDebugFn(time.Now().UnixMilli(), fmt.Sprintf("[fix_me] %s", msg))
+		(*fn)(time.Now().UnixMilli(), fmt.Sprintf("[fix_me] %s", msg))
 		return
 	}
 
@@ -138,15 +140,15 @@ func debug(format string, a ...any) {
 }
 
 func warning(format string, a ...any) {
-	if !enableWarningLogging {
+	if !enableWarningLogging.Load() {
 		return
 	}
 
 	msg := fmt.Sprintf(format, a...)
 
-	if clientWarningFn != nil {
+	if fn := clientWarningFn.Load(); fn != nil && *fn != nil {
 		// should not reach here
-		clientWarningFn(fmt.Sprintf("[fix_me] %s", msg))
+		(*fn)(fmt.Sprintf("[fix_me] %s", msg))
 		return
 	}
 

@@ -286,7 +286,7 @@ func RunMain(opts ...Option) (int, error) {
 	}
 
 	// init logging and sshd_config
-	enableWarningLogging = true
+	enableWarningLogging.Store(true)
 
 	if args.Debug {
 		initDebugLogging()
@@ -294,9 +294,9 @@ func RunMain(opts ...Option) (int, error) {
 
 	initSshdConfig()
 
-	if !enableDebugLogging {
+	if !enableDebugLogging.Load() {
 		if v := getSshdConfig("LogLevel"); strings.EqualFold(v, "quiet") || strings.EqualFold(v, "fatal") {
-			enableWarningLogging = false
+			enableWarningLogging.Store(false)
 		}
 	}
 
@@ -322,7 +322,7 @@ func RunMain(opts ...Option) (int, error) {
 			_, _ = doWithTimeout(func() (int, error) { server.Close(); return 0, nil }, time.Second)
 			// If the client is still active on exit, logs have likely been delivered,
 			// so the server-side debug log can be cleaned up.
-			if enableDebugLogging && server.isClientAlive() {
+			if enableDebugLogging.Load() && server.isClientAlive() {
 				cleanupDebugLog.Store(true)
 			}
 		}

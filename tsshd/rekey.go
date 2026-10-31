@@ -301,7 +301,16 @@ func (r *rotatingCrypto) doRekey() error {
 	r.clientPriKey.Store(clientPriKey)
 
 	for !r.client.isBusStreamInited() {
-		time.Sleep(100 * time.Millisecond)
+		// Failed client startup never publishes a bus. Stop its pending initial
+		// rekey when cleanup closes the crypto or the client.
+		if r.closed.Load() || r.client.IsClosed() {
+			return io.ErrClosedPipe
+		}
+		select {
+		case <-r.stopCh:
+			return io.ErrClosedPipe
+		case <-time.After(100 * time.Millisecond):
+		}
 	}
 	return r.client.sendBusMessage("rekey", rekeyMessage{clientPriKey.PublicKey().Bytes()})
 }

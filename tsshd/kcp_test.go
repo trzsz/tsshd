@@ -512,18 +512,22 @@ func TestKCP_DelegatedCrypto(t *testing.T) {
 		t.Fatalf("newRotatingCrypto failed: %v", err)
 	}
 
-	oriClientDebugFn, oriEnableDebugLogging := clientDebugFn, enableDebugLogging
-	defer func() { clientDebugFn, enableDebugLogging = oriClientDebugFn, oriEnableDebugLogging }()
+	oriClientDebugFn, oriEnableDebugLogging := clientDebugFn.Load(), enableDebugLogging.Load()
+	defer func() {
+		clientDebugFn.Store(oriClientDebugFn)
+		enableDebugLogging.Store(oriEnableDebugLogging)
+	}()
 
 	var debugCalled, kcpMemUnexpected atomic.Bool
-	clientDebugFn = func(_ int64, msg string) {
+	debugFn := func(_ int64, msg string) {
 		debugCalled.Store(true)
 		if strings.Contains(msg, kcpMemLayoutUnexpected) {
 			kcpMemUnexpected.Store(true)
 		}
 	}
+	clientDebugFn.Store(&debugFn)
 
-	enableDebugLogging = true
+	enableDebugLogging.Store(true)
 	debug("call clientDebugFn")
 	if !debugCalled.Load() {
 		t.Fatalf("expected clientDebugFn to be called but it was not")
