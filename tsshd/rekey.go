@@ -188,7 +188,7 @@ func (r *rotatingCrypto) consumeBytes(n uint64) {
 
 	r.bytesConsumed += n
 
-	if r.bytesConsumed >= r.bytesThreshold && !r.bytesTriggered {
+	if r.bytesConsumed >= r.bytesThreshold && !r.bytesTriggered && r.client != nil {
 		r.bytesTriggered = true
 		r.debug("byte-based rekey triggered: consumed [%d] threshold [%d]", r.bytesConsumed, r.bytesThreshold)
 		go r.startRekey()

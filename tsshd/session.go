@@ -595,8 +595,14 @@ func (s *sshUdpServer) handleSessionEvent(stream Stream) {
 	}
 	var errStream Stream
 	if es := s.takeStderrStream(errID); es != nil {
-		defer func() { _ = es.Close() }()
-		errStream = es
+		var err error
+		errStream, err = compressOutput(msg.Compression, es)
+		if err != nil {
+			_ = es.Close()
+			sendError(stream, fmt.Errorf("compress stderr failed: %v", err))
+			return
+		}
+		defer func() { _ = errStream.Close() }()
 	} else {
 		errStream = &discardStream{}
 	}
@@ -635,32 +641,28 @@ func (s *sshUdpServer) handleSessionEvent(stream Stream) {
 		return
 	}
 
-	// The server decides whether the output is compressed and tells the client in the ack,
-	// so both sides always agree.
-	var resp startResponse
-	outStream, err := compressOutput(&msg, stream)
+	outStream, err := compressOutput(msg.Compression, stream)
 	if err != nil {
-		warning("session [%d] compression failed: %v", msg.ID, err)
-	} else if outStream != stream {
-		resp.Compress = kCompressZstd
+		sendError(stream, fmt.Errorf("compress stdout failed: %v", err))
+		sess.Close()
+		return
+	}
+	if msg.Compression != "" {
+		debug("session [%d] output compressed with %s", msg.ID, msg.Compression)
 	}
 
-	if err := sendResponse(stream, &resp); err != nil { // ack ok
+	if err := sendSuccess(stream); err != nil { // ack ok
 		warning("start session ack ok failed: %v", err)
+		_ = outStream.Close()
 		sess.Close()
 		return
 	}
 
-	if outStream != stream {
-		stream = outStream
-		debug("session [%d] output compressed with zstd", msg.ID)
-	}
-
 	if sess.mwSess == nil && msg.Shell {
-		sess.showMotd(stream)
+		sess.showMotd(outStream)
 	}
 
-	sess.forwardIO(s, stream, errStream)
+	sess.forwardIO(s, outStream, errStream)
 
 	if s.args.Attachable {
 		// Each session is started only once since duplicate session IDs are rejected,

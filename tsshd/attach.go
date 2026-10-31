@@ -385,16 +385,16 @@ func (s *sshUdpServer) attachSession(ioStream, errStream Stream, msg *startMessa
 		return nil, 0, fmt.Errorf("invalid session state: err stream is nil")
 	}
 
-	// the attaching client gets its own encoder if it asks for it, see compressOutput
-	var resp startResponse
-	outStream, err := compressOutput(msg, ioStream)
+	outStream, err := compressOutput(msg.Compression, ioStream)
 	if err != nil {
-		warning("session [%d] compression failed: %v", msg.ID, err)
-	} else if outStream != ioStream {
-		resp.Compress = kCompressZstd
+		return nil, 0, fmt.Errorf("compress stdout failed: %v", err)
+	}
+	if msg.Compression != "" {
+		debug("session [%d] output compressed with %s", msg.ID, msg.Compression)
 	}
 
-	if err := sendResponse(ioStream, &resp); err != nil { // ack ok
+	if err := sendSuccess(ioStream); err != nil { // ack ok
+		_ = outStream.Close()
 		return nil, 0, fmt.Errorf("ack ok failed: %v", err)
 	}
 

@@ -25,59 +25,63 @@ SOFTWARE.
 package tsshd
 
 import (
-	"errors"
-	"io"
+	"fmt"
+	"strings"
 	"sync"
 
 	"github.com/klauspost/compress/zstd"
 )
 
-// kCompressZstd compresses the session output (server to client) with one zstd stream per session.
-// The stream is flushed on every write, so the client can show the output at once.
-const kCompressZstd = "zstd"
+// kCompressionZstd is the Zstandard compression algorithm used for session output.
+const kCompressionZstd = "zstd"
 
-const kCompressWindow = 1 << 20
+// kZstdCompressWindow is the maximum window size used by the Zstd encoder and decoder.
+const kZstdCompressWindow = 1 << 20
 
-// compressionWanted reports whether the client asks for compressed output: the client
-// must request it and the server must support it, older servers do not set ServerInfo.Compress.
-func compressionWanted(info *ServerInfo, requested string) bool {
-	return requested == kCompressZstd && info.Compress == kCompressZstd
-}
-
-// requestCompression asks the server to compress the output of a session, also when
-// attaching to one.
-func requestCompression(msg *startMessage, wanted bool) {
-	if wanted {
-		msg.Compress = kCompressZstd
+// selectCompression selects the session output compression algorithm based on
+// the requested algorithm and negotiated protocol version.
+func selectCompression(protoVersion int, requested string) (string, error) {
+	switch {
+	case requested == "", strings.EqualFold(requested, "zstd"):
+		if protoVersion >= 2 {
+			return kCompressionZstd, nil
+		}
+		return "", nil
+	case strings.EqualFold(requested, "none"):
+		return "", nil
+	default:
+		return "", fmt.Errorf("invalid compression algorithm: %q", requested)
 	}
 }
 
-// compressOutput returns the stream the server writes the session output to. Every client
-// gets its own encoder on its own stream: attaching swaps the client stream of a session,
-// the encoder of the previous client goes away with it and the new client starts fresh.
-// The encoder must not wrap the replaceable stream, which retries an interrupted write on
-// the new stream and would mix the output of two compression contexts.
-func compressOutput(msg *startMessage, stream Stream) (Stream, error) {
-	if msg.Compress != kCompressZstd {
+// compressOutput returns the stream used to write session output.
+// Each client gets a separate encoder so attaching a new client starts a fresh
+// compression stream. The encoder must wrap the underlying stream rather than
+// the replaceable session stream, which may retry a write on a different client
+// stream and mix two compression contexts.
+func compressOutput(compression string, stream Stream) (Stream, error) {
+	switch compression {
+	case "":
 		return stream, nil
+	case kCompressionZstd:
+		return newZstdWriteStream(stream)
+	default:
+		return nil, fmt.Errorf("unsupported compression algorithm: %q", compression)
 	}
-	zs, err := newZstdWriteStream(stream)
-	if err != nil {
-		return stream, err
-	}
-	return zs, nil
 }
 
-// zstdWriteStream compresses what is written to the session stream, reads pass through.
+// zstdWriteStream compresses writes while passing reads through unchanged.
 type zstdWriteStream struct {
 	Stream
-	mu  sync.Mutex
-	enc *zstd.Encoder
+	mu      sync.Mutex
+	enc     *zstd.Encoder
+	finOnce sync.Once
+	finErr  error
 }
 
 func newZstdWriteStream(stream Stream) (*zstdWriteStream, error) {
 	enc, err := zstd.NewWriter(stream, zstd.WithEncoderLevel(zstd.SpeedDefault),
-		zstd.WithWindowSize(kCompressWindow), zstd.WithEncoderConcurrency(1), zstd.WithLowerEncoderMem(true))
+		zstd.WithWindowSize(kZstdCompressWindow), zstd.WithEncoderConcurrency(1), zstd.WithLowerEncoderMem(true))
 	if err != nil {
 		return nil, err
 	}
@@ -87,40 +91,60 @@ func newZstdWriteStream(stream Stream) (*zstdWriteStream, error) {
 func (s *zstdWriteStream) Write(p []byte) (int, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if _, err := s.enc.Write(p); err != nil {
-		return 0, err
+	n, err := s.enc.Write(p)
+	if err != nil {
+		return n, err
 	}
 	if err := s.enc.Flush(); err != nil {
-		return 0, err
+		return n, err
 	}
-	return len(p), nil
+	return n, nil
 }
 
-func (s *zstdWriteStream) finish() {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	_ = s.enc.Close()
+func (s *zstdWriteStream) finish() error {
+	s.finOnce.Do(func() {
+		s.mu.Lock()
+		defer s.mu.Unlock()
+		s.finErr = s.enc.Close()
+	})
+	return s.finErr
 }
 
 func (s *zstdWriteStream) CloseWrite() error {
-	s.finish()
-	return s.Stream.CloseWrite()
+	err := s.finish()
+	closeErr := s.Stream.CloseWrite()
+	if err != nil {
+		return err
+	}
+	return closeErr
 }
 
-// Close closes the stream before it finishes the encoder: a write blocked on a client that is
-// gone holds the encoder until the stream is closed. The output ends with CloseWrite instead.
+// Close aborts the compressed stream by closing the underlying stream first,
+// unblocking any pending write before releasing the encoder.
+// Use CloseWrite to finish the compressed stream normally.
 func (s *zstdWriteStream) Close() error {
 	err := s.Stream.Close()
-	s.finish()
+	_ = s.finish()
 	return err
 }
 
-// zstdReadStream decompresses what is read from the session stream, writes pass through.
+// decompressOutput returns the stream used to read session output.
+func decompressOutput(compression string, stream Stream) (Stream, error) {
+	switch compression {
+	case "":
+		return stream, nil
+	case kCompressionZstd:
+		return newZstdReadStream(stream)
+	default:
+		return nil, fmt.Errorf("unsupported compression algorithm: %q", compression)
+	}
+}
+
+// zstdReadStream decompresses reads while passing writes through unchanged.
 //
-// Close is left to the embedded stream. The decoder is not safe to close while another
-// goroutine is blocked in Read, which is what happens when a session is closed while its
-// output forwarder is still running. With decoder concurrency 1 there are no goroutines
-// behind it, so the garbage collector reclaims it once the forwarder returns.
+// Close is left to the embedded stream. Closing the decoder while another
+// goroutine is blocked in Read is unsafe. Instead, closing the underlying
+// stream unblocks Read, allowing the decoder to be reclaimed by the garbage collector.
 type zstdReadStream struct {
 	Stream
 	dec *zstd.Decoder
@@ -128,7 +152,7 @@ type zstdReadStream struct {
 
 func newZstdReadStream(stream Stream) (*zstdReadStream, error) {
 	dec, err := zstd.NewReader(stream, zstd.WithDecoderConcurrency(1), zstd.WithDecoderLowmem(true),
-		zstd.WithDecoderMaxWindow(kCompressWindow))
+		zstd.WithDecoderMaxWindow(kZstdCompressWindow))
 	if err != nil {
 		return nil, err
 	}
@@ -136,9 +160,5 @@ func newZstdReadStream(stream Stream) (*zstdReadStream, error) {
 }
 
 func (s *zstdReadStream) Read(p []byte) (int, error) {
-	n, err := s.dec.Read(p)
-	if errors.Is(err, io.ErrUnexpectedEOF) {
-		err = io.EOF
-	}
-	return n, err
+	return s.dec.Read(p)
 }

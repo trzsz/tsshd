@@ -35,7 +35,7 @@ import (
 
 const kTsshdVersion = "0.1.10"
 
-const kTsshdProtocol = 1
+const kTsshdProtocol = 2
 
 // buildTag stores the version tag injected at build time via -ldflags.
 var buildTag = ""
