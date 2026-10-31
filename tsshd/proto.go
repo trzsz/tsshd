@@ -168,6 +168,8 @@ type startMessage struct {
 	Subs   string               `json:",omitempty"`
 	Attach bool                 `json:",omitempty"`
 	ErrID  uint64               `json:",omitempty"`
+	// Compression specifies the requested session output compression algorithm.
+	Compression string `json:",omitempty"`
 }
 
 type exitMessage struct {

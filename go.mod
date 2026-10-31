@@ -8,6 +8,7 @@ require (
 	github.com/charmbracelet/x/ansi v0.11.9
 	github.com/creack/pty v1.1.24
 	github.com/google/shlex v0.0.0-20191202100458-e7afc7fbc510
+	github.com/klauspost/compress v1.20.3
 	github.com/rcarmo/go-te v0.1.1-0.20261011111757-c4b625a6ea41
 	github.com/stretchr/testify v1.12.1
 	github.com/trzsz/kcp-go/v5 v5.6.73

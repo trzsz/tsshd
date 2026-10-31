@@ -385,7 +385,16 @@ func (s *sshUdpServer) attachSession(ioStream, errStream Stream, msg *startMessa
 		return nil, 0, fmt.Errorf("invalid session state: err stream is nil")
 	}
 
+	outStream, err := compressOutput(msg.Compression, ioStream)
+	if err != nil {
+		return nil, 0, fmt.Errorf("compress stdout failed: %v", err)
+	}
+	if msg.Compression != "" {
+		debug("session [%d] output compressed with %s", msg.ID, msg.Compression)
+	}
+
 	if err := sendSuccess(ioStream); err != nil { // ack ok
+		_ = outStream.Close()
 		return nil, 0, fmt.Errorf("ack ok failed: %v", err)
 	}
 
@@ -393,7 +402,7 @@ func (s *sshUdpServer) attachSession(ioStream, errStream Stream, msg *startMessa
 	// since incoming data may immediately require the server instance.
 	sess.server.Store(s)
 
-	sess.ioStream.swap(ioStream)
+	sess.ioStream.swap(outStream)
 	sess.errStream.swap(errStream)
 
 	if pty {
