@@ -622,6 +622,10 @@ func startClientProxy(client *SshUdpClient, opts *UdpClientOptions) (*clientProx
 		network += "4"
 	} else if opts.IPv6 && !opts.IPv4 {
 		network += "6"
+	} else if opts.ServerInfo.AddressFamily == "inet" {
+		network += "4"
+	} else if opts.ServerInfo.AddressFamily == "inet6" {
+		network += "6"
 	}
 
 	clientID := opts.ServerInfo.ClientID

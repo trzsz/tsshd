@@ -201,7 +201,7 @@ func handleAttachRequest(conn net.Conn) error {
 		globalSocketInfo.serverInfo.ClientID++
 	}
 
-	infoStr, err := json.Marshal(globalSocketInfo.serverInfo)
+	infoStr, err := json.Marshal(globalSocketInfo.serverInfo.snapshot())
 	if err != nil {
 		_, _ = fmt.Fprintf(conn, "ERROR: generate server info failed: %v\n", err)
 		return fmt.Errorf("json marshal server info failed: %v", err)

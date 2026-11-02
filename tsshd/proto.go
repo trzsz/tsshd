@@ -96,6 +96,20 @@ type ServerInfo struct {
 	ServerID   uint64 `json:",omitempty"`
 	ProxyMode  string `json:",omitempty"`
 	MTU        uint16 `json:",omitempty"`
+
+	// AddressFamily is "inet" or "inet6" for a single-family frontend.
+	// Empty means unknown or unrestricted.
+	AddressFamily string `json:",omitempty"`
+	frontendConn  frontendConnection
+}
+
+// Listener selection can change after startup; attach needs the current family.
+func (s *ServerInfo) snapshot() ServerInfo {
+	info := *s
+	if s.frontendConn != nil {
+		info.AddressFamily = s.frontendConn.addressFamily()
+	}
+	return info
 }
 
 type SessionInfo struct {
