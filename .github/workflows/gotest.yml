@@ -1,6 +1,18 @@
 name: Go test tsshd
 on: [push, pull_request]
 jobs:
+  go-test-race:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout tsshd
+        uses: actions/checkout@v6
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version: "1.26"
+      - name: make test with race detector
+        run: make test GO_TEST='go test -race -timeout 10m'
   go-test-on-linux:
     runs-on: ubuntu-latest
     steps:
@@ -42,7 +54,7 @@ jobs:
       - name: Set up Go
         run: |
           wget -q https://github.com/thongtech/go-legacy-win7/releases/download/v1.26.7-1/go-legacy-win7-1.26.7-1.linux_amd64.tar.gz -O /tmp/go.tar.gz
-          tar -C $HOME -xzf /tmp/go.tar.gz
+          tar -C "$HOME" -xzf /tmp/go.tar.gz
       - name: Build tsshd
         run: |
           export GOROOT=$HOME/go-legacy-win7

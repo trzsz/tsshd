@@ -45,7 +45,11 @@ func TestKCP_PassSaltValidation(t *testing.T) {
 	defer func() { _ = svrConn.Close() }()
 
 	// Start KCP server
-	listener, _, err := listenKCP(svrConn, opts.ServerInfo, false)
+	crypto, err := newKcpServerCrypto(opts.ServerInfo, false)
+	if err != nil {
+		t.Fatalf("newKcpServerCrypto failed: %v", err)
+	}
+	listener, err := listenKCP(svrConn, crypto)
 	if err != nil {
 		t.Fatalf("listenKCP failed: %v", err)
 	}
@@ -72,6 +76,8 @@ func TestKCP_PassSaltValidation(t *testing.T) {
 			for {
 				if conn, err := listener.AcceptKCP(); err == nil {
 					_ = conn.Close()
+				} else {
+					return
 				}
 			}
 		}()
@@ -188,7 +194,11 @@ func TestKCP_OOB(t *testing.T) {
 	defer func() { _ = svrConn.Close() }()
 
 	// Start KCP server
-	listener, _, err := listenKCP(svrConn, opts.ServerInfo, false)
+	crypto, err := newKcpServerCrypto(opts.ServerInfo, false)
+	if err != nil {
+		t.Fatalf("newKcpServerCrypto failed: %v", err)
+	}
+	listener, err := listenKCP(svrConn, crypto)
 	if err != nil {
 		t.Fatalf("listenKCP failed: %v", err)
 	}
@@ -447,7 +457,11 @@ func TestKCP_EchoBasic(t *testing.T) {
 	svrConn := listenRandomUDP(t)
 	defer func() { _ = svrConn.Close() }()
 
-	listener, _, err := listenKCP(svrConn, opts.ServerInfo, false)
+	crypto, err := newKcpServerCrypto(opts.ServerInfo, false)
+	if err != nil {
+		t.Fatalf("newKcpServerCrypto failed: %v", err)
+	}
+	listener, err := listenKCP(svrConn, crypto)
 	if err != nil {
 		t.Fatalf("listenKCP failed: %v", err)
 	}
@@ -501,16 +515,21 @@ func TestKCP_DelegatedCrypto(t *testing.T) {
 	defer func() { _ = svrConn.Close() }()
 
 	proxy := &proxyWithCrypto{t: t, conn: svrConn}
-	listener, crypto, err := listenKCP(proxy, opts.ServerInfo, true)
+	crypto, err := newKcpServerCrypto(opts.ServerInfo, true)
 	if err != nil {
-		t.Fatalf("listenKCP failed: %v", err)
+		t.Fatalf("newKcpServerCrypto failed: %v", err)
 	}
-	defer func() { _ = listener.Close() }()
 
 	proxy.crypto, err = newRotatingCrypto(nil, crypto.keyPass, crypto.keySalt, 0, 0, false)
 	if err != nil {
 		t.Fatalf("newRotatingCrypto failed: %v", err)
 	}
+
+	listener, err := listenKCP(proxy, crypto)
+	if err != nil {
+		t.Fatalf("listenKCP failed: %v", err)
+	}
+	defer func() { _ = listener.Close() }()
 
 	oriClientDebugFn, oriEnableDebugLogging := clientDebugFn, enableDebugLogging
 	defer func() { clientDebugFn, enableDebugLogging = oriClientDebugFn, oriEnableDebugLogging }()

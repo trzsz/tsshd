@@ -151,12 +151,10 @@ func initServer(args *tsshdArgs) (*ServerInfo, string, error) {
 	}
 
 	if args.KCP {
-		listener, crypto, err := listenKCP(proxy, info, args.Attachable)
+		listener, err := listenKCP(proxy, proxy.kcpCrypto)
 		if err != nil {
 			return nil, "", err
 		}
-
-		proxy.kcpCrypto = crypto
 
 		addOnExitFunc(func() { _ = listener.Close() })
 		go serveKCP(args, proxy, listener)
@@ -420,32 +418,34 @@ func tcpListenOnPort(addrs []*net.UDPAddr, port int) (_ frontendConnection, err 
 	return &tcpFrontendConn{listenerList: listenerList}, nil
 }
 
-func listenKCP(conn net.PacketConn, info *ServerInfo, delegToProxy bool) (*kcp.Listener, *rotatingCrypto, error) {
+func newKcpServerCrypto(info *ServerInfo, delegToProxy bool) (*rotatingCrypto, error) {
 	pass := make([]byte, 48)
 	if _, err := crypto_rand.Read(pass); err != nil {
-		return nil, nil, fmt.Errorf("rand pass failed: %v", err)
+		return nil, fmt.Errorf("rand pass failed: %v", err)
 	}
 	salt := make([]byte, 48)
 	if _, err := crypto_rand.Read(salt); err != nil {
-		return nil, nil, fmt.Errorf("rand salt failed: %v", err)
+		return nil, fmt.Errorf("rand salt failed: %v", err)
 	}
 
 	crypto, err := newRotatingCrypto(nil, pass, salt, 0, 0, delegToProxy)
 	if err != nil {
-		return nil, nil, fmt.Errorf("new rotating crypto failed: %w", err)
-	}
-	block := kcp.NewAEADCrypt(crypto)
-
-	listener, err := kcp.ServeConn(block, 1, 1, conn)
-	if err != nil {
-		return nil, nil, fmt.Errorf("kcp serve conn failed: %v", err)
+		return nil, fmt.Errorf("new rotating crypto failed: %w", err)
 	}
 
 	info.Mode = kUdpModeKCP
 	info.Pass = fmt.Sprintf("%x", pass)
 	info.Salt = fmt.Sprintf("%x", salt)
 
-	return listener, crypto, nil
+	return crypto, nil
+}
+
+func listenKCP(conn net.PacketConn, crypto *rotatingCrypto) (*kcp.Listener, error) {
+	listener, err := kcp.ServeConn(kcp.NewAEADCrypt(crypto), 1, 1, conn)
+	if err != nil {
+		return nil, fmt.Errorf("kcp serve conn failed: %v", err)
+	}
+	return listener, nil
 }
 
 func listenQUIC(conn net.PacketConn, info *ServerInfo, mtu uint16) (*quic.Listener, uint16, error) {

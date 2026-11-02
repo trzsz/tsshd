@@ -41,6 +41,7 @@ import (
 )
 
 type mockStream struct {
+	mutex sync.Mutex
 	buf   bytes.Buffer
 	err   error
 	first bool
@@ -55,6 +56,8 @@ func (s *mockStream) Read(b []byte) (n int, err error) {
 }
 
 func (s *mockStream) Write(p []byte) (int, error) {
+	s.mutex.Lock()
+	defer s.mutex.Unlock()
 	if s.first {
 		time.Sleep(10 * time.Millisecond)
 		s.first = false
@@ -98,7 +101,15 @@ func (s *mockStream) SetWriteDeadline(t time.Time) error {
 }
 
 func (s *mockStream) String() string {
+	s.mutex.Lock()
+	defer s.mutex.Unlock()
 	return s.buf.String()
+}
+
+func (s *mockStream) setError(err error) {
+	s.mutex.Lock()
+	defer s.mutex.Unlock()
+	s.err = err
 }
 
 type chunkReader struct {
@@ -184,7 +195,10 @@ func newTestSessionContext(keepPending, timeout bool, maxLines int) (*sessionCon
 	sess := &sessionContext{rows: 0, clientChecker: newReplaceableTimeoutChecker(clientChecker)}
 	sess.server.Store(server)
 
-	return sess, func() { maxPendingOutputLines = oriMaxLines }
+	return sess, func() {
+		clientChecker.Close()
+		maxPendingOutputLines = oriMaxLines
+	}
 }
 
 func runForwardOutputAndReconnect(s *sessionContext, reader *chunkReader, stream *mockStream, callback func(*serverOutputForwarder)) {
@@ -194,14 +208,14 @@ func runForwardOutputAndReconnect(s *sessionContext, reader *chunkReader, stream
 	s.clientChecker.checker.onReconnected(forwarder.onReconnected)
 	wg.Go(forwarder.forward)
 
-	go func() {
+	wg.Go(func() {
 		if callback != nil {
 			time.Sleep(50 * time.Millisecond)
 			callback(forwarder)
 		}
 		time.Sleep(50 * time.Millisecond)
 		s.clientChecker.checker.updateNow()
-	}()
+	})
 
 	wg.Wait()
 }
@@ -242,7 +256,7 @@ func TestForwardOutput_WriteError(t *testing.T) {
 	defer reset()
 
 	stream := newMockStream()
-	stream.err = errors.New("mock write error")
+	stream.setError(errors.New("mock write error"))
 	reader := &chunkReader{data: [][]byte{[]byte("a\nb\nc\n")}, chunk: 1}
 
 	s.newOutputForwarder("stdout", reader, stream).forward()
@@ -339,7 +353,7 @@ func TestForwardOutput_FlushWriteError(t *testing.T) {
 	}
 
 	runForwardOutputAndReconnect(s, reader, stream, func(*serverOutputForwarder) {
-		stream.err = errors.New("mock write error")
+		stream.setError(errors.New("mock write error"))
 		close(signal)
 	})
 
@@ -595,7 +609,9 @@ func TestForwardOutput_ReconnectWhileReadBlocked(t *testing.T) {
 		chunk:  1,
 	}
 
+	done := make(chan struct{})
 	go func() {
+		defer close(done)
 		runForwardOutputAndReconnect(s, reader, stream, nil)
 	}()
 
@@ -604,6 +620,8 @@ func TestForwardOutput_ReconnectWhileReadBlocked(t *testing.T) {
 	}, time.Second, 10*time.Millisecond)
 
 	close(block)
+	<-done
+	assert.Equal("a\nb\nc\nd\n", stream.String())
 }
 
 func TestForwardOutput_TimeoutWithoutNewLine(t *testing.T) {
@@ -647,7 +665,7 @@ func TestForwardOutput_AbortIfTimeout(t *testing.T) {
 	done := make(chan struct{})
 	go func() {
 		runForwardOutputAndReconnect(s, reader, stream, func(forwarder *serverOutputForwarder) {
-			forwarder.abortIfTimeout(10 * time.Millisecond, nil)
+			forwarder.abortIfTimeout(10*time.Millisecond, nil)
 		})
 		close(done)
 	}()
@@ -686,7 +704,7 @@ func TestForwardOutput_AbortIfTimeoutWithNewOutput(t *testing.T) {
 	done := make(chan struct{})
 	go func() {
 		runForwardOutputAndReconnect(s, reader, stream, func(forwarder *serverOutputForwarder) {
-			forwarder.abortIfTimeout(100 * time.Millisecond, nil)
+			forwarder.abortIfTimeout(100*time.Millisecond, nil)
 			time.Sleep(50 * time.Millisecond)
 			close(signal)
 		})
@@ -715,7 +733,7 @@ func TestForwardOutput_AbortIfTimeoutAfterReturned(t *testing.T) {
 
 	assert.Equal("a\nb\nc\n", stream.String())
 
-	forwarder.abortIfTimeout(10 * time.Millisecond, nil)
+	forwarder.abortIfTimeout(10*time.Millisecond, nil)
 
 	assert.True(reader.closed.Load())
 	assert.Nil(forwarder.lastForwardTime.Load())

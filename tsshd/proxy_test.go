@@ -27,6 +27,7 @@ package tsshd
 import (
 	"bytes"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net"
 	"os"
@@ -34,7 +35,35 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/stretchr/testify/require"
 )
+
+type kcpStartupFrontend struct {
+	frontendConnection
+	t *testing.T
+}
+
+func (c *kcpStartupFrontend) start(proxy *serverProxy) {
+	// A frontend can authenticate a client as soon as start is called,
+	// before initServer has created the KCP listener.
+	require.NotNil(c.t, proxy.kcpCrypto)
+	client, err := proxy.newClientState(1)
+	require.NoError(c.t, err)
+	crypto := client.kcpCrypto.Load()
+	require.NotNil(c.t, crypto)
+	require.Equal(c.t, proxy.kcpCrypto.keyPass, crypto.keyPass)
+	require.Equal(c.t, proxy.kcpCrypto.keySalt, crypto.keySalt)
+}
+
+func TestKCP_CryptoReadyBeforeFrontendStart(t *testing.T) {
+	info := &ServerInfo{}
+	proxy, err := startServerProxy(&tsshdArgs{KCP: true, Attachable: true}, info, &kcpStartupFrontend{t: t})
+	require.NoError(t, err)
+	require.Equal(t, kUdpModeKCP, info.Mode)
+	require.Equal(t, fmt.Sprintf("%x", proxy.kcpCrypto.keyPass), info.Pass)
+	require.Equal(t, fmt.Sprintf("%x", proxy.kcpCrypto.keySalt), info.Salt)
+}
 
 type echoServer struct {
 	t *testing.T

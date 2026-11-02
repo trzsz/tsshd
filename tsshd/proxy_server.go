@@ -973,6 +973,14 @@ func startServerProxy(args *tsshdArgs, info *ServerInfo, conn frontendConnection
 		cipherBlock:  &cipherBlock,
 	}
 
+	// Publish the keys before either the frontend or KCP starts reading packets.
+	if args.KCP {
+		proxy.kcpCrypto, err = newKcpServerCrypto(info, args.Attachable)
+		if err != nil {
+			return nil, err
+		}
+	}
+
 	if !args.Attachable || args.Socket {
 		for info.ClientID == 0 {
 			clientID := make([]byte, 8)
