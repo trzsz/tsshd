@@ -104,7 +104,7 @@ func handleSocketConn(conn net.Conn) {
 		debug("socket unknown command: %s", cmd)
 	}
 
-	if err != nil && enableDebugLogging {
+	if err != nil && enableDebugLogging.Load() {
 		debug("handle request [%s] failed: %v", cmd, err)
 	}
 }

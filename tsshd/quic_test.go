@@ -27,6 +27,7 @@ package tsshd
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -137,11 +138,12 @@ func TestQUIC_InitialPacketSize(t *testing.T) {
 
 		// Client
 		quicConfig.InitialPacketSize = 0
-		client, err := newQuicClient(&UdpClientOptions{
-			ServerInfo:     info,
-			ProxyClient:    &SshUdpClient{},
-			ConnectTimeout: 10 * time.Second,
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		client, err := newQuicClient(ctx, &UdpClientOptions{
+			ServerInfo:  info,
+			ProxyClient: &SshUdpClient{},
 		}, cliConn, svrConn.LocalAddr())
+		cancel()
 		if err != nil {
 			t.Fatalf("newQuicClient failed (mtu=%d): %v", requestedMTU, err)
 		}
@@ -149,7 +151,7 @@ func TestQUIC_InitialPacketSize(t *testing.T) {
 			t.Fatalf("client initial packet size mismatch: requested=%d, expected=%d, got=%d", requestedMTU, expectedMTU, got)
 		}
 		<-acceptDone
-		_ = client.closeClient()
+		_ = client.Close()
 
 		if got := quicConfig.InitialPacketSize; got != 0 {
 			t.Fatalf("shared quicConfig should not be mutated, got InitialPacketSize=%d", got)
@@ -315,16 +317,15 @@ func TestQUIC_RespectMTU(t *testing.T) {
 
 		cliConn := listenRandomUDP(t)
 		defer func() { _ = cliConn.Close() }()
-		client, err := newQuicClient(&UdpClientOptions{
-			ServerInfo:     info,
-			ProxyClient:    &SshUdpClient{},
-			ConnectTimeout: 3 * time.Second,
+		client, err := newQuicClient(ctx, &UdpClientOptions{
+			ServerInfo:  info,
+			ProxyClient: &SshUdpClient{},
 		}, cliConn, svrConn.LocalAddr())
 		if err != nil {
 			clientErrCh <- fmt.Errorf("client failed to dial QUIC server: %w", err)
 			return
 		}
-		defer func() { _ = client.closeClient() }()
+		defer func() { _ = client.Close() }()
 
 		data := make([]byte, streamSize)
 		for i := range data {
@@ -353,7 +354,7 @@ func TestQUIC_RespectMTU(t *testing.T) {
 				return
 			}
 			if !bytes.Equal(data, echo) {
-				streamErrCh <- fmt.Errorf("stream echo data mismatch")
+				streamErrCh <- errors.New("stream echo data mismatch")
 				return
 			}
 		}()
@@ -363,7 +364,7 @@ func TestQUIC_RespectMTU(t *testing.T) {
 
 		// oversized datagram must be rejected by QUIC
 		if err := client.conn.SendDatagram(data[:size+1]); err == nil {
-			clientErrCh <- fmt.Errorf("expected oversized datagram to be rejected, but send succeeded")
+			clientErrCh <- errors.New("expected oversized datagram to be rejected, but send succeeded")
 			return
 		}
 
@@ -380,7 +381,7 @@ func TestQUIC_RespectMTU(t *testing.T) {
 				return
 			}
 			if !bytes.Equal(packet, resp) {
-				clientErrCh <- fmt.Errorf("datagram echo data mismatch")
+				clientErrCh <- errors.New("datagram echo data mismatch")
 				return
 			}
 		}
@@ -489,14 +490,18 @@ func TestQUIC_CertValidation(t *testing.T) {
 	// If it happens to succeed, case 3 (valid certificates) will fail later.
 	cliConn1 := listenRandomUDP(t)
 	defer func() { _ = cliConn1.Close() }()
-	_, _ = newQuicClient(&UdpClientOptions{ServerInfo: &illegalInfo, ConnectTimeout: 3 * time.Second}, cliConn1, svrConn.LocalAddr())
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	_, _ = newQuicClient(ctx, &UdpClientOptions{ServerInfo: &illegalInfo}, cliConn1, svrConn.LocalAddr())
+	cancel()
 
 	// Case 2: Invalid server certificate
 	illegalInfo = info
 	illegalInfo.ServerCert = fmt.Sprintf("%x", illegalCertPEM)
 	cliConn2 := listenRandomUDP(t)
 	defer func() { _ = cliConn2.Close() }()
-	_, err = newQuicClient(&UdpClientOptions{ServerInfo: &illegalInfo, ConnectTimeout: 3 * time.Second}, cliConn2, svrConn.LocalAddr())
+	ctx, cancel = context.WithTimeout(context.Background(), 3*time.Second)
+	_, err = newQuicClient(ctx, &UdpClientOptions{ServerInfo: &illegalInfo}, cliConn2, svrConn.LocalAddr())
+	cancel()
 	if err == nil {
 		t.Fatalf("Client should not succeed with invalid server certificate")
 	}
@@ -504,18 +509,20 @@ func TestQUIC_CertValidation(t *testing.T) {
 	// Case 3: Valid client and server certificates
 	cliConn3 := listenRandomUDP(t)
 	defer func() { _ = cliConn3.Close() }()
-	client, err := newQuicClient(&UdpClientOptions{ServerInfo: &info, ConnectTimeout: 3 * time.Second}, cliConn3, svrConn.LocalAddr())
+	ctx, cancel = context.WithTimeout(context.Background(), 3*time.Second)
+	client, err := newQuicClient(ctx, &UdpClientOptions{ServerInfo: &info}, cliConn3, svrConn.LocalAddr())
+	cancel()
 	if err != nil {
 		// If this fails, it could be because case 1 succeeded with an invalid client certificate.
 		t.Fatalf("Valid client certificate should succeed: %v", err)
 	}
-	defer func() { _ = client.closeClient() }()
+	defer func() { _ = client.Close() }()
 
 	// Open a stream to ensure that:
 	// 1. the QUIC handshake has completed successfully
 	// 2. TLS certificate validation passed
 	// 3. application data can be exchanged over the connection
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	ctx, cancel = context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
 	stream, err := client.conn.OpenStreamSync(ctx)

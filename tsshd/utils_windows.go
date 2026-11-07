@@ -26,6 +26,7 @@ package tsshd
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -105,7 +106,7 @@ func (p *tsshdPty) Resize(cols, rows int) error {
 }
 
 func (p *tsshdPty) Redraw() error {
-	return fmt.Errorf("signal-based redraw is not supported on Windows")
+	return errors.New("signal-based redraw is not supported on Windows")
 }
 
 func newTsshdPty(cmd *exec.Cmd, cols, rows int) (*tsshdPty, error) {
@@ -301,5 +302,5 @@ out:
 		return best.name, nil
 	}
 
-	return "", fmt.Errorf("no leaf process")
+	return "", errors.New("no leaf process")
 }

@@ -26,6 +26,7 @@ package tsshd
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -157,18 +158,25 @@ func runProxyEchoTest(t *testing.T, args *tsshdArgs) {
 			}
 			defer func() { _ = proxy.Close() }()
 
-			if err := proxy.renewTransportPath(nil, opts.ConnectTimeout); err != nil {
+			ctx, cancel := context.WithTimeout(context.Background(), opts.ConnectTimeout)
+			err = proxy.renewTransportPath(ctx, nil)
+			cancel()
+			if err != nil {
 				t.Fatalf("renew transport path failed: %v", err)
 			}
 
 			client.clientProxy = proxy
-			proto, err := newProtoClient(opts, client)
+			ctx, cancel = context.WithTimeout(context.Background(), opts.ConnectTimeout)
+			proto, err := newProtoClient(ctx, opts, client)
+			cancel()
 			if err != nil {
 				t.Fatalf("new proto client failed: %v", err)
 			}
-			defer func() { _ = proto.closeClient() }()
+			defer func() { _ = proto.Close() }()
 
-			stream, err := proto.newStream(time.Second)
+			ctx, cancel = context.WithTimeout(context.Background(), time.Second)
+			stream, err := proto.newStream(ctx)
+			cancel()
 			if err != nil {
 				t.Fatalf("proto new stream failed: %v", err)
 			}
@@ -176,7 +184,10 @@ func runProxyEchoTest(t *testing.T, args *tsshdArgs) {
 
 			runStreamEchoTest(t, stream)
 
-			if err := proxy.renewTransportPath(nil, opts.ConnectTimeout); err != nil {
+			ctx, cancel = context.WithTimeout(context.Background(), opts.ConnectTimeout)
+			err = proxy.renewTransportPath(ctx, nil)
+			cancel()
+			if err != nil {
 				t.Fatalf("renew transport path failed: %v", err)
 			}
 

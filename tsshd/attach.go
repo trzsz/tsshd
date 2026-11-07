@@ -25,6 +25,7 @@ SOFTWARE.
 package tsshd
 
 import (
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -59,7 +60,7 @@ func (s *interruptibleStream) Close() error {
 
 func (s *interruptibleStream) Write(buf []byte) (int, error) {
 	if s.closed.Load() {
-		return 0, fmt.Errorf("stream closed")
+		return 0, errors.New("stream closed")
 	}
 
 	s.mu.Lock()
@@ -68,14 +69,14 @@ func (s *interruptibleStream) Write(buf []byte) (int, error) {
 	select {
 	case s.bufCh <- buf:
 	case <-s.closeCh:
-		return 0, fmt.Errorf("stream closed")
+		return 0, errors.New("stream closed")
 	}
 
 	select {
 	case result := <-s.ackCh:
 		return result.n, result.err
 	case <-s.closeCh:
-		return 0, fmt.Errorf("stream closed")
+		return 0, errors.New("stream closed")
 	}
 }
 
@@ -349,7 +350,7 @@ func (d *discardStream) CloseWrite() error                  { return nil }
 
 func (s *sshUdpServer) attachSession(ioStream, errStream Stream, msg *startMessage) (*sessionContext, ErrCode, error) {
 	if !s.args.Attachable {
-		return nil, 0, fmt.Errorf("attach is not allowed: tsshd was not started with --attachable")
+		return nil, 0, errors.New("attach is not allowed: tsshd was not started with --attachable")
 	}
 
 	sess := getSessionByID(msg.ID)
@@ -364,7 +365,7 @@ func (s *sshUdpServer) attachSession(ioStream, errStream Stream, msg *startMessa
 
 	pty := (sess.mwSess != nil && sess.mwSess.pty) || sess.pty != nil
 	if msg.Pty && !pty {
-		return nil, ErrNotPty, fmt.Errorf("not a pty session")
+		return nil, ErrNotPty, errors.New("not a pty session")
 	}
 
 	// Serialize session attachment with ownership updates.
@@ -372,17 +373,17 @@ func (s *sshUdpServer) attachSession(ioStream, errStream Stream, msg *startMessa
 	defer attachMutex.Unlock()
 
 	if server := activeSshUdpServer.Load(); server != s {
-		return nil, 0, fmt.Errorf("server is no longer active")
+		return nil, 0, errors.New("server is no longer active")
 	}
 
 	if sess.server.Load() != nil {
-		return nil, 0, fmt.Errorf("session already attached")
+		return nil, 0, errors.New("session already attached")
 	}
 	if sess.ioStream == nil {
-		return nil, 0, fmt.Errorf("invalid session state: i/o stream is nil")
+		return nil, 0, errors.New("invalid session state: i/o stream is nil")
 	}
 	if sess.errStream == nil {
-		return nil, 0, fmt.Errorf("invalid session state: err stream is nil")
+		return nil, 0, errors.New("invalid session state: err stream is nil")
 	}
 
 	outStream, err := compressOutput(msg.Compression, ioStream)

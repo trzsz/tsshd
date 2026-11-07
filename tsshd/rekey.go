@@ -30,6 +30,7 @@ import (
 	"crypto/ecdh"
 	crypto_rand "crypto/rand"
 	"crypto/sha512"
+	"errors"
 	"fmt"
 	"io"
 	"sync"
@@ -146,7 +147,7 @@ func (r *rotatingCrypto) Open(dst, nonce, ciphertext, additionalData []byte) (pl
 	}
 
 	if err == nil {
-		return nil, fmt.Errorf("gcm open failed: no available keys")
+		return nil, errors.New("gcm open failed: no available keys")
 	}
 	return nil, fmt.Errorf("gcm open failed: %w", err)
 }
@@ -301,7 +302,16 @@ func (r *rotatingCrypto) doRekey() error {
 	r.clientPriKey.Store(clientPriKey)
 
 	for !r.client.isBusStreamInited() {
-		time.Sleep(100 * time.Millisecond)
+		// Failed client startup never publishes a bus. Stop its pending initial
+		// rekey when cleanup closes the crypto or the client.
+		if r.closed.Load() || r.client.IsClosed() {
+			return io.ErrClosedPipe
+		}
+		select {
+		case <-r.stopCh:
+			return io.ErrClosedPipe
+		case <-time.After(100 * time.Millisecond):
+		}
 	}
 	return r.client.sendBusMessage("rekey", rekeyMessage{clientPriKey.PublicKey().Bytes()})
 }
@@ -315,7 +325,7 @@ func (r *rotatingCrypto) handleClientRekey(msg *rekeyMessage) error {
 
 	clientPriKey := r.clientPriKey.Load()
 	if clientPriKey == nil {
-		return fmt.Errorf("client private key is nil")
+		return errors.New("client private key is nil")
 	}
 
 	secret, err := clientPriKey.ECDH(serverPubKey)
@@ -385,7 +395,7 @@ func newRotatingCrypto(client *SshUdpClient, pass, salt []byte, bytesThreshold u
 			r.debug("time-based rekey triggered (initial)")
 			r.startRekey()
 
-			for {
+			for !r.client.IsClosed() {
 				select {
 				case <-ticker.C:
 					r.debug("time-based rekey triggered: threshold [%v]", timeThreshold)

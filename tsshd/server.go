@@ -25,6 +25,7 @@ SOFTWARE.
 package tsshd
 
 import (
+	"errors"
 	"fmt"
 	"net"
 	"sync"
@@ -123,7 +124,7 @@ var newSshUdpServer = func(args *tsshdArgs, proxy *serverProxy, addr net.Addr, p
 func (s *sshUdpServer) initClientChecker(timeout time.Duration) {
 	s.clientChecker = newTimeoutChecker(timeout)
 
-	if enableDebugLogging {
+	if enableDebugLogging.Load() {
 		s.clientChecker.onTimeout(func() {
 			debug("blocked due to no client [%x] input for [%v]", s.client.proxyAddr.clientID, s.clientChecker.heartbeatTimeout)
 		})
@@ -131,7 +132,9 @@ func (s *sshUdpServer) initClientChecker(timeout time.Duration) {
 			debug("resumed after receiving client [%x] input", s.client.proxyAddr.clientID)
 			time.AfterFunc(10*time.Second, func() {
 				if !s.clientChecker.isTimeout() {
-					s.client.udpTraffic.recFlag.Store(false)
+					if traffic := s.client.udpTraffic.Load(); traffic != nil {
+						traffic.recFlag.Store(false)
+					}
 				}
 			})
 		})
@@ -165,9 +168,11 @@ func (s *sshUdpServer) initClientChecker(timeout time.Duration) {
 		s.client.setClientConn(oldClientConn, nil)
 		debug("client [%x] transport cleared due to timeout", s.client.proxyAddr.clientID)
 
-		if enableDebugLogging && !s.client.udpTraffic.recFlag.Load() {
-			s.client.udpTraffic.resetStats()
-			s.client.udpTraffic.recFlag.Store(true)
+		if enableDebugLogging.Load() {
+			if traffic := s.client.udpTraffic.Load(); traffic != nil && !traffic.recFlag.Load() {
+				traffic.resetStats()
+				traffic.recFlag.Store(true)
+			}
 		}
 	})
 
@@ -195,7 +200,7 @@ func (s *sshUdpServer) activateServer(sessionName string) error {
 	debug("client [%x] starting server activation", s.client.proxyAddr.clientID)
 	if !s.args.Attachable {
 		if !activeSshUdpServer.CompareAndSwap(nil, s) {
-			return fmt.Errorf("active server is already in use")
+			return errors.New("active server is already in use")
 		}
 		s.client.server.Store(s)
 		s.serving.Store(true)
@@ -209,7 +214,7 @@ func (s *sshUdpServer) activateServer(sessionName string) error {
 	defer attachMutex.Unlock()
 
 	if busClosing.Load() {
-		return fmt.Errorf("bus is closed")
+		return errors.New("bus is closed")
 	}
 
 	oldServer := activeSshUdpServer.Swap(s)
@@ -280,7 +285,7 @@ func (s *sshUdpServer) Close() {
 	debug("client [%x] all streams closed", s.client.proxyAddr.clientID)
 
 	// close server connection
-	err := s.proto.closeServer()
+	err := s.proto.Close()
 	debug("client [%x] transport closed: %v", s.client.proxyAddr.clientID, err)
 
 	// The clientState is kept in memory to prevent replay attacks.
@@ -353,7 +358,7 @@ func (s *sshUdpServer) handleStream(stream Stream) {
 		return
 	}
 
-	if enableDebugLogging && command != "dial" && command != "accept" && command != "dial-udp" && command != "accept-udp" {
+	if enableDebugLogging.Load() && command != "dial" && command != "accept" && command != "dial-udp" && command != "accept-udp" {
 		debug("stream [%x][%d] command [%s] starts", s.client.proxyAddr.clientID, id, command)
 		defer debug("stream [%x][%d] command [%s] closing", s.client.proxyAddr.clientID, id, command)
 	}
@@ -368,11 +373,11 @@ func (s *sshUdpServer) handleStream(stream Stream) {
 	} else {
 		// Other streams require bus initialization and that this server is the active instance.
 		if !s.serving.Load() {
-			sendError(stream, fmt.Errorf("bus must be initialized first"))
+			sendError(stream, errors.New("bus must be initialized first"))
 			return
 		}
 		if server := activeSshUdpServer.Load(); server != s {
-			sendError(stream, fmt.Errorf("not the active server instance"))
+			sendError(stream, errors.New("not the active server instance"))
 			return
 		}
 	}
