@@ -302,7 +302,11 @@ func newStartupServer(t *testing.T, mode string, handle func(Stream) error) (*Ud
 			return &quicStream{stream, conn}, closeConn, err
 		}
 	} else {
-		listener, crypto, err := listenKCP(peer, info, false)
+		crypto, err := newKcpServerCrypto(info, false)
+		if err != nil {
+			t.Fatalf("newKcpServerCrypto failed: %v", err)
+		}
+		listener, err := listenKCP(peer, crypto)
 		if err != nil {
 			t.Fatal(err)
 		}

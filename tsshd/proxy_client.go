@@ -175,7 +175,6 @@ type clientProxy struct {
 	serverID      uint64
 	renewMutex    chan struct{}
 	serialNumber  uint64
-	kcpCrypto     *rotatingCrypto
 	serverChecker *timeoutChecker
 	closed        atomic.Bool
 	udpTraffic    *trafficStats
@@ -584,10 +583,6 @@ func (p *clientProxy) Close() error {
 	p.clearBackendConn(nil)
 
 	p.serverChecker.Close()
-
-	if p.kcpCrypto != nil {
-		p.kcpCrypto.Close()
-	}
 
 	return nil
 }

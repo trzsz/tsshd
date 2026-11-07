@@ -427,12 +427,14 @@ type protocolClient interface {
 	getUdpForwarder() *udpForwarder
 	newStream(ctx context.Context) (Stream, error)
 	stats(s *TransportStats)
+	handleClientRekey(*rekeyMessage) error
 }
 
 type kcpClient struct {
 	conn      *kcp.UDPSession
 	session   *smux.Session
 	forwarder *udpForwarder
+	crypto    *rotatingCrypto
 }
 
 func (c *kcpClient) reset() {
@@ -447,6 +449,7 @@ func (c *kcpClient) Close() error {
 		return nil
 	}
 	c.forwarder.Close()
+	c.crypto.Close()
 	return c.session.Close()
 }
 
@@ -468,6 +471,10 @@ func (c *kcpClient) newStream(ctx context.Context) (Stream, error) {
 		}
 		return &smuxStream{stream}, nil
 	})
+}
+
+func (c *kcpClient) handleClientRekey(msg *rekeyMessage) error {
+	return c.crypto.handleClientRekey(msg)
 }
 
 type quicClient struct {
@@ -511,6 +518,10 @@ func (c *quicClient) newStream(ctx context.Context) (Stream, error) {
 	return &quicStream{stream, c.conn}, err
 }
 
+func (c *quicClient) handleClientRekey(msg *rekeyMessage) error {
+	return nil
+}
+
 func newProtoClient(ctx context.Context, opts *UdpClientOptions, client *SshUdpClient) (protocolClient, error) {
 	switch opts.ServerInfo.Mode {
 	case "":
@@ -533,20 +544,18 @@ func newKcpClient(opts *UdpClientOptions, client *SshUdpClient, udpConn net.Pack
 	}
 	salt, err := hex.DecodeString(opts.ServerInfo.Salt)
 	if err != nil {
-		return nil, fmt.Errorf("decode salt [%s] failed: %w", opts.ServerInfo.Pass, err)
+		return nil, fmt.Errorf("decode salt [%s] failed: %w", opts.ServerInfo.Salt, err)
 	}
 
 	crypto, err := newRotatingCrypto(client, pass, salt, kRekeyBytesThreshold, kRekeyTimeThreshold, false)
 	if err != nil {
 		return nil, fmt.Errorf("new rotating crypto failed: %w", err)
 	}
-	if client != nil {
-		client.clientProxy.kcpCrypto = crypto
-	}
 	block := kcp.NewAEADCrypt(crypto)
 
 	conn, err := kcp.NewConn2(remoteAddr, block, 1, 1, udpConn)
 	if err != nil {
+		crypto.Close()
 		return nil, fmt.Errorf("kcp new conn [%v] failed: %w", remoteAddr.String(), err)
 	}
 	conn.SetWindowSize(1024, 1024)
@@ -564,9 +573,10 @@ func newKcpClient(opts *UdpClientOptions, client *SshUdpClient, udpConn net.Pack
 	session, err := smux.Client(conn, &smuxConfig)
 	if err != nil {
 		_ = conn.Close()
+		crypto.Close()
 		return nil, fmt.Errorf("kcp smux client failed: %w", err)
 	}
-	return &kcpClient{conn, session, &udpForwarder{conn: newKcpDatagramConn(conn)}}, nil
+	return &kcpClient{conn, session, &udpForwarder{conn: newKcpDatagramConn(conn)}, crypto}, nil
 }
 
 func newQuicClient(ctx context.Context, opts *UdpClientOptions, udpConn net.PacketConn, remoteAddr net.Addr) (*quicClient, error) {

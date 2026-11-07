@@ -1026,11 +1026,9 @@ func (c *SshUdpClient) handleRekeyEvent() {
 		return
 	}
 
-	if c.clientProxy.kcpCrypto != nil {
-		if err := c.clientProxy.kcpCrypto.handleClientRekey(&msg); err != nil {
-			c.warning("rekey failed: %v", err)
-			return
-		}
+	if err := c.protoClient.handleClientRekey(&msg); err != nil {
+		c.warning("rekey failed: %v", err)
+		return
 	}
 }
 
