@@ -29,6 +29,7 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/base64"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -126,11 +127,15 @@ type UdpClientOptions struct {
 
 // NewSshUdpClient creates a SshUdpClient
 func NewSshUdpClient(opts *UdpClientOptions) (udpClient *SshUdpClient, err error) {
-	debugFn, warningFn := opts.DebugFunc, opts.WarningFunc
-	enableDebugLogging.Store(opts.EnableDebugging)
-	clientDebugFn.Store(&debugFn)
-	enableWarningLogging.Store(opts.EnableWarning)
-	clientWarningFn.Store(&warningFn)
+	if opts.ConnectTimeout <= 0 {
+		// Fall back to the default timeout to avoid unexpected behavior from invalid client options.
+		opts.ConnectTimeout = kDefaultConnectTimeout
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), opts.ConnectTimeout)
+	defer cancel()
+
+	initClientDebugLogging(opts.EnableDebugging, opts.DebugFunc)
+	initClientWarningLogging(opts.EnableWarning, opts.WarningFunc)
 
 	if opts.ServerInfo.ProtoVer == 0 {
 		ver, err := parseTsshdVersion(opts.ServerInfo.ServerVer)
@@ -138,7 +143,7 @@ func NewSshUdpClient(opts *UdpClientOptions) (udpClient *SshUdpClient, err error
 			return nil, fmt.Errorf("tsshd version invalid: %w", err)
 		}
 		if ver.compare(&tsshdVersion{0, 1, 6}) < 0 {
-			return nil, fmt.Errorf("please upgrade tsshd to continue")
+			return nil, errors.New("please upgrade tsshd to continue")
 		}
 	}
 
@@ -165,6 +170,8 @@ func NewSshUdpClient(opts *UdpClientOptions) (udpClient *SshUdpClient, err error
 		clientWarningFn:      opts.WarningFunc,
 		activeChecker:        newTimeoutChecker(opts.HeartbeatTimeout),
 		shouldPauseReconnect: opts.ShouldPauseReconnect,
+		busClosed:            make(chan struct{}),
+		activeAckChan:        make(chan int64, 1),
 	}
 	defer func() {
 		if err != nil {
@@ -177,8 +184,9 @@ func NewSshUdpClient(opts *UdpClientOptions) (udpClient *SshUdpClient, err error
 	if err != nil {
 		return
 	}
+
 	beginTime := time.Now()
-	err = udpClient.clientProxy.renewTransportPath(opts.ProxyClient, opts.ConnectTimeout)
+	err = udpClient.clientProxy.renewTransportPath(ctx, opts.ProxyClient)
 	if err != nil {
 		if opts.ConnectTimeout > 2*time.Second && time.Since(beginTime) > (opts.ConnectTimeout-time.Second) {
 			net := "UDP"
@@ -195,13 +203,10 @@ func NewSshUdpClient(opts *UdpClientOptions) (udpClient *SshUdpClient, err error
 		return
 	}
 
-	protoClient, err := newProtoClient(opts, udpClient)
+	udpClient.protoClient, err = newProtoClient(ctx, opts, udpClient)
 	if err != nil {
 		return
 	}
-	// Failed protocol constructors can return a typed nil. Only publish a live
-	// client so deferred cleanup never calls methods through that nil pointer.
-	udpClient.protoClient = protoClient
 
 	if udpClient.enableDebugging {
 		udpClient.activeChecker.onTimeout(func() {
@@ -220,83 +225,52 @@ func NewSshUdpClient(opts *UdpClientOptions) (udpClient *SshUdpClient, err error
 	}
 	udpClient.activeChecker.onTimeout(udpClient.tryToReconnect)
 
-	busStream, resp, err := udpClient.initBusStream(opts)
-	if err != nil {
+	if err = udpClient.initBusStream(ctx, opts); err != nil {
 		return
 	}
-	udpClient.debug("bus response next session id: %d", resp.NextSessionID)
-	udpClient.sessionID.Store(resp.NextSessionID)
-
-	// Automatic KCP rekey can already be waiting for the bus. Publish all bus
-	// state under its mutex, and initialize the acknowledgement channel before
-	// starting the reader, which may receive an immediate server event.
-	udpClient.busMutex.Lock()
-	udpClient.busStream, udpClient.busClosed = busStream, make(chan struct{})
-	udpClient.activeAckChan = make(chan int64, 1)
-	udpClient.busMutex.Unlock()
-	go udpClient.handleBusEvent()
-	go udpClient.keepAlive(opts.IntervalTime)
 
 	return
 }
 
-func (c *SshUdpClient) initBusStream(opts *UdpClientOptions) (stream Stream, resp busResponse, err error) {
-	defer func() {
-		if err != nil && stream != nil {
-			_ = stream.Close()
-			stream = nil
-		}
-	}()
+func (c *SshUdpClient) initBusStream(ctx context.Context, opts *UdpClientOptions) error {
+	// Automatic KCP rekey may already be waiting for the bus. Keep the mutex
+	// locked until the bus stream is fully initialized and published, so rekey
+	// and other bus operations cannot access it prematurely.
+	c.busMutex.Lock()
+	defer c.busMutex.Unlock()
 
-	// Stream setup (open, command, ack) and the bus round trip (message,
-	// server activation, response) each get their own ConnectTimeout, so a
-	// slow but healthy link is not penalized for needing two round trips.
-	err = c.withStartupTimeout("bus stream open", opts.ConnectTimeout, func() (err error) {
-		stream, err = c.newStream("bus")
-		if err != nil {
-			return fmt.Errorf("new bus stream failed: %w", err)
-		}
-		return nil
-	})
-	if err != nil {
-		return
-	}
-
-	err = c.withStartupTimeout("bus stream init", opts.ConnectTimeout, func() error {
-		if err := sendMessage(stream, busMessage{
+	stream, err := c.newStream(ctx, "bus", func(stream Stream) error {
+		msg := busMessage{
 			ClientVer:        kTsshdVersion,
 			ProtoVer:         c.protoVersion,
 			SessionName:      opts.SessionName,
 			AliveTimeout:     opts.AliveTimeout,
 			IntervalTime:     opts.IntervalTime,
-			HeartbeatTimeout: opts.HeartbeatTimeout}); err != nil {
+			HeartbeatTimeout: opts.HeartbeatTimeout,
+		}
+		if err := sendMessage(stream, &msg); err != nil {
 			return fmt.Errorf("send bus message failed: %w", err)
 		}
+
+		var resp busResponse
 		if err := recvResponse(stream, &resp); err != nil {
 			return fmt.Errorf("bus stream init failed: %w", err)
 		}
+
+		c.debug("bus response next session id: %d", resp.NextSessionID)
+		c.sessionID.Store(resp.NextSessionID)
+
 		return nil
 	})
-	return
-}
 
-// withStartupTimeout runs fn and closes the protocol client if it does not
-// finish within timeout. Closing interrupts blocked I/O (and smux.OpenStream)
-// rather than leaving a timeout-wrapper goroutine behind.
-func (c *SshUdpClient) withStartupTimeout(phase string, timeout time.Duration, fn func() error) error {
-	closed := make(chan struct{})
-	timer := time.AfterFunc(timeout, func() {
-		_ = c.protoClient.closeClient()
-		close(closed)
-	})
-	err := fn()
-	// Disarm cancellation before the caller continues, or join an
-	// already-running cancellation and report the timeout instead.
-	if !timer.Stop() {
-		<-closed
-		return fmt.Errorf("%s timeout [%v]: %w", phase, timeout, context.DeadlineExceeded)
+	if err != nil {
+		return err
 	}
-	return err
+
+	c.busStream = stream
+	go c.handleBusEvent()
+	go c.keepAlive(opts.IntervalTime)
+	return nil
 }
 
 func (c *SshUdpClient) debug(format string, a ...any) {
@@ -332,7 +306,14 @@ func (c *SshUdpClient) Close() (err error) {
 		return
 	}
 
-	if c.busStream != nil && !c.detached.Load() {
+	detached := c.detached.Load()
+	if detached && c.clientProxy != nil {
+		// On detach, close the proxy first to sever the transport before
+		// local protocol cleanup, preserving the remote session.
+		_ = c.clientProxy.Close()
+	}
+
+	if c.busStream != nil && !detached {
 		_, err = doWithTimeout(func() (int, error) {
 			if err := c.sendBusCommand("close"); err != nil {
 				c.debug("send cmd [close] failed: %v", err)
@@ -352,9 +333,9 @@ func (c *SshUdpClient) Close() (err error) {
 		}, 300*time.Millisecond)
 	}
 
-	if c.protoClient != nil && !c.detached.Load() {
+	if c.protoClient != nil {
 		_, err = doWithTimeout(func() (int, error) {
-			err := c.protoClient.closeClient()
+			err := c.protoClient.Close()
 			if err != nil {
 				c.debug("close client failed: %v", err)
 			} else {
@@ -364,7 +345,7 @@ func (c *SshUdpClient) Close() (err error) {
 		}, 200*time.Millisecond)
 	}
 
-	if c.clientProxy != nil {
+	if !detached && c.clientProxy != nil {
 		_ = c.clientProxy.Close()
 	}
 
@@ -390,45 +371,61 @@ func (c *SshUdpClient) Detach() {
 	_ = c.Close()
 }
 
-func (c *SshUdpClient) newStream(cmd string) (Stream, error) {
-	stream, err := c.protoClient.newStream(c.connectTimeout)
+func (c *SshUdpClient) newStream(ctx context.Context, cmd string, initFn func(Stream) error) (stream Stream, err error) {
+	deadline, hasDeadline := ctx.Deadline()
+	if !hasDeadline {
+		return nil, errors.New("context deadline is required")
+	}
+
+	stream, err = c.protoClient.newStream(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("new stream [%s] failed: %w", cmd, err)
 	}
-	// Bound the command acknowledgement so NewSession/Dial cannot hang forever
-	// on a stalled transport. The bus stream is bounded by initBusStream.
-	if cmd != "bus" && c.connectTimeout > 0 {
-		_ = stream.SetDeadline(time.Now().Add(c.connectTimeout))
-		defer func() { _ = stream.SetDeadline(time.Time{}) }()
-	}
-	if err := sendCommand(stream, cmd); err != nil {
-		_ = stream.Close()
-		return nil, fmt.Errorf("send command [%s] failed: %w", cmd, err)
-	}
-	if err := recvError(stream); err != nil {
-		_ = stream.Close()
-		return nil, fmt.Errorf("new stream [%s] error: %w", cmd, err)
-	}
-	return stream, nil
-}
 
-// setDialDeadline bounds the dial request and response by the remote dial
-// timeout plus one ConnectTimeout for the round trip. Without a dial timeout
-// the remote dial is unbounded by design, so no deadline is set.
-func (c *SshUdpClient) setDialDeadline(stream Stream, timeout time.Duration) (clear func()) {
-	if timeout <= 0 || c.connectTimeout <= 0 {
-		return func() {}
+	defer func() {
+		if err != nil && stream != nil {
+			_ = stream.Close()
+			stream = nil
+		}
+	}()
+
+	if err = stream.SetDeadline(deadline); err != nil {
+		err = fmt.Errorf("stream [%s] set deadline failed: %w", cmd, err)
+		return
 	}
-	_ = stream.SetDeadline(time.Now().Add(timeout + c.connectTimeout))
-	return func() { _ = stream.SetDeadline(time.Time{}) }
+
+	if err = sendCommand(stream, cmd); err != nil {
+		err = fmt.Errorf("send command [%s] failed: %w", cmd, err)
+		return
+	}
+	if err = recvError(stream); err != nil {
+		err = fmt.Errorf("new stream [%s] error: %w", cmd, err)
+		return
+	}
+
+	if initFn != nil {
+		if err = initFn(stream); err != nil {
+			return
+		}
+	}
+
+	if err = stream.SetDeadline(time.Time{}); err != nil {
+		err = fmt.Errorf("stream [%s] clear deadline failed: %w", cmd, err)
+		return
+	}
+
+	return stream, nil
 }
 
 // NewSession opens a new Session for this client
 func (c *SshUdpClient) NewSession() (*SshUdpSession, error) {
-	stream, err := c.newStream("session")
+	ctx, cancel := context.WithTimeout(context.Background(), c.connectTimeout)
+	defer cancel()
+	stream, err := c.newStream(ctx, "session", nil)
 	if err != nil {
 		return nil, err
 	}
+
 	c.exitWG.Add(1)
 	udpSession := &SshUdpSession{client: c, stream: stream, envs: make(map[string]string), code: -1}
 	udpSession.exitWG.Add(1)
@@ -441,33 +438,55 @@ func (c *SshUdpClient) NewSession() (*SshUdpSession, error) {
 
 // DialTimeout initiates a connection to the addr from the remote host
 func (c *SshUdpClient) DialTimeout(network, addr string, timeout time.Duration) (Stream, error) {
-	stream, err := c.newStream("dial")
+	if timeout <= 0 {
+		timeout = c.connectTimeout
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+
+	return c.dialContext(network, addr, ctx)
+}
+
+func (c *SshUdpClient) dialContext(network, addr string, ctx context.Context) (Stream, error) {
+	var resp dialResponse
+
+	stream, err := c.newStream(ctx, "dial", func(stream Stream) error {
+		var timeout time.Duration
+		if deadline, ok := ctx.Deadline(); ok {
+			timeout = time.Until(deadline)
+			if timeout <= 0 {
+				return errors.New("context deadline exceeded")
+			}
+		}
+
+		msg := dialMessage{
+			Net:     network,
+			Addr:    addr,
+			Timeout: timeout,
+		}
+		if err := sendMessage(stream, &msg); err != nil {
+			return fmt.Errorf("send dial message failed: %w", err)
+		}
+
+		return recvResponse(stream, &resp)
+	})
+
 	if err != nil {
 		return nil, err
 	}
-	msg := dialMessage{
-		Net:     network,
-		Addr:    addr,
-		Timeout: timeout,
-	}
-	clearDeadline := c.setDialDeadline(stream, timeout)
-	if err := sendMessage(stream, &msg); err != nil {
-		_ = stream.Close()
-		return nil, fmt.Errorf("send dial message failed: %w", err)
-	}
-	var resp dialResponse
-	if err := recvResponse(stream, &resp); err != nil {
-		_ = stream.Close()
-		return nil, err
-	}
-	clearDeadline()
+
 	c.exitWG.Add(1)
 	return &sshUdpConn{Stream: stream, rAddr: resp.RemoteAddr, client: c}, nil
 }
 
 // DialUDP initiates a logical UDP connection to the addr from the remote host
 func (c *SshUdpClient) DialUDP(network, addr string, timeout time.Duration) (PacketConn, error) {
-	return c.dialUDP(network, addr, timeout, false)
+	if timeout <= 0 {
+		timeout = c.connectTimeout
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	return c.dialUDP(network, addr, ctx, false)
 }
 
 // DialUDPDatagramOnly is DialUDP with real-UDP send semantics: packets that
@@ -476,39 +495,56 @@ func (c *SshUdpClient) DialUDP(network, addr string, timeout time.Duration) (Pac
 // stream fallback. Intended for tunneling protocols that run their own path
 // MTU discovery, e.g. QUIC.
 func (c *SshUdpClient) DialUDPDatagramOnly(network, addr string, timeout time.Duration) (PacketConn, error) {
-	return c.dialUDP(network, addr, timeout, true)
+	if timeout <= 0 {
+		timeout = c.connectTimeout
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	return c.dialUDP(network, addr, ctx, true)
 }
 
-func (c *SshUdpClient) dialUDP(network, addr string, timeout time.Duration, datagramOnly bool) (PacketConn, error) {
-	stream, err := c.newStream("dial-udp")
+func (c *SshUdpClient) dialUDP(network, addr string, ctx context.Context, datagramOnly bool) (PacketConn, error) {
+	var conn *packetConn
+
+	_, err := c.newStream(ctx, "dial-udp", func(stream Stream) error {
+		var timeout time.Duration
+		if deadline, ok := ctx.Deadline(); ok {
+			timeout = time.Until(deadline)
+			if timeout <= 0 {
+				return errors.New("context deadline exceeded")
+			}
+		}
+
+		msg := dialUdpMessage{
+			Net:     network,
+			Addr:    addr,
+			Timeout: timeout,
+		}
+		if err := sendMessage(stream, &msg); err != nil {
+			return fmt.Errorf("send dial udp message failed: %w", err)
+		}
+
+		var resp dialUdpResponse
+		if err := recvResponse(stream, &resp); err != nil {
+			return err
+		}
+
+		conn = newPacketConn(stream, resp.ID, c.protoClient.getUdpForwarder(), c.clientProxy.serverChecker)
+		conn.datagramOnly = datagramOnly
+
+		var ok udpReadyMessage
+		if err := sendMessage(stream, &ok); err != nil {
+			return fmt.Errorf("send udp ready message failed: %w", err)
+		}
+
+		return nil
+	})
+
 	if err != nil {
+		if conn != nil {
+			_ = conn.Close()
+		}
 		return nil, err
-	}
-
-	msg := dialUdpMessage{
-		Net:     network,
-		Addr:    addr,
-		Timeout: timeout,
-	}
-	clearDeadline := c.setDialDeadline(stream, timeout)
-	if err := sendMessage(stream, &msg); err != nil {
-		_ = stream.Close()
-		return nil, fmt.Errorf("send dial udp message failed: %w", err)
-	}
-	var resp dialUdpResponse
-	if err := recvResponse(stream, &resp); err != nil {
-		_ = stream.Close()
-		return nil, err
-	}
-	clearDeadline()
-
-	conn := newPacketConn(stream, resp.ID, c.protoClient.getUdpForwarder(), c.clientProxy.serverChecker)
-	conn.datagramOnly = datagramOnly
-
-	var ok udpReadyMessage
-	if err := sendMessage(stream, &ok); err != nil {
-		_ = conn.Close()
-		return nil, fmt.Errorf("send udp ready message failed: %w", err)
 	}
 
 	c.exitWG.Add(1)
@@ -517,44 +553,50 @@ func (c *SshUdpClient) dialUDP(network, addr string, timeout time.Duration, data
 
 // Listen requests the remote peer to open a listening socket on addr
 func (c *SshUdpClient) Listen(network, addr string) (net.Listener, error) {
-	stream, err := c.newStream("listen")
+	ctx, cancel := context.WithTimeout(context.Background(), c.connectTimeout)
+	defer cancel()
+
+	stream, err := c.newStream(ctx, "listen", func(stream Stream) error {
+		msg := listenMessage{
+			Net:  network,
+			Addr: addr,
+		}
+		if err := sendMessage(stream, &msg); err != nil {
+			return fmt.Errorf("send listen message failed: %w", err)
+		}
+
+		return recvError(stream)
+	})
+
 	if err != nil {
 		return nil, err
 	}
-	msg := listenMessage{
-		Net:  network,
-		Addr: addr,
-	}
-	if err := sendMessage(stream, &msg); err != nil {
-		_ = stream.Close()
-		return nil, fmt.Errorf("send listen message failed: %w", err)
-	}
-	if err := recvError(stream); err != nil {
-		_ = stream.Close()
-		return nil, err
-	}
+
 	c.exitWG.Add(1)
 	return &sshUdpListener{client: c, stream: stream}, nil
 }
 
 // ListenUDP requests the remote peer to open a UDP listening endpoint on addr
 func (c *SshUdpClient) ListenUDP(network, addr string) (PacketListener, error) {
-	stream, err := c.newStream("listen-udp")
+	ctx, cancel := context.WithTimeout(context.Background(), c.connectTimeout)
+	defer cancel()
+
+	stream, err := c.newStream(ctx, "listen-udp", func(stream Stream) error {
+		msg := listenUdpMessage{
+			Net:  network,
+			Addr: addr,
+		}
+		if err := sendMessage(stream, &msg); err != nil {
+			return fmt.Errorf("send listen udp message failed: %w", err)
+		}
+
+		return recvError(stream)
+	})
+
 	if err != nil {
 		return nil, err
 	}
-	msg := listenUdpMessage{
-		Net:  network,
-		Addr: addr,
-	}
-	if err := sendMessage(stream, &msg); err != nil {
-		_ = stream.Close()
-		return nil, fmt.Errorf("send listen udp message failed: %w", err)
-	}
-	if err := recvError(stream); err != nil {
-		_ = stream.Close()
-		return nil, err
-	}
+
 	c.exitWG.Add(1)
 	return &sshUdpPacketListener{client: c, stream: stream}, nil
 }
@@ -579,7 +621,7 @@ func (c *SshUdpClient) HandleChannelOpen(channelType string) <-chan ssh.NewChann
 
 // SendRequest is not supported yet
 func (c *SshUdpClient) SendRequest(name string, wantReply bool, payload []byte) (bool, []byte, error) {
-	return false, nil, fmt.Errorf("ssh udp client SendRequest is not supported yet")
+	return false, nil, errors.New("ssh udp client SendRequest is not supported yet")
 }
 
 // SetKeepPendingInput sets whether to keep the pending input during disconnection.
@@ -636,7 +678,10 @@ func (c *SshUdpClient) GetLastReconnectError() error {
 // GetMaxDatagramSize returns the maximum payload size (in bytes) that
 // can be sent in a single datagram over this SshUdpClient.
 func (c *SshUdpClient) GetMaxDatagramSize() uint16 {
-	return c.protoClient.getUdpForwarder().conn.GetMaxDatagramSize()
+	if f := c.protoClient.getUdpForwarder(); f != nil {
+		return f.conn.GetMaxDatagramSize()
+	}
+	return 0
 }
 
 // IsConnectionLost returns true if the underlying transport is currently unable to reach the server.
@@ -702,7 +747,10 @@ func (c *SshUdpClient) tryToReconnect() {
 			}
 		}
 
-		if err := c.clientProxy.renewTransportPath(c.proxyClient, c.connectTimeout); err != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), c.connectTimeout)
+		err := c.clientProxy.renewTransportPath(ctx, c.proxyClient)
+		cancel()
+		if err != nil {
 			if c.IsClosed() {
 				return
 			}
@@ -853,7 +901,7 @@ func (c *SshUdpClient) handleBusEvent() {
 		case "rekey":
 			c.handleRekeyEvent()
 		default:
-			if err := handleUnknownEvent(c.busStream, command); err != nil {
+			if err := handleUnknownEvent(c.busStream, command); err != nil { // nolint
 				c.warning("handle bus command [%s] failed: %v. You may need to upgrade tssh.", command, err)
 			}
 		}
@@ -1114,7 +1162,7 @@ func (s *SshUdpSession) Start(cmd string) error {
 
 func (s *SshUdpSession) startSession(msg *startMessage) error {
 	if s.started {
-		return fmt.Errorf("session already started")
+		return errors.New("session already started")
 	}
 	s.started = true
 	if s.x11 != nil {
@@ -1253,7 +1301,7 @@ func (s *SshUdpSession) Setenv(name, value string) error {
 // remote command's standard input when the command starts.
 func (s *SshUdpSession) StdinPipe() (io.WriteCloser, error) {
 	if s.stdin != nil {
-		return nil, fmt.Errorf("stdin already set")
+		return nil, errors.New("stdin already set")
 	}
 	reader, writer := io.Pipe()
 	s.stdin = reader
@@ -1264,7 +1312,7 @@ func (s *SshUdpSession) StdinPipe() (io.WriteCloser, error) {
 // remote command's standard output when the command starts.
 func (s *SshUdpSession) StdoutPipe() (io.Reader, error) {
 	if s.stdout != nil {
-		return nil, fmt.Errorf("stdout already set")
+		return nil, errors.New("stdout already set")
 	}
 	reader, writer := io.Pipe()
 	s.stdout = writer
@@ -1275,18 +1323,20 @@ func (s *SshUdpSession) StdoutPipe() (io.Reader, error) {
 // remote command's standard error when the command starts.
 func (s *SshUdpSession) StderrPipe() (io.Reader, error) {
 	if s.stderr != nil {
-		return nil, fmt.Errorf("stderr already set")
+		return nil, errors.New("stderr already set")
 	}
-	stream, err := s.client.newStream("stderr")
+
+	ctx, cancel := context.WithTimeout(context.Background(), s.client.connectTimeout)
+	defer cancel()
+
+	stream, err := s.client.newStream(ctx, "stderr", func(stream Stream) error {
+		if err := sendMessage(stream, stderrMessage{ID: s.id}); err != nil {
+			return fmt.Errorf("send stderr message failed: %w", err)
+		}
+		return recvError(stream)
+	})
+
 	if err != nil {
-		return nil, err
-	}
-	if err := sendMessage(stream, stderrMessage{ID: s.id}); err != nil {
-		_ = stream.Close()
-		return nil, fmt.Errorf("send stderr message failed: %w", err)
-	}
-	if err := recvError(stream); err != nil {
-		_ = stream.Close()
 		return nil, err
 	}
 
@@ -1484,18 +1534,21 @@ func (l *sshUdpListener) Accept() (net.Conn, error) {
 	if err := recvMessage(l.stream, &msg); err != nil {
 		return nil, fmt.Errorf("recv accept message failed: %w", err)
 	}
-	stream, err := l.client.newStream("accept")
+
+	ctx, cancel := context.WithTimeout(context.Background(), l.client.connectTimeout)
+	defer cancel()
+
+	stream, err := l.client.newStream(ctx, "accept", func(stream Stream) error {
+		if err := sendMessage(stream, &msg); err != nil {
+			return fmt.Errorf("send accept message failed: %w", err)
+		}
+		return recvError(stream)
+	})
+
 	if err != nil {
 		return nil, err
 	}
-	if err := sendMessage(stream, &msg); err != nil {
-		_ = stream.Close()
-		return nil, fmt.Errorf("send accept message failed: %w", err)
-	}
-	if err := recvError(stream); err != nil {
-		_ = stream.Close()
-		return nil, err
-	}
+
 	l.client.exitWG.Add(1)
 	return &sshUdpConn{Stream: stream, client: l.client}, nil
 }
@@ -1552,24 +1605,26 @@ type sshUdpNewChannel struct {
 }
 
 func (c *sshUdpNewChannel) Accept() (ssh.Channel, <-chan *ssh.Request, error) {
-	stream, err := c.client.newStream("accept")
+	ctx, cancel := context.WithTimeout(context.Background(), c.client.connectTimeout)
+	defer cancel()
+
+	stream, err := c.client.newStream(ctx, "accept", func(stream Stream) error {
+		if err := sendMessage(stream, &acceptMessage{ID: c.id}); err != nil {
+			return fmt.Errorf("send accept message failed: %w", err)
+		}
+		return recvError(stream)
+	})
+
 	if err != nil {
 		return nil, nil, err
 	}
-	if err := sendMessage(stream, &acceptMessage{ID: c.id}); err != nil {
-		_ = stream.Close()
-		return nil, nil, fmt.Errorf("send accept message failed: %w", err)
-	}
-	if err := recvError(stream); err != nil {
-		_ = stream.Close()
-		return nil, nil, err
-	}
+
 	c.client.exitWG.Add(1)
 	return &sshUdpChannel{Stream: stream, client: c.client}, nil, nil
 }
 
 func (c *sshUdpNewChannel) Reject(reason ssh.RejectionReason, message string) error {
-	return fmt.Errorf("ssh udp new channel Reject is not supported yet")
+	return errors.New("ssh udp new channel Reject is not supported yet")
 }
 
 func (c *sshUdpNewChannel) ChannelType() string {
@@ -1605,7 +1660,7 @@ func (c *sshUdpChannel) Close() error {
 }
 
 func (c *sshUdpChannel) SendRequest(name string, wantReply bool, payload []byte) (bool, error) {
-	return false, fmt.Errorf("ssh udp channel SendRequest is not supported yet")
+	return false, errors.New("ssh udp channel SendRequest is not supported yet")
 }
 
 func (c *sshUdpChannel) Stderr() io.ReadWriter {
@@ -1639,19 +1694,24 @@ func (l *sshUdpPacketListener) AcceptUDP() (PacketConn, error) {
 	if err := recvMessage(l.stream, &msg); err != nil {
 		return nil, fmt.Errorf("recv accept udp message failed: %w", err)
 	}
-	stream, err := l.client.newStream("accept-udp")
+
+	ctx, cancel := context.WithTimeout(context.Background(), l.client.connectTimeout)
+	defer cancel()
+
+	var conn *packetConn
+
+	_, err := l.client.newStream(ctx, "accept-udp", func(stream Stream) error {
+		conn = newPacketConn(stream, msg.ID, l.client.protoClient.getUdpForwarder(), l.client.clientProxy.serverChecker)
+		if err := sendMessage(stream, &msg); err != nil {
+			return fmt.Errorf("send accept udp message failed: %w", err)
+		}
+		return recvError(stream)
+	})
+
 	if err != nil {
-		return nil, err
-	}
-
-	conn := newPacketConn(stream, msg.ID, l.client.protoClient.getUdpForwarder(), l.client.clientProxy.serverChecker)
-
-	if err := sendMessage(stream, &msg); err != nil {
-		_ = stream.Close()
-		return nil, fmt.Errorf("send accept udp message failed: %w", err)
-	}
-	if err := recvError(stream); err != nil {
-		_ = stream.Close()
+		if conn != nil {
+			_ = conn.Close()
+		}
 		return nil, err
 	}
 

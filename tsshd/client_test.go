@@ -51,7 +51,7 @@ func TestQuicStartupTimeoutCleanup(t *testing.T) {
 	for _, backend := range []string{"connected", "missing", "failed"} {
 		t.Run(backend, func(t *testing.T) {
 			sink := listenRandomUDP(t)
-			defer sink.Close()
+			defer func() { _ = sink.Close() }()
 			opts := &UdpClientOptions{
 				TsshdAddr: sink.LocalAddr().String(), ConnectTimeout: 100 * time.Millisecond,
 				ServerInfo: &ServerInfo{ProxyKey: strings.Repeat("00", 32),
@@ -61,7 +61,7 @@ func TestQuicStartupTimeoutCleanup(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			defer proxy.Close()
+			defer func() { _ = proxy.Close() }()
 			switch backend {
 			case "connected":
 				conn, err := net.DialUDP("udp", nil, sink.LocalAddr().(*net.UDPAddr))
@@ -76,7 +76,9 @@ func TestQuicStartupTimeoutCleanup(t *testing.T) {
 			}
 			done := make(chan error, 1)
 			go func() {
-				_, err := newQuicClient(opts, proxy, proxy.remoteAddr)
+				ctx, cancel := context.WithTimeout(context.Background(), opts.ConnectTimeout)
+				_, err := newQuicClient(ctx, opts, proxy, proxy.remoteAddr)
+				cancel()
 				done <- err
 			}()
 			select {
@@ -158,15 +160,19 @@ type startupProtocol struct {
 	once    sync.Once
 }
 
-func (p *startupProtocol) newStream(time.Duration) (Stream, error) {
+func (p *startupProtocol) newStream(ctx context.Context) (Stream, error) {
 	if p.opening {
-		<-p.closed
-		return nil, io.ErrClosedPipe
+		select {
+		case <-p.closed:
+			return nil, io.ErrClosedPipe
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
 	}
 	return p.stream, nil
 }
 
-func (p *startupProtocol) closeClient() error {
+func (p *startupProtocol) Close() error {
 	p.once.Do(func() {
 		_ = p.stream.Close()
 		close(p.closed)
@@ -174,13 +180,21 @@ func (p *startupProtocol) closeClient() error {
 	return nil
 }
 
+func isStartupTimeout(err error) bool {
+	if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, os.ErrDeadlineExceeded) {
+		return true
+	}
+	var netErr net.Error
+	return errors.As(err, &netErr) && netErr.Timeout()
+}
+
 func TestBusStartupBlockedIO(t *testing.T) {
 	for _, stage := range []string{"open", "command-write", "message-write", "response-body"} {
 		t.Run(stage, func(t *testing.T) {
 			conn, peer := net.Pipe()
-			defer peer.Close()
+			defer func() { _ = peer.Close() }()
 			proto := &startupProtocol{stream: startupPipeStream{conn}, opening: stage == "open", closed: make(chan struct{})}
-			defer proto.closeClient()
+			defer func() { _ = proto.Close() }()
 			serverDone := make(chan struct{})
 			go func() {
 				defer close(serverDone)
@@ -204,13 +218,16 @@ func TestBusStartupBlockedIO(t *testing.T) {
 			}()
 			client := &SshUdpClient{protoClient: proto, connectTimeout: 100 * time.Millisecond}
 			start := time.Now()
-			stream, _, err := client.initBusStream(&UdpClientOptions{ConnectTimeout: client.connectTimeout})
-			if stream != nil || !errors.Is(err, context.DeadlineExceeded) {
-				t.Fatalf("expected canceled %s, got stream=%v, err=%v", stage, stream, err)
+			ctx, cancel := context.WithTimeout(context.Background(), client.connectTimeout)
+			err := client.initBusStream(ctx, &UdpClientOptions{})
+			cancel()
+			if client.busStream != nil || !isStartupTimeout(err) {
+				t.Fatalf("expected canceled %s, got stream=%v, err=%v", stage, client.busStream, err)
 			}
 			if time.Since(start) > time.Second {
 				t.Fatalf("%s did not unblock on timeout", stage)
 			}
+			_ = proto.Close()
 			select {
 			case <-serverDone:
 			case <-time.After(time.Second):
@@ -233,15 +250,29 @@ func (p *startupPeer) ReadFrom(buf []byte) (int, net.Addr, error) {
 		if err != nil {
 			return n, addr, err
 		}
-		if data := aesDecrypt(&p.block, buf[:n]); len(data) == 16 {
+
+		data := aesDecrypt(&p.block, buf[:n])
+		if len(data) == 16 {
 			binary.BigEndian.PutUint64(data[:8], 42)
+
+			// Authentication ACK is encrypted.
 			if _, err := p.WriteTo(aesEncrypt(&p.block, data), addr); err != nil {
 				return 0, nil, err
 			}
 			continue
 		}
+
+		// QUIC/KCP packets are not encrypted by the UDP proxy.
 		return n, addr, nil
 	}
+}
+
+func (p *startupPeer) SetReadBuffer(bytes int) error {
+	return nil
+}
+
+func (p *startupPeer) SetWriteBuffer(bytes int) error {
+	return nil
 }
 
 func newStartupServer(t *testing.T, mode string, handle func(Stream) error) (*UdpClientOptions, <-chan error) {
@@ -300,7 +331,7 @@ func newStartupServer(t *testing.T, mode string, handle func(Stream) error) (*Ud
 			defer closeConn()
 		}
 		if err == nil {
-			defer stream.Close()
+			defer func() { _ = stream.Close() }()
 			_ = stream.SetDeadline(time.Now().Add(3 * time.Second))
 			err = handle(stream)
 		}
@@ -316,7 +347,7 @@ func newStartupServer(t *testing.T, mode string, handle func(Stream) error) (*Ud
 		}
 	})
 	return &UdpClientOptions{TsshdAddr: conn.LocalAddr().String(), ServerInfo: info,
-		ConnectTimeout: 150 * time.Millisecond, HeartbeatTimeout: time.Hour,
+		ConnectTimeout: time.Second, HeartbeatTimeout: time.Hour,
 		IntervalTime: 300 * time.Millisecond, AliveTimeout: time.Hour}, result
 }
 
@@ -354,10 +385,10 @@ func TestBusStartupTimeout(t *testing.T) {
 				default:
 					t.Fatalf("did not reach %s: %v", stage, err)
 				}
-				if time.Since(start) > time.Second {
-					t.Fatalf("bus %s exceeded connection timeout: %v", stage, err)
+				if elapsed := time.Since(start); elapsed > 2*opts.ConnectTimeout {
+					t.Fatalf("bus %s did not return promptly after timeout: %v (%v)", stage, elapsed, err)
 				}
-				if !errors.Is(err, context.DeadlineExceeded) {
+				if !isStartupTimeout(err) {
 					t.Fatalf("expected startup timeout, got %v", err)
 				}
 			})
@@ -422,20 +453,27 @@ func TestBusStartupTimeoutCleared(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			defer client.Close()
+			defer func() { _ = client.Close() }()
 			if client.sessionID.Load() != 7 {
 				t.Fatal("bus response was not applied")
 			}
 			select {
-			case ack := <-client.activeAckChan:
-				if ack != 1 {
-					t.Fatalf("unexpected initial bus event: %d", ack)
-				}
+			case <-alive:
+				// Initial bus event was processed.
 			case <-time.After(time.Second):
-				t.Fatal("initial bus event blocked on an unpublished acknowledgement channel")
+				t.Fatal("initial bus event was not processed")
 			}
-			// The first heartbeat is sent after twice ConnectTimeout. Both directions
-			// must still work, and the startup cancellation must no longer be armed.
+			// Wait until the startup deadline has passed, then require a fresh
+			// heartbeat round trip to prove the stream deadline was cleared.
+			time.Sleep(opts.ConnectTimeout + opts.IntervalTime)
+			for {
+				select {
+				case <-alive:
+				default:
+					goto drained
+				}
+			}
+		drained:
 			select {
 			case <-alive:
 			case err := <-result:
@@ -480,7 +518,7 @@ func TestQuicRemoteCloseCleanup(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer client.Close()
+	defer func() { _ = client.Close() }()
 	select {
 	case <-client.protoClient.(*quicClient).closed:
 	case <-time.After(time.Second):
@@ -506,7 +544,7 @@ func TestBusStartupRekeyCanceled(t *testing.T) {
 		// Unblock the old implementation before reporting its leaked startup wait.
 		conn, peer := net.Pipe()
 		_ = peer.Close()
-		defer conn.Close()
+		defer func() { _ = conn.Close() }()
 		client.busMutex.Lock()
 		client.busStream = startupPipeStream{conn}
 		client.busMutex.Unlock()
@@ -519,15 +557,17 @@ func TestBusStartupRekeyCanceled(t *testing.T) {
 	}
 }
 
-func TestBusStartupPhasesHaveSeparateBudgets(t *testing.T) {
+func TestBusStartupUsesSingleDeadline(t *testing.T) {
 	conn, peer := net.Pipe()
-	defer peer.Close()
+	defer func() { _ = peer.Close() }()
 	proto := &startupProtocol{stream: startupPipeStream{conn}, closed: make(chan struct{})}
-	defer proto.closeClient()
+	defer func() { _ = proto.Close() }()
+
 	const timeout = 200 * time.Millisecond
-	// Each phase takes ~60% of ConnectTimeout: together they exceed one budget.
 	delay := timeout * 6 / 10
+	serverDone := make(chan struct{})
 	go func() {
+		defer close(serverDone)
 		if _, err := recvCommand(peer); err != nil {
 			return
 		}
@@ -542,66 +582,233 @@ func TestBusStartupPhasesHaveSeparateBudgets(t *testing.T) {
 		time.Sleep(delay)
 		_ = sendResponse(startupPipeStream{peer}, &busResponse{})
 	}()
+
 	client := &SshUdpClient{protoClient: proto, connectTimeout: timeout}
-	stream, _, err := client.initBusStream(&UdpClientOptions{ConnectTimeout: timeout})
-	if err != nil || stream == nil {
-		t.Fatalf("expected startup within two per-phase budgets, got stream=%v, err=%v", stream, err)
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	start := time.Now()
+	err := client.initBusStream(ctx, &UdpClientOptions{})
+	if client.busStream != nil {
+		_ = client.busStream.Close()
+	}
+	if err == nil {
+		t.Fatal("startup succeeded even though its phases exceeded the shared deadline")
+	}
+	if !errors.Is(err, context.DeadlineExceeded) && !errors.Is(err, os.ErrDeadlineExceeded) {
+		t.Fatalf("expected startup deadline error, got %v", err)
+	}
+	if elapsed := time.Since(start); elapsed > time.Second {
+		t.Fatalf("startup did not stop after the shared deadline: %v", elapsed)
+	}
+	_ = proto.Close()
+	select {
+	case <-serverDone:
+	case <-time.After(time.Second):
+		t.Fatal("server did not stop after startup cancellation")
+	}
+}
+
+func TestNewStreamClearsStartupDeadline(t *testing.T) {
+	conn, peer := net.Pipe()
+	defer func() { _ = peer.Close() }()
+	proto := &startupProtocol{stream: startupPipeStream{conn}, closed: make(chan struct{})}
+	defer func() { _ = proto.Close() }()
+
+	const timeout = 100 * time.Millisecond
+	serverDone := make(chan error, 1)
+	go func() {
+		if _, err := recvCommand(peer); err != nil {
+			serverDone <- err
+			return
+		}
+		if err := sendSuccess(startupPipeStream{peer}); err != nil {
+			serverDone <- err
+			return
+		}
+		var b [1]byte
+		_, err := io.ReadFull(peer, b[:])
+		serverDone <- err
+	}()
+
+	client := &SshUdpClient{protoClient: proto, connectTimeout: timeout}
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	stream, err := client.newStream(ctx, "session", nil)
+	cancel()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = stream.Close() }()
+
+	// The stream must remain usable after the startup deadline has elapsed.
+	time.Sleep(timeout * 2)
+	if _, err := stream.Write([]byte{1}); err != nil {
+		t.Fatalf("stream retained its startup deadline: %v", err)
+	}
+	select {
+	case err := <-serverDone:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("server did not receive data after startup deadline")
+	}
+}
+
+type startupResource struct {
+	closed chan struct{}
+	once   sync.Once
+}
+
+func (r *startupResource) Close() error {
+	r.once.Do(func() { close(r.closed) })
+	return nil
+}
+
+func TestDoWithContextClosesLateResource(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	started := make(chan struct{})
+	release := make(chan struct{})
+	resource := &startupResource{closed: make(chan struct{})}
+
+	done := make(chan error, 1)
+	go func() {
+		_, err := doWithContext(ctx, func() (*startupResource, error) {
+			close(started)
+			<-release
+			return resource, nil
+		})
+		done <- err
+	}()
+
+	<-started
+	cancel()
+	if err := <-done; !errors.Is(err, context.Canceled) {
+		t.Fatalf("expected context cancellation, got %v", err)
+	}
+	close(release)
+	select {
+	case <-resource.closed:
+	case <-time.After(time.Second):
+		t.Fatal("late resource was not closed")
 	}
 }
 
 func TestStreamCommandAckDeadline(t *testing.T) {
 	conn, peer := net.Pipe()
-	defer peer.Close()
+	defer func() { _ = peer.Close() }()
 	proto := &startupProtocol{stream: startupPipeStream{conn}, closed: make(chan struct{})}
-	defer proto.closeClient()
+	defer func() { _ = proto.Close() }()
 	go func() {
 		_, _ = recvCommand(peer)
 		<-proto.closed // never acknowledge
 	}()
 	client := &SshUdpClient{protoClient: proto, connectTimeout: 100 * time.Millisecond}
 	start := time.Now()
-	if _, err := client.newStream("session"); !errors.Is(err, os.ErrDeadlineExceeded) {
+	ctx, cancel := context.WithTimeout(context.Background(), client.connectTimeout)
+	if _, err := client.newStream(ctx, "session", nil); !errors.Is(err, os.ErrDeadlineExceeded) {
 		t.Fatalf("expected command ack deadline, got %v", err)
 	}
+	cancel()
 	if time.Since(start) > time.Second {
 		t.Fatal("command ack did not honor ConnectTimeout")
 	}
 }
 
-func TestDialResponseDeadline(t *testing.T) {
-	for _, withTimeout := range []bool{true, false} {
-		t.Run(fmt.Sprintf("timeout=%v", withTimeout), func(t *testing.T) {
-			conn, peer := net.Pipe()
-			defer peer.Close()
-			client := &SshUdpClient{connectTimeout: 50 * time.Millisecond}
-			go func() {
-				var msg dialMessage
-				_ = recvMessage(peer, &msg)
-				// never respond
-			}()
-			stream := startupPipeStream{conn}
-			dialTimeout := time.Duration(0)
-			if withTimeout {
-				dialTimeout = 50 * time.Millisecond
+func TestDialUsesSingleTimeoutBudget(t *testing.T) {
+	const (
+		timeout     = 800 * time.Millisecond
+		setupDelay  = 250 * time.Millisecond
+		maxDuration = timeout + setupDelay/2
+	)
+
+	conn, peer := net.Pipe()
+	defer func() { _ = peer.Close() }()
+
+	proto := &startupProtocol{
+		stream: startupPipeStream{conn},
+		closed: make(chan struct{}),
+	}
+	defer func() { _ = proto.Close() }()
+
+	client := &SshUdpClient{
+		protoClient:    proto,
+		connectTimeout: timeout,
+	}
+
+	type serverResult struct {
+		msg dialMessage
+		err error
+	}
+	serverDone := make(chan serverResult, 1)
+
+	go func() {
+		stream := startupPipeStream{peer}
+
+		cmd, err := recvCommand(stream)
+		if err != nil {
+			serverDone <- serverResult{err: err}
+			return
+		}
+		if cmd != "dial" {
+			serverDone <- serverResult{
+				err: fmt.Errorf("unexpected command: %s", cmd),
 			}
-			defer client.setDialDeadline(stream, dialTimeout)()
-			_ = sendMessage(stream, &dialMessage{Net: "tcp", Addr: "x:1"})
-			done := make(chan error, 1)
-			go func() {
-				var resp dialResponse
-				done <- recvResponse(stream, &resp)
-			}()
-			select {
-			case err := <-done:
-				if !withTimeout || !errors.Is(err, os.ErrDeadlineExceeded) {
-					t.Fatalf("unexpected dial response result: %v", err)
-				}
-			case <-time.After(500 * time.Millisecond):
-				if withTimeout {
-					t.Fatal("dial response did not honor dial timeout + ConnectTimeout")
-				}
-				_ = conn.Close()
-			}
-		})
+			return
+		}
+
+		// Consume part of the timeout while waiting for the command ACK.
+		time.Sleep(setupDelay)
+
+		if err := sendSuccess(stream); err != nil {
+			serverDone <- serverResult{err: err}
+			return
+		}
+
+		var msg dialMessage
+		if err := recvMessage(stream, &msg); err != nil {
+			serverDone <- serverResult{err: err}
+			return
+		}
+
+		// Deliberately do not send a response. The client should time out
+		// using the original deadline, not a renewed timeout.
+		serverDone <- serverResult{msg: msg}
+	}()
+
+	start := time.Now()
+
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	_, err := client.dialContext("tcp", "example.com:22", ctx)
+	cancel()
+
+	elapsed := time.Since(start)
+
+	if !isStartupTimeout(err) {
+		t.Fatalf("expected dial timeout, got %v", err)
+	}
+
+	if elapsed > maxDuration {
+		t.Fatalf("dial exceeded the original timeout: elapsed=%v, timeout=%v",
+			elapsed, timeout)
+	}
+
+	select {
+	case result := <-serverDone:
+		if result.err != nil {
+			t.Fatalf("server failed: %v", result.err)
+		}
+
+		if result.msg.Timeout <= 0 {
+			t.Fatalf("expected positive remaining timeout, got %v",
+				result.msg.Timeout)
+		}
+
+		if result.msg.Timeout >= timeout-setupDelay/2 {
+			t.Fatalf("dial message did not use the remaining timeout: got %v, total=%v",
+				result.msg.Timeout, timeout)
+		}
+
+	case <-time.After(time.Second):
+		t.Fatal("server did not receive dial message")
 	}
 }

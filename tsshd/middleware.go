@@ -26,7 +26,7 @@ package tsshd
 
 import (
 	"context"
-	"fmt"
+	"errors"
 	"io"
 	"sync/atomic"
 )
@@ -269,7 +269,7 @@ func (s *middlewareSession) Resize(cols, rows int) error {
 		case s.sizeCh <- window:
 			return nil
 		default:
-			return fmt.Errorf("resize event dropped: channel is full")
+			return errors.New("resize event dropped: channel is full")
 		}
 	}
 }

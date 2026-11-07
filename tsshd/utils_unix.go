@@ -27,6 +27,7 @@ SOFTWARE.
 package tsshd
 
 import (
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -316,7 +317,7 @@ func getProcInfos() (map[int]*procInfo, error) {
 
 	lines := strings.Split(strings.TrimSpace(string(output)), "\n")
 	if len(lines) <= 1 {
-		return nil, fmt.Errorf("no process found")
+		return nil, errors.New("no process found")
 	}
 
 	procs := make(map[int]*procInfo)
@@ -396,5 +397,5 @@ func getForegroundProcess(pgid int) (string, error) {
 		return best.name, nil
 	}
 
-	return "", fmt.Errorf("no leaf process")
+	return "", errors.New("no leaf process")
 }

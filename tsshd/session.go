@@ -27,6 +27,7 @@ package tsshd
 import (
 	"bufio"
 	"bytes"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -150,7 +151,7 @@ func (c *sessionContext) StartMiddleware() error {
 	c.mwSess.stdin, c.mwSess.stdout, c.mwSess.stderr = stdinReader, stdoutWriter, stderrWriter
 
 	if sessionHandler == nil {
-		return fmt.Errorf("no session handler")
+		return errors.New("no session handler")
 	}
 
 	go func() {

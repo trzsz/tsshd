@@ -50,6 +50,14 @@ type PacketConn interface {
 	// The implementation may append an additional 8-byte identifier or metadata to the payload.
 	Write([]byte) error
 
+	// WriteWithContext writes a packet to the connection. The context can cancel
+	// waits for peer reconnection and limit how long this method waits for the
+	// write to complete. Canceling the context does not necessarily stop an
+	// in-progress write; the packet may still be sent even if this method returns
+	// due to cancellation. Like Write, the implementation may append an additional
+	// 8-byte identifier or metadata to the payload.
+	WriteWithContext(context.Context, []byte) error
+
 	// Read reads a single packet from the connection into the provided buffer.
 	Read([]byte) (int, error)
 
@@ -336,6 +344,10 @@ func (c *packetConn) startStreamReader() {
 }
 
 func (c *packetConn) Write(buf []byte) error {
+	return c.WriteWithContext(context.Background(), buf)
+}
+
+func (c *packetConn) WriteWithContext(ctx context.Context, buf []byte) error {
 	if c.datagramOnly {
 		// Real-UDP semantics: drop instead of blocking on reconnection or
 		// falling back to the reliable stream, so the inner protocol's path
@@ -352,7 +364,7 @@ func (c *packetConn) Write(buf []byte) error {
 	}
 
 	if c.peerCheck.isTimeout() {
-		if err := c.peerCheck.waitUntilReconnected(); err != nil {
+		if err := c.peerCheck.waitReconnect(ctx); err != nil {
 			return err
 		}
 	}
@@ -363,7 +375,12 @@ func (c *packetConn) Write(buf []byte) error {
 		}
 	}
 
-	if err := sendUdpPacket(c.stream, buf); err != nil {
+	if ctx.Done() == nil {
+		return sendUdpPacket(c.stream, buf)
+	}
+
+	buffer := append([]byte(nil), buf...)
+	if _, err := doWithContext(ctx, func() (int, error) { return 0, sendUdpPacket(c.stream, buffer) }); err != nil {
 		return err
 	}
 	return nil

@@ -647,7 +647,7 @@ func TestForwardOutput_AbortIfTimeout(t *testing.T) {
 	done := make(chan struct{})
 	go func() {
 		runForwardOutputAndReconnect(s, reader, stream, func(forwarder *serverOutputForwarder) {
-			forwarder.abortIfTimeout(10 * time.Millisecond, nil)
+			forwarder.abortIfTimeout(10*time.Millisecond, nil)
 		})
 		close(done)
 	}()
@@ -686,7 +686,7 @@ func TestForwardOutput_AbortIfTimeoutWithNewOutput(t *testing.T) {
 	done := make(chan struct{})
 	go func() {
 		runForwardOutputAndReconnect(s, reader, stream, func(forwarder *serverOutputForwarder) {
-			forwarder.abortIfTimeout(100 * time.Millisecond, nil)
+			forwarder.abortIfTimeout(100*time.Millisecond, nil)
 			time.Sleep(50 * time.Millisecond)
 			close(signal)
 		})
@@ -715,7 +715,7 @@ func TestForwardOutput_AbortIfTimeoutAfterReturned(t *testing.T) {
 
 	assert.Equal("a\nb\nc\n", stream.String())
 
-	forwarder.abortIfTimeout(10 * time.Millisecond, nil)
+	forwarder.abortIfTimeout(10*time.Millisecond, nil)
 
 	assert.True(reader.closed.Load())
 	assert.Nil(forwarder.lastForwardTime.Load())

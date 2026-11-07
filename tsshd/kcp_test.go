@@ -26,6 +26,7 @@ package tsshd
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -121,7 +122,7 @@ func TestKCP_PassSaltValidation(t *testing.T) {
 		illegalOpts := &UdpClientOptions{ServerInfo: &ServerInfo{Pass: opts.ServerInfo.Salt, Salt: opts.ServerInfo.Pass}}
 		illegalClient, err := newKcpClient(illegalOpts, nil, cliConn1, svrConn.LocalAddr())
 		if err == nil {
-			defer func() { _ = illegalClient.closeClient() }()
+			defer func() { _ = illegalClient.Close() }()
 			// Try to open a smux stream with a short timeout.
 			// If this unexpectedly succeeds, it will consume the server's
 			// single Accept slot and cause Case 2 to fail, exposing a bug.
@@ -138,7 +139,7 @@ func TestKCP_PassSaltValidation(t *testing.T) {
 			clientErrCh <- fmt.Errorf("valid pass/salt should succeed: %v", err)
 			return
 		}
-		defer func() { _ = client.closeClient() }()
+		defer func() { _ = client.Close() }()
 
 		// open stream and verify echo
 		stream, err := doWithTimeout(func() (*smux.Stream, error) {
@@ -162,7 +163,7 @@ func TestKCP_PassSaltValidation(t *testing.T) {
 			return
 		}
 		if !bytes.Equal(data, echo) {
-			clientErrCh <- fmt.Errorf("echo mismatch")
+			clientErrCh <- errors.New("echo mismatch")
 			return
 		}
 	}()
@@ -316,10 +317,27 @@ func TestKCP_OOB(t *testing.T) {
 	})
 
 	wg.Go(func() {
-		// send OOB data of varying lengths in a loop, content is [0,1,2,...]
-		for i := range 5 << 20 {
-			if err := client.conn.SendOOB(data[:i%sizePlus1]); err != nil {
-				t.Errorf("client failed to send OOB payload: %v", err)
+		for range 1000 {
+			// send OOB data of varying lengths in a loop, content is [0,1,2,...]
+			for i := range 5 * sizePlus1 {
+				j := i % sizePlus1
+				if counts[j].Load() > 0 {
+					continue
+				}
+				if err := client.conn.SendOOB(data[:j]); err != nil {
+					t.Errorf("client failed to send OOB payload: %v", err)
+				}
+			}
+			time.Sleep(10 * time.Millisecond)
+			var missing bool
+			for i := range counts {
+				if counts[i].Load() == 0 {
+					missing = true
+					break
+				}
+			}
+			if !missing {
+				break
 			}
 		}
 		oobDone.Store(true)
@@ -460,7 +478,7 @@ func TestKCP_EchoBasic(t *testing.T) {
 	if err != nil {
 		t.Fatalf("newKcpClient failed: %v", err)
 	}
-	defer func() { _ = client.closeClient() }()
+	defer func() { _ = client.Close() }()
 
 	runKcpEchoTest(t, listener, client)
 }
@@ -540,7 +558,7 @@ func TestKCP_DelegatedCrypto(t *testing.T) {
 	if err != nil {
 		t.Fatalf("newKcpClient failed: %v", err)
 	}
-	defer func() { _ = client.closeClient() }()
+	defer func() { _ = client.Close() }()
 
 	runKcpEchoTest(t, listener, client)
 

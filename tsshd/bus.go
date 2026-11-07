@@ -25,6 +25,7 @@ SOFTWARE.
 package tsshd
 
 import (
+	"errors"
 	"fmt"
 	"sync"
 	"sync/atomic"
@@ -48,7 +49,7 @@ func (s *sshUdpServer) sendBusMessage(command string, msg any) error {
 	s.busMutex.Unlock()
 
 	if busStream == nil {
-		return fmt.Errorf("bus stream is nil")
+		return errors.New("bus stream is nil")
 	}
 
 	// sendCommandAndMessage assembles the command and payload into a
@@ -63,7 +64,7 @@ func (s *sshUdpServer) initBusAndServer(stream Stream, msg *busMessage) error {
 
 	// only one bus
 	if s.busStream != nil {
-		return fmt.Errorf("bus has been initialized")
+		return errors.New("bus has been initialized")
 	}
 
 	s.initClientChecker(msg.HeartbeatTimeout)
@@ -98,7 +99,7 @@ func (s *sshUdpServer) handleBusEvent(stream Stream) {
 			return
 		}
 		if ver.compare(&tsshdVersion{0, 1, 6}) < 0 {
-			sendError(stream, fmt.Errorf("please upgrade tssh to continue"))
+			sendError(stream, errors.New("please upgrade tssh to continue"))
 			return
 		}
 	}
@@ -119,8 +120,8 @@ func (s *sshUdpServer) handleBusEvent(stream Stream) {
 				if s.closed.Load() {
 					return
 				}
-				if s.client.udpTraffic.recFlag.Load() {
-					if msg := s.client.udpTraffic.flushLog(); msg != "" {
+				if traffic := s.client.udpTraffic.Load(); traffic != nil && traffic.recFlag.Load() {
+					if msg := traffic.flushLog(); msg != "" {
 						debug("client [%x] %s", s.client.proxyAddr.clientID, msg)
 					}
 				}
@@ -165,7 +166,7 @@ func (s *sshUdpServer) handleBusEvent(stream Stream) {
 		case "rekey":
 			err = s.handleRekeyEvent(stream)
 		default:
-			if err := handleUnknownEvent(stream, command); err != nil {
+			if err := handleUnknownEvent(stream, command); err != nil { // nolint
 				warning("handle bus command [%s] failed: %v. You may need to upgrade tsshd.", command, err)
 			}
 		}
@@ -262,7 +263,7 @@ func (s *sshUdpServer) handleRekeyEvent(stream Stream) error {
 		kcpCrypto = s.proxy.kcpCrypto
 	}
 	if kcpCrypto == nil {
-		return fmt.Errorf("rekey failed: crypto is nil")
+		return errors.New("rekey failed: crypto is nil")
 	}
 	if err := kcpCrypto.handleServerRekey(s, &msg); err != nil {
 		return fmt.Errorf("rekey failed: %v", err)
@@ -271,7 +272,7 @@ func (s *sshUdpServer) handleRekeyEvent(stream Stream) error {
 	return nil
 }
 
-func handleUnknownEvent(stream Stream, command string) error {
+func handleUnknownEvent(stream Stream, command string) error { // nolint
 	var msg struct{}
 	if err := recvMessage(stream, &msg); err != nil {
 		return fmt.Errorf("recv message for unknown command [%s] failed: %v", command, err)

@@ -66,7 +66,7 @@ type clientState struct {
 	clientMutex  sync.Mutex
 	clientCond   *sync.Cond
 	kcpCrypto    atomic.Pointer[rotatingCrypto]
-	udpTraffic   *trafficStats
+	udpTraffic   atomic.Pointer[trafficStats]
 }
 
 func (c *clientState) remoteAddr() string {
@@ -181,6 +181,7 @@ func (c *clientState) Close() {
 	c.setClientAddr(nil, nil)
 	c.setAuthedAddr(nil, nil)
 	c.udpFrontConn.Store(nil)
+	c.udpTraffic.Store(nil)
 }
 
 type frontendConnection interface {
@@ -759,9 +760,7 @@ func (p *serverProxy) newClientState(clientID uint64) (*clientState, error) {
 		client.kcpCrypto.Store(crypto)
 	}
 
-	if enableDebugLogging.Load() {
-		client.udpTraffic = &trafficStats{}
-	}
+	client.udpTraffic.Store(&trafficStats{})
 
 	return client, nil
 }
@@ -805,7 +804,7 @@ func (p *serverProxy) sealAuthPacket(serialNumber uint64) ([]byte, error) {
 	binary.BigEndian.PutUint64(data[8:16], serialNumber)
 	buf := aesEncrypt(p.cipherBlock, data)
 	if buf == nil {
-		return nil, fmt.Errorf("aes encrypt failed")
+		return nil, errors.New("aes encrypt failed")
 	}
 	return buf, nil
 }
@@ -870,9 +869,11 @@ func (p *serverProxy) ReadFrom(buf []byte) (int, net.Addr, error) {
 		server.clientChecker.updateNow()
 	}
 
-	if enableDebugLogging.Load() && client.udpTraffic.recFlag.Load() {
-		client.udpTraffic.recvCount.Add(1)
-		client.udpTraffic.recvBytes.Add(uint64(n))
+	if enableDebugLogging.Load() {
+		if traffic := client.udpTraffic.Load(); traffic != nil && traffic.recFlag.Load() {
+			traffic.recvCount.Add(1)
+			traffic.recvBytes.Add(uint64(n))
+		}
 	}
 
 	return n, &client.proxyAddr, nil
@@ -913,9 +914,11 @@ func (p *serverProxy) WriteTo(buf []byte, addr net.Addr) (int, error) {
 		if err != errClientDisconnected {
 			debug("frontend write failed: %v", err)
 		}
-	} else if enableDebugLogging.Load() && client.udpTraffic.recFlag.Load() {
-		client.udpTraffic.sendCount.Add(1)
-		client.udpTraffic.sendBytes.Add(uint64(len(buf)))
+	} else if enableDebugLogging.Load() {
+		if traffic := client.udpTraffic.Load(); traffic != nil && traffic.recFlag.Load() {
+			traffic.sendCount.Add(1)
+			traffic.sendBytes.Add(uint64(len(buf)))
+		}
 	}
 
 	return n, nil

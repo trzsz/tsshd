@@ -60,6 +60,35 @@ var cleanupDebugLog atomic.Bool
 const kHeartbeatLogLimit uint64 = 10
 const kHeartbeatInitCount uint64 = 1000
 
+// Multiple client instances may exist in the same process, for example,
+// when connecting through jump hosts. Shared client/server functions may
+// emit debug or warning logs, so they should distinguish between client
+// and server calls and use the callback associated with the calling client.
+//
+// If a shared function fails to distinguish between client and server calls,
+// the global client callback serves as a fallback. Such logs should be tagged
+// with [fix_me] so that the missing distinction can be identified and fixed.
+//
+// Therefore, if any client enables debug or warning logging, its callback
+// is retained as a process-wide fallback.
+func initClientDebugLogging(enableDebugging bool, debugFn func(int64, string)) {
+	if enableDebugging {
+		enableDebugLogging.Store(true)
+		if debugFn != nil {
+			clientDebugFn.Store(&debugFn)
+		}
+	}
+}
+
+func initClientWarningLogging(enableWarning bool, warningFn func(string)) {
+	if enableWarning {
+		enableWarningLogging.Store(true)
+		if warningFn != nil {
+			clientWarningFn.Store(&warningFn)
+		}
+	}
+}
+
 func initDebugLogging() {
 	enableDebugLogging.Store(true)
 
@@ -190,22 +219,50 @@ func warning(format string, a ...any) {
 func doWithTimeout[T any](task func() (T, error), timeout time.Duration) (T, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
-	done := make(chan struct {
+	return doWithContext(ctx, task)
+}
+
+func doWithContext[T any](ctx context.Context, task func() (T, error)) (T, error) {
+	var zero T
+	if err := ctx.Err(); err != nil {
+		return zero, err
+	}
+
+	type result struct {
 		ret T
 		err error
-	}, 1)
+	}
+
+	// Use an unbuffered channel to transfer ownership of the result only when
+	// the caller receives it. If the context is canceled before the transfer,
+	// close the result if it implements Close() error to avoid leaking resources.
+	done := make(chan result)
+
 	go func() {
 		ret, err := task()
-		done <- struct {
-			ret T
-			err error
-		}{ret, err}
-		close(done)
+		if err != nil {
+			if closer, ok := any(ret).(interface{ Close() error }); ok {
+				_ = closer.Close()
+			}
+			select {
+			case done <- result{err: err}:
+			case <-ctx.Done():
+			}
+			return
+		}
+
+		select {
+		case done <- result{ret: ret}:
+		case <-ctx.Done():
+			if closer, ok := any(ret).(interface{ Close() error }); ok {
+				_ = closer.Close()
+			}
+		}
 	}()
+
 	select {
 	case <-ctx.Done():
-		var ret T
-		return ret, fmt.Errorf("timeout exceeded %v", timeout)
+		return zero, ctx.Err()
 	case res := <-done:
 		return res.ret, res.err
 	}
@@ -329,7 +386,7 @@ func (tc *timeoutChecker) waitReconnect(ctx context.Context) error {
 		case <-*ch:
 			continue
 		case <-tc.closeChan:
-			return fmt.Errorf("timeout closed")
+			return errors.New("timeout closed")
 		case <-ctx.Done():
 			return ctx.Err()
 		}

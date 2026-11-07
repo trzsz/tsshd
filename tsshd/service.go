@@ -87,7 +87,7 @@ var smuxConfig = smux.Config{
 
 type protocolServer interface {
 	reset()
-	closeServer() error
+	Close() error
 	getUdpForwarder() *udpForwarder
 }
 
@@ -101,7 +101,7 @@ func (s *kcpServer) reset() {
 	s.conn.ResetRTO()
 }
 
-func (s *kcpServer) closeServer() error {
+func (s *kcpServer) Close() error {
 	s.forwarder.Close()
 	return s.session.Close()
 }
@@ -119,7 +119,7 @@ func (s *quicServer) reset() {
 	s.conn.ResetPTO()
 }
 
-func (s *quicServer) closeServer() error {
+func (s *quicServer) Close() error {
 	s.forwarder.Close()
 	return s.conn.CloseWithError(0, "")
 }

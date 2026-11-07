@@ -65,6 +65,9 @@ type TransportStats struct {
 }
 
 func (c *kcpClient) stats(s *TransportStats) {
+	if c == nil {
+		return
+	}
 	s.Mode = kUdpModeKCP
 	s.SRTTMs = int64(c.conn.GetSRTT())
 	s.RTTVarMs = int64(c.conn.GetSRTTVar())
@@ -76,6 +79,9 @@ func (c *kcpClient) stats(s *TransportStats) {
 }
 
 func (c *quicClient) stats(s *TransportStats) {
+	if c == nil {
+		return
+	}
 	cs := c.conn.ConnectionStats()
 	s.Mode = kUdpModeQUIC
 	s.SRTTMs = cs.SmoothedRTT.Milliseconds()

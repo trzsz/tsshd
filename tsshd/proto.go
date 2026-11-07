@@ -31,6 +31,7 @@ import (
 	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -292,7 +293,7 @@ func writeAll(dst io.Writer, data []byte) error {
 
 func sendCommand(stream io.Writer, command string) error {
 	if len(command) == 0 {
-		return fmt.Errorf("send command is empty")
+		return errors.New("send command is empty")
 	}
 	if len(command) > 255 {
 		return fmt.Errorf("send command too long: %s", command)
@@ -352,7 +353,7 @@ func recvMessage(stream io.Reader, msg any) error {
 
 func sendCommandAndMessage(stream io.Writer, command string, msg any) error {
 	if len(command) == 0 {
-		return fmt.Errorf("send command is empty")
+		return errors.New("send command is empty")
 	}
 	if len(command) > 255 {
 		return fmt.Errorf("send command too long: %s", command)
@@ -422,9 +423,9 @@ func recvResponse(stream Stream, resp errorResponder) error {
 
 type protocolClient interface {
 	reset()
-	closeClient() error
+	Close() error
 	getUdpForwarder() *udpForwarder
-	newStream(connectTimeout time.Duration) (Stream, error)
+	newStream(ctx context.Context) (Stream, error)
 	stats(s *TransportStats)
 }
 
@@ -435,24 +436,38 @@ type kcpClient struct {
 }
 
 func (c *kcpClient) reset() {
+	if c == nil {
+		return
+	}
 	c.conn.ResetRTO()
 }
 
-func (c *kcpClient) closeClient() error {
+func (c *kcpClient) Close() error {
+	if c == nil {
+		return nil
+	}
 	c.forwarder.Close()
 	return c.session.Close()
 }
 
 func (c *kcpClient) getUdpForwarder() *udpForwarder {
+	if c == nil {
+		return nil
+	}
 	return c.forwarder
 }
 
-func (c *kcpClient) newStream(connectTimeout time.Duration) (Stream, error) {
-	stream, err := c.session.OpenStream()
-	if err != nil {
-		return nil, fmt.Errorf("kcp smux open stream failed: %w", err)
+func (c *kcpClient) newStream(ctx context.Context) (Stream, error) {
+	if c == nil {
+		return nil, errors.New("kcp client is nil")
 	}
-	return &smuxStream{stream}, nil
+	return doWithContext(ctx, func() (Stream, error) {
+		stream, err := c.session.OpenStream()
+		if err != nil {
+			return nil, fmt.Errorf("kcp smux open stream failed: %w", err)
+		}
+		return &smuxStream{stream}, nil
+	})
 }
 
 type quicClient struct {
@@ -462,10 +477,16 @@ type quicClient struct {
 }
 
 func (c *quicClient) reset() {
+	if c == nil {
+		return
+	}
 	c.conn.ResetPTO()
 }
 
-func (c *quicClient) closeClient() error {
+func (c *quicClient) Close() error {
+	if c == nil {
+		return nil
+	}
 	c.forwarder.Close()
 	err := c.conn.CloseWithError(0, "")
 	<-c.closed
@@ -473,12 +494,16 @@ func (c *quicClient) closeClient() error {
 }
 
 func (c *quicClient) getUdpForwarder() *udpForwarder {
+	if c == nil {
+		return nil
+	}
 	return c.forwarder
 }
 
-func (c *quicClient) newStream(connectTimeout time.Duration) (Stream, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), connectTimeout)
-	defer cancel()
+func (c *quicClient) newStream(ctx context.Context) (Stream, error) {
+	if c == nil {
+		return nil, errors.New("quic client is nil")
+	}
 	stream, err := c.conn.OpenStreamSync(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("quic open stream sync failed: %w", err)
@@ -486,14 +511,16 @@ func (c *quicClient) newStream(connectTimeout time.Duration) (Stream, error) {
 	return &quicStream{stream, c.conn}, err
 }
 
-func newProtoClient(opts *UdpClientOptions, client *SshUdpClient) (protocolClient, error) {
+func newProtoClient(ctx context.Context, opts *UdpClientOptions, client *SshUdpClient) (protocolClient, error) {
 	switch opts.ServerInfo.Mode {
 	case "":
-		return nil, fmt.Errorf("%s", "Please upgrade tsshd")
+		return nil, errors.New("please upgrade tsshd")
 	case kUdpModeKCP:
-		return newKcpClient(opts, client, client.clientProxy, client.clientProxy.remoteAddr)
+		return doWithContext(ctx, func() (protocolClient, error) {
+			return newKcpClient(opts, client, client.clientProxy, client.clientProxy.remoteAddr)
+		})
 	case kUdpModeQUIC:
-		return newQuicClient(opts, client.clientProxy, client.clientProxy.remoteAddr)
+		return newQuicClient(ctx, opts, client.clientProxy, client.clientProxy.remoteAddr)
 	default:
 		return nil, fmt.Errorf("unknown tsshd mode: %s", opts.ServerInfo.Mode)
 	}
@@ -536,12 +563,13 @@ func newKcpClient(opts *UdpClientOptions, client *SshUdpClient, udpConn net.Pack
 
 	session, err := smux.Client(conn, &smuxConfig)
 	if err != nil {
+		_ = conn.Close()
 		return nil, fmt.Errorf("kcp smux client failed: %w", err)
 	}
 	return &kcpClient{conn, session, &udpForwarder{conn: newKcpDatagramConn(conn)}}, nil
 }
 
-func newQuicClient(opts *UdpClientOptions, udpConn net.PacketConn, remoteAddr net.Addr) (*quicClient, error) {
+func newQuicClient(ctx context.Context, opts *UdpClientOptions, udpConn net.PacketConn, remoteAddr net.Addr) (*quicClient, error) {
 	serverCert, err := hex.DecodeString(opts.ServerInfo.ServerCert)
 	if err != nil {
 		return nil, fmt.Errorf("decode server cert [%s] failed: %w", opts.ServerInfo.ServerCert, err)
@@ -578,8 +606,6 @@ func newQuicClient(opts *UdpClientOptions, udpConn net.PacketConn, remoteAddr ne
 		config.InitialPacketSize = kDefaultMTU
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), opts.ConnectTimeout)
-	defer cancel()
 	// Own the transport explicitly. quic.Dial closes its single-use transport
 	// before returning a handshake error, but clientProxy reads intentionally
 	// wait through backend failures/reconnections and do not implement deadlines.

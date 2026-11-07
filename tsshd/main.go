@@ -25,6 +25,7 @@ SOFTWARE.
 package tsshd
 
 import (
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -234,7 +235,7 @@ var mainOnce atomic.Bool
 // and only the child process continues running.
 func RunMain(opts ...Option) (int, error) {
 	if !mainOnce.CompareAndSwap(false, true) {
-		return kExitCodeAlreadyRun, fmt.Errorf("tsshd server already running")
+		return kExitCodeAlreadyRun, errors.New("tsshd server already running")
 	}
 
 	for _, opt := range opts {
