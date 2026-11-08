@@ -185,22 +185,31 @@ func (c *clientState) Close() {
 }
 
 type frontendConnection interface {
+	addressFamily() string
 	start(*serverProxy)
 	readFrom([]byte) (int, *clientState)
 	writeTo([]byte, *clientState) error
 }
 
 type udpFrontendConn struct {
-	proxy       *serverProxy
-	conn        atomic.Pointer[net.UDPConn]
-	connList    []*net.UDPConn
-	initMutex   sync.Mutex
-	initCond    *sync.Cond
-	cacheClient atomic.Pointer[clientState]
-	clientMutex sync.Mutex
-	clientMap   map[string]*clientState
-	authedMutex sync.Mutex
-	authedMap   map[string]*clientState
+	proxy        *serverProxy
+	conn         atomic.Pointer[net.UDPConn]
+	connList     []*net.UDPConn
+	listenFamily string
+	initMutex    sync.Mutex
+	initCond     *sync.Cond
+	cacheClient  atomic.Pointer[clientState]
+	clientMutex  sync.Mutex
+	clientMap    map[string]*clientState
+	authedMutex  sync.Mutex
+	authedMap    map[string]*clientState
+}
+
+func (c *udpFrontendConn) addressFamily() string {
+	if conn := c.conn.Load(); conn != nil {
+		return listenerAddressFamily(conn.LocalAddr())
+	}
+	return c.listenFamily
 }
 
 func (c *udpFrontendConn) start(proxy *serverProxy) {
@@ -534,8 +543,21 @@ type tcpFrameSignal struct {
 
 type tcpFrontendConn struct {
 	proxy         *serverProxy
+	listenerMutex sync.Mutex
 	listenerList  []*net.TCPListener
-	frameSignalCh chan *tcpFrameSignal
+	// listenerFamily is fixed at listen time; it is read-only afterwards.
+	listenerFamily map[*net.TCPListener]string
+	frameSignalCh  chan *tcpFrameSignal
+}
+
+func (c *tcpFrontendConn) addressFamily() string {
+	c.listenerMutex.Lock()
+	defer c.listenerMutex.Unlock()
+	families := make([]string, 0, len(c.listenerList))
+	for _, listener := range c.listenerList {
+		families = append(families, c.listenerFamily[listener])
+	}
+	return commonAddressFamily(families)
 }
 
 func (c *tcpFrontendConn) start(proxy *serverProxy) {
@@ -545,14 +567,25 @@ func (c *tcpFrontendConn) start(proxy *serverProxy) {
 		c.frameSignalCh = make(chan *tcpFrameSignal, 10)
 	}
 
+	c.listenerMutex.Lock()
+	defer c.listenerMutex.Unlock()
 	for _, listener := range c.listenerList {
 		go c.serve(listener)
 	}
-	c.listenerList = nil
 }
 
 func (c *tcpFrontendConn) serve(listener *net.TCPListener) {
-	defer func() { _ = listener.Close() }()
+	defer func() {
+		c.listenerMutex.Lock()
+		defer c.listenerMutex.Unlock()
+		_ = listener.Close()
+		for i, l := range c.listenerList {
+			if l == listener {
+				c.listenerList = append(c.listenerList[:i], c.listenerList[i+1:]...)
+				break
+			}
+		}
+	}()
 	beginTime := time.Now()
 	neverAccepted := true
 

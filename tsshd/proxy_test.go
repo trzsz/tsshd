@@ -114,6 +114,10 @@ func runStreamEchoTest(t *testing.T, stream Stream) {
 }
 
 func runProxyEchoTest(t *testing.T, args *tsshdArgs) {
+	runProxyEchoTestHost(t, args, "127.0.0.1")
+}
+
+func runProxyEchoTestHost(t *testing.T, args *tsshdArgs, host string) {
 	oriNew := newSshUdpServer
 	defer func() {
 		newSshUdpServer = oriNew
@@ -136,7 +140,7 @@ func runProxyEchoTest(t *testing.T, args *tsshdArgs) {
 	}
 
 	opts := &UdpClientOptions{
-		TsshdAddr:        net.JoinHostPort("127.0.0.1", strconv.Itoa(info.Port)),
+		TsshdAddr:        net.JoinHostPort(host, strconv.Itoa(info.Port)),
 		ServerInfo:       &info,
 		ConnectTimeout:   args.ConnectTimeout,
 		HeartbeatTimeout: 3 * time.Second,
@@ -196,6 +200,22 @@ func runProxyEchoTest(t *testing.T, args *tsshdArgs) {
 	}
 
 	wg.Wait()
+}
+
+func TestProxyAddressFamilyIPv6(t *testing.T) {
+	requireIPv6Loopback(t)
+	if _, err := net.ResolveUDPAddr("udp6", "localhost:1"); err != nil {
+		t.Skip("localhost needs an IPv6 record")
+	}
+	for _, kcp := range []bool{false, true} {
+		for _, tcp := range []bool{false, true} {
+			t.Run(fmt.Sprintf("kcp=%t/tcp=%t", kcp, tcp), func(t *testing.T) {
+				t.Setenv("SSH_CONNECTION", "::1 1234 ::1 22")
+				runProxyEchoTestHost(t, &tsshdArgs{KCP: kcp, TCP: tcp,
+					Port: "31000-65000", ConnectTimeout: 3 * time.Second}, "localhost")
+			})
+		}
+	}
 }
 
 func TestProxy(t *testing.T) {
