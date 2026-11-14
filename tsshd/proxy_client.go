@@ -175,7 +175,7 @@ type clientProxy struct {
 	clientID      uint64
 	serverID      uint64
 	renewMutex    chan struct{}
-	serialNumber  uint64
+	serialNumber  atomic.Uint64
 	serverChecker *timeoutChecker
 	closed        atomic.Bool
 	udpTraffic    *trafficStats
@@ -229,7 +229,7 @@ func (p *clientProxy) renewTransportPath(ctx context.Context, proxyClient *SshUd
 		return errors.New("client proxy closed")
 	}
 
-	p.serialNumber++
+	p.serialNumber.Add(1)
 	p.clearBackendConn(nil)
 
 	var err error
@@ -413,39 +413,48 @@ func (p *clientProxy) renewTcpPath(ctx context.Context, proxyClient *SshUdpClien
 		_ = conn.Close()
 		return nil, errors.New("proxy auth failed")
 	}
-	p.client.debug("serial number [%d] auth success", p.serialNumber)
+	p.client.debug("serial number [%d] auth success", p.serialNumber.Load())
 
 	return conn, nil
 }
 
 func (p *clientProxy) renewUdpPath(ctx context.Context, proxyClient *SshUdpClient) (*serverConnHolder, error) {
-	var conn *serverConnHolder
+	return p.raceUdpPath(ctx, func(ctx context.Context, network string) (*serverConnHolder, error) {
+		return p.dialPacket(ctx, proxyClient, network)
+	})
+}
+
+func (p *clientProxy) dialPacket(ctx context.Context, proxyClient *SshUdpClient, network string) (*serverConnHolder, error) {
 	if proxyClient != nil {
-		udpConn, err := proxyClient.dialUDP(p.serverNet, p.serverAddr, ctx, false)
+		udpConn, err := proxyClient.dialUDP(network, p.serverAddr, ctx, false)
 		if err != nil {
-			return nil, fmt.Errorf("proxy dial [%s] [%s] failed: %v", p.serverNet, p.serverAddr, err)
+			return nil, fmt.Errorf("proxy dial [%s] [%s] failed: %v", network, p.serverAddr, err)
 		}
-		conn = &serverConnHolder{udpConn}
-	} else {
-		serverAddr, err := doWithContext(ctx, func() (*net.UDPAddr, error) {
-			return net.ResolveUDPAddr(p.serverNet, p.serverAddr)
-		})
-		if err != nil {
-			return nil, fmt.Errorf("resolve udp addr [%s] [%s] failed: %v", p.serverNet, p.serverAddr, err)
-		}
-		udpConn, err := net.DialUDP("udp", nil, serverAddr)
-		if err != nil {
-			return nil, fmt.Errorf("dial [%s] [%s] failed: %v", p.serverNet, p.serverAddr, err)
-		}
-		setDSCP(udpConn, kProxyDSCP)
-		_ = udpConn.SetReadBuffer(kProxyBufferSize)
-		_ = udpConn.SetWriteBuffer(kProxyBufferSize)
-		conn = &serverConnHolder{&udpServerConn{udpConn}}
+		return &serverConnHolder{udpConn}, nil
 	}
 
+	serverAddr, err := doWithContext(ctx, func() (*net.UDPAddr, error) {
+		return net.ResolveUDPAddr(network, p.serverAddr)
+	})
+	if err != nil {
+		return nil, fmt.Errorf("resolve udp addr [%s] [%s] failed: %v", network, p.serverAddr, err)
+	}
+	udpConn, err := net.DialUDP("udp", nil, serverAddr)
+	if err != nil {
+		return nil, fmt.Errorf("dial [%s] [%s] failed: %v", network, p.serverAddr, err)
+	}
+	setDSCP(udpConn, kProxyDSCP)
+	_ = udpConn.SetReadBuffer(kProxyBufferSize)
+	_ = udpConn.SetWriteBuffer(kProxyBufferSize)
+	return &serverConnHolder{&udpServerConn{udpConn}}, nil
+}
+
+// authUdpPath closes conn if it fails.
+func (p *clientProxy) authUdpPath(ctx context.Context, conn *serverConnHolder) error {
 	done := make(chan error, 1)
 	go func() {
-		buffer := make([]byte, 256)
+		// Windows fails the read if a datagram is larger than the buffer.
+		buffer := make([]byte, 0xffff)
 		for ctx.Err() == nil {
 			n, err := conn.Read(buffer)
 			if err != nil {
@@ -453,7 +462,6 @@ func (p *clientProxy) renewUdpPath(ctx context.Context, proxyClient *SshUdpClien
 				return
 			}
 			if p.isAuthSuccessful(buffer[:n]) {
-				p.client.debug("serial number [%d] auth success", p.serialNumber)
 				done <- nil
 				return
 			}
@@ -465,7 +473,7 @@ func (p *clientProxy) renewUdpPath(ctx context.Context, proxyClient *SshUdpClien
 
 	if err := p.sendAuthPacket(ctx, conn); err != nil {
 		_ = conn.Close()
-		return nil, fmt.Errorf("send auth packet failed: %v", err)
+		return fmt.Errorf("send auth packet failed: %v", err)
 	}
 
 	for {
@@ -473,25 +481,74 @@ func (p *clientProxy) renewUdpPath(ctx context.Context, proxyClient *SshUdpClien
 		case err := <-done:
 			if err != nil {
 				_ = conn.Close()
-				return nil, err
+				return err
 			}
-			return conn, nil
+			return nil
 		case <-ticker.C:
 			if err := p.sendAuthPacket(ctx, conn); err != nil {
 				_ = conn.Close()
-				return nil, fmt.Errorf("send auth packet failed: %v", err)
+				return fmt.Errorf("send auth packet failed: %v", err)
 			}
 		case <-ctx.Done():
 			_ = conn.Close()
-			return nil, fmt.Errorf("renew path to [%s] [%s] failed: %v", p.serverNet, p.serverAddr, ctx.Err())
+			return ctx.Err()
 		}
 	}
+}
+
+// raceUdpPath tries IPv4 and IPv6 at once unless a family is forced.
+// All attempts use the same serial number, so the server accepts only the first.
+func (p *clientProxy) raceUdpPath(ctx context.Context, dial func(context.Context, string) (*serverConnHolder, error)) (*serverConnHolder, error) {
+	networks := []string{p.serverNet}
+	if p.serverNet == "udp" {
+		networks = []string{"udp4", "udp6"}
+	}
+
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	type result struct {
+		network string
+		conn    *serverConnHolder
+		err     error
+	}
+	results := make(chan result, len(networks))
+	for _, network := range networks {
+		go func() {
+			conn, err := dial(ctx, network)
+			if err == nil {
+				if err = p.authUdpPath(ctx, conn); err != nil {
+					err = fmt.Errorf("renew path to [%s] [%s] failed: %v", network, p.serverAddr, err)
+				}
+			}
+			results <- result{network, conn, err}
+		}()
+	}
+
+	var conn *serverConnHolder
+	var errs []error
+	for range networks {
+		res := <-results
+		if res.err != nil {
+			errs = append(errs, res.err)
+		} else if conn == nil {
+			conn = res.conn
+			cancel()
+			p.client.debug("serial number [%d] auth success over [%s]", p.serialNumber.Load(), res.network)
+		} else {
+			_ = res.conn.Close()
+		}
+	}
+	if conn == nil {
+		return nil, errors.Join(errs...)
+	}
+	return conn, nil
 }
 
 func (p *clientProxy) sendAuthPacket(ctx context.Context, conn PacketConn) error {
 	data := make([]byte, 16, 20+kClientNonceSize)
 	binary.BigEndian.PutUint64(data[0:8], p.clientID)
-	binary.BigEndian.PutUint64(data[8:16], p.serialNumber)
+	binary.BigEndian.PutUint64(data[8:16], p.serialNumber.Load())
 	if p.client.protoVersion >= 3 {
 		// Announce the protocol version and the client nonce, so that the
 		// server knows how the following KCP packets are protected before the
@@ -522,11 +579,13 @@ func (p *clientProxy) isAuthSuccessful(buf []byte) bool {
 		return false
 	}
 	serialNumber := binary.BigEndian.Uint64(data[8:16])
-	if serialNumber > p.serialNumber {
-		p.serialNumber = serialNumber
+	oldSerialNumber := p.serialNumber.Load()
+	if serialNumber > oldSerialNumber {
+		// Another attempt may have raised it already.
+		p.serialNumber.CompareAndSwap(oldSerialNumber, serialNumber)
 		return false
 	}
-	return p.serialNumber == serialNumber
+	return serialNumber == oldSerialNumber
 }
 
 func (p *clientProxy) ReadFrom(buf []byte) (int, net.Addr, error) {

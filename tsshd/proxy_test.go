@@ -308,7 +308,7 @@ func TestProxy_ClientHello(t *testing.T) {
 		proxy, err := startClientProxy(&SshUdpClient{protoVersion: protoVersion}, opts)
 		require.NoError(t, err)
 		t.Cleanup(func() { _ = proxy.Close() })
-		proxy.serialNumber = 1
+		proxy.serialNumber.Store(1)
 		return proxy
 	}
 
