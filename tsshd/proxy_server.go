@@ -34,6 +34,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"net/netip"
 	"strconv"
 	"sync"
 	"sync/atomic"
@@ -64,6 +65,18 @@ type clientHello struct {
 	clientNonce  []byte
 }
 
+// udpPath is the socket, remote and local address a client authenticated on.
+type udpPath struct {
+	socket udpSocket
+	remote netip.AddrPort
+	local  netip.Addr
+	oob    []byte // set when the path is accepted
+}
+
+func (p *udpPath) send(buf []byte) error {
+	return p.socket.writeTo(buf, p.remote, p.oob)
+}
+
 type clientState struct {
 	sealed       atomic.Bool
 	closed       atomic.Bool
@@ -71,8 +84,8 @@ type clientState struct {
 	proxyAddr    proxyClientAddr
 	serialNumber atomic.Uint64
 	clientConn   atomic.Pointer[net.TCPConn]
-	clientAddr   atomic.Pointer[net.UDPAddr]
-	authedAddr   atomic.Pointer[net.UDPAddr]
+	clientAddr   atomic.Pointer[udpPath]
+	authedAddr   atomic.Pointer[udpPath]
 	udpFrontConn atomic.Pointer[udpFrontendConn]
 	clientMutex  sync.Mutex
 	clientCond   *sync.Cond
@@ -84,7 +97,7 @@ type clientState struct {
 
 func (c *clientState) remoteAddr() string {
 	if addr := c.clientAddr.Load(); addr != nil {
-		return addr.String()
+		return addr.remote.String()
 	}
 	if conn := c.clientConn.Load(); conn != nil {
 		return conn.RemoteAddr().String()
@@ -131,7 +144,7 @@ func (c *clientState) setClientConn(oldConn, newConn *net.TCPConn) {
 	}
 }
 
-func (c *clientState) setClientAddr(oldAddr, newAddr *net.UDPAddr) {
+func (c *clientState) setClientAddr(oldAddr, newAddr *udpPath) {
 	conn := c.udpFrontConn.Load()
 
 	if oldAddr == nil {
@@ -153,7 +166,7 @@ func (c *clientState) setClientAddr(oldAddr, newAddr *net.UDPAddr) {
 	}
 }
 
-func (c *clientState) setAuthedAddr(oldAddr, newAddr *net.UDPAddr) {
+func (c *clientState) setAuthedAddr(oldAddr, newAddr *udpPath) {
 	conn := c.udpFrontConn.Load()
 
 	if oldAddr == nil {
@@ -203,102 +216,58 @@ type frontendConnection interface {
 	writeTo([]byte, *clientState) error
 }
 
+// udpPacket hands a packet from a socket reader to readFrom.
+type udpPacket struct {
+	buf  []byte // valid until done is signaled
+	path udpPath
+	done chan struct{}
+}
+
 type udpFrontendConn struct {
 	proxy       *serverProxy
-	conn        atomic.Pointer[net.UDPConn]
-	connList    []*net.UDPConn
-	initMutex   sync.Mutex
-	initCond    *sync.Cond
+	sockets     []udpSocket
+	packetCh    chan udpPacket
+	closed      chan struct{} // closed after all readLoops return
 	cacheClient atomic.Pointer[clientState]
 	clientMutex sync.Mutex
-	clientMap   map[string]*clientState
+	clientMap   map[netip.AddrPort]*clientState
 	authedMutex sync.Mutex
-	authedMap   map[string]*clientState
+	authedMap   map[netip.AddrPort]*clientState
 }
 
 func (c *udpFrontendConn) start(proxy *serverProxy) {
 	c.proxy = proxy
-	c.initCond = sync.NewCond(&c.initMutex)
+	c.packetCh = make(chan udpPacket)
+	c.closed = make(chan struct{})
 
-	if len(c.connList) == 1 {
-		c.initConn(c.connList[0], nil, 0, 0, nil)
-	} else {
-		for _, conn := range c.connList {
-			go c.probeAuth(conn)
-		}
+	// Sockets stay open until exit, so clients can reconnect at any time.
+	var readers sync.WaitGroup
+	for _, socket := range c.sockets {
+		addOnExitFunc(func() { _ = socket.Close() })
+		readers.Go(func() { c.readLoop(socket) })
 	}
-	c.connList = nil
+	go func() {
+		readers.Wait()
+		close(c.closed)
+	}()
 }
 
-func (c *udpFrontendConn) initConn(conn *net.UDPConn, addr *net.UDPAddr, clientID, newSerialNumber uint64, hello *clientHello) {
-	setDSCP(conn, kProxyDSCP)
-	_ = conn.SetReadBuffer(kProxyBufferSize)
-	_ = conn.SetWriteBuffer(kProxyBufferSize)
-
-	c.initMutex.Lock()
-	defer c.initMutex.Unlock()
-
-	if c.conn.Load() != nil {
-		_ = conn.Close()
-		return
-	}
-	c.conn.Store(conn)
-	c.initCond.Broadcast()
-	addOnExitFunc(func() { _ = conn.Close() })
-
-	if addr != nil {
-		client := c.proxy.getClient(clientID)
-		if client == nil {
-			warning("init conn failed: get client [%x] return nil", clientID)
-			return
-		}
-		if client.closed.Load() {
-			warning("init conn failed: client [%x] is closed", clientID)
-			return
-		}
-		client.udpFrontConn.Store(c)
-		oldSerialNumber := client.serialNumber.Load()
-		if newSerialNumber > oldSerialNumber && c.proxy.acceptClientHello(client, hello) {
-			if client.serialNumber.CompareAndSwap(oldSerialNumber, newSerialNumber) {
-				client.setAuthedAddr(nil, cloneNetAddr(addr).(*net.UDPAddr))
-			}
-		}
-	}
-}
-
-func (c *udpFrontendConn) waitConn() *net.UDPConn {
-	if conn := c.conn.Load(); conn != nil {
-		return conn
-	}
-
-	c.initMutex.Lock()
-	defer c.initMutex.Unlock()
-
-	conn := c.conn.Load()
-	for conn == nil {
-		c.initCond.Wait()
-		conn = c.conn.Load()
-	}
-
-	return conn
-}
-
-func (c *udpFrontendConn) probeAuth(conn *net.UDPConn) {
-	buf := make([]byte, 128)
+func (c *udpFrontendConn) readLoop(socket udpSocket) {
+	buf := make([]byte, 0xffff)
+	done := make(chan struct{})
 	for {
-		_ = conn.SetReadDeadline(time.Now().Add(c.proxy.args.ConnectTimeout))
-		n, addr, err := conn.ReadFromUDP(buf)
+		n, remote, local, err := socket.readFrom(buf)
 		if err != nil {
-			_ = conn.Close()
-			return
+			if errors.Is(err, net.ErrClosed) {
+				return
+			}
+			warning("frontend read udp failed: %v", err)
+			time.Sleep(10 * time.Millisecond)
+			continue
 		}
 
-		isAuthPacket, clientID, serialNumber, hello := c.proxy.openAuthPacket(buf[:n])
-		if isAuthPacket {
-			_ = conn.SetReadDeadline(time.Time{})
-			c.initConn(conn, addr, clientID, serialNumber, hello)
-			return
-		}
+		c.packetCh <- udpPacket{buf[:n], udpPath{socket: socket, remote: remote, local: local}, done}
+		<-done
 	}
 }
 
@@ -314,13 +283,13 @@ func (c *udpFrontendConn) addClientMap(client *clientState) {
 
 	c.clientMutex.Lock()
 	if c.clientMap == nil {
-		c.clientMap = make(map[string]*clientState)
+		c.clientMap = make(map[netip.AddrPort]*clientState)
 	}
-	c.clientMap[addr.String()] = client
+	c.clientMap[addr.remote] = client
 	c.clientMutex.Unlock()
 }
 
-func (c *udpFrontendConn) delClientMap(addr *net.UDPAddr) {
+func (c *udpFrontendConn) delClientMap(addr *udpPath) {
 	if !c.proxy.args.Attachable {
 		return
 	}
@@ -330,7 +299,7 @@ func (c *udpFrontendConn) delClientMap(addr *net.UDPAddr) {
 	}
 
 	c.clientMutex.Lock()
-	delete(c.clientMap, addr.String())
+	delete(c.clientMap, addr.remote)
 	c.clientMutex.Unlock()
 }
 
@@ -346,13 +315,13 @@ func (c *udpFrontendConn) addAuthedMap(authed *clientState) {
 
 	c.authedMutex.Lock()
 	if c.authedMap == nil {
-		c.authedMap = make(map[string]*clientState)
+		c.authedMap = make(map[netip.AddrPort]*clientState)
 	}
-	c.authedMap[addr.String()] = authed
+	c.authedMap[addr.remote] = authed
 	c.authedMutex.Unlock()
 }
 
-func (c *udpFrontendConn) delAuthedMap(addr *net.UDPAddr) {
+func (c *udpFrontendConn) delAuthedMap(addr *udpPath) {
 	if !c.proxy.args.Attachable {
 		return
 	}
@@ -362,18 +331,16 @@ func (c *udpFrontendConn) delAuthedMap(addr *net.UDPAddr) {
 	}
 
 	c.authedMutex.Lock()
-	delete(c.authedMap, addr.String())
+	delete(c.authedMap, addr.remote)
 	c.authedMutex.Unlock()
 }
 
-func isSameAddr(a, b *net.UDPAddr) bool {
-	if a == nil || b == nil {
-		return false
-	}
-	return a.Port == b.Port && a.Zone == b.Zone && a.IP.Equal(b.IP)
+// isSameAddr compares only the remote address. A client may use any local address.
+func isSameAddr(path *udpPath, addr netip.AddrPort) bool {
+	return path != nil && path.remote == addr
 }
 
-func (c *udpFrontendConn) getClient(addr *net.UDPAddr) (*clientState, bool, bool) {
+func (c *udpFrontendConn) getClient(addr netip.AddrPort) (*clientState, bool, bool) {
 	if !c.proxy.args.Attachable {
 		client := c.proxy.soleClient
 		if isSameAddr(client.clientAddr.Load(), addr) {
@@ -394,10 +361,8 @@ func (c *udpFrontendConn) getClient(addr *net.UDPAddr) (*clientState, bool, bool
 		}
 	}
 
-	key := addr.String()
-
 	c.clientMutex.Lock()
-	client := c.clientMap[key]
+	client := c.clientMap[addr]
 	c.clientMutex.Unlock()
 
 	if client != nil && isSameAddr(client.clientAddr.Load(), addr) {
@@ -406,7 +371,7 @@ func (c *udpFrontendConn) getClient(addr *net.UDPAddr) (*clientState, bool, bool
 	}
 
 	c.authedMutex.Lock()
-	authed := c.authedMap[key]
+	authed := c.authedMap[addr]
 	c.authedMutex.Unlock()
 
 	if authed != nil && isSameAddr(authed.authedAddr.Load(), addr) {
@@ -416,21 +381,23 @@ func (c *udpFrontendConn) getClient(addr *net.UDPAddr) (*clientState, bool, bool
 	return nil, false, false
 }
 
+// readFrom returns a nil client once all sockets are closed.
 func (c *udpFrontendConn) readFrom(buf []byte) (int, *clientState) {
-	conn := c.waitConn()
-
 	for {
-		n, addr, err := conn.ReadFromUDP(buf)
-		if err != nil {
-			warning("frontend read udp failed: %v", err)
-			time.Sleep(10 * time.Millisecond)
-			continue
+		var packet udpPacket
+		select {
+		case packet = <-c.packetCh:
+		case <-c.closed:
+			return 0, nil
 		}
+		n := copy(buf, packet.buf)
+		packet.done <- struct{}{}
+		addr := packet.path.remote
 
 		client, isClientAddr, isAuthedAddr := c.getClient(addr)
 
 		// Case 1: packet from current effective client.
-		// Fast path — directly forward.
+		// Fast path — directly forward. Only authentication changes the path.
 		if isClientAddr {
 			if n <= kSafeToDropPacketLen {
 				continue
@@ -482,9 +449,12 @@ func (c *udpFrontendConn) readFrom(buf []byte) (int, *clientState) {
 				debug("authenticate conflict: old_serial=%d, new_serial=%d", oldSerialNumber, newSerialNumber)
 				newSerialNumber = client.serialNumber.Load()
 			}
+			// Reply on the authenticated path.
 			if b, err := c.proxy.sealAuthPacket(newSerialNumber, hello); err != nil {
 				warning("seal auth packet failed: %v", err)
-			} else if _, err := conn.WriteTo(b, addr); err != nil {
+			} else if path := client.authedAddr.Load(); path == nil {
+				warning("authed addr missing: client_id=%x, new_serial=%d", clientID, newSerialNumber)
+			} else if err := path.send(b); err != nil {
 				warning("send auth packet failed: %v", err)
 			}
 			continue
@@ -518,10 +488,13 @@ func (c *udpFrontendConn) readFrom(buf []byte) (int, *clientState) {
 			continue
 		}
 
+		// Build oob once per accepted path, not per packet.
+		path := packet.path
+		path.oob = path.socket.replyOOB(path.local)
 		if client.serialNumber.CompareAndSwap(oldSerialNumber, newSerialNumber) {
 			debug("client [%x] [%d] authed from %s", clientID, newSerialNumber, addr)
 			// Store as authenticated but not yet activated address.
-			client.setAuthedAddr(nil, cloneNetAddr(addr).(*net.UDPAddr))
+			client.setAuthedAddr(nil, &path)
 		} else {
 			debug("authenticate conflict: old_serial=%d, new_serial=%d", oldSerialNumber, newSerialNumber)
 			newSerialNumber = client.serialNumber.Load()
@@ -529,7 +502,7 @@ func (c *udpFrontendConn) readFrom(buf []byte) (int, *clientState) {
 		// Send authentication response (ack).
 		if b, err := c.proxy.sealAuthPacket(newSerialNumber, hello); err != nil {
 			warning("seal auth packet failed: %v", err)
-		} else if _, err := conn.WriteTo(b, addr); err != nil {
+		} else if err := path.send(b); err != nil {
 			warning("send auth packet failed: %v", err)
 		}
 	}
@@ -541,8 +514,7 @@ func (c *udpFrontendConn) writeTo(buf []byte, client *clientState) error {
 		return errClientDisconnected
 	}
 
-	_, err := c.waitConn().WriteTo(buf, addr)
-	return err
+	return addr.send(buf)
 }
 
 type tcpFrameSignal struct {
@@ -565,38 +537,23 @@ func (c *tcpFrontendConn) start(proxy *serverProxy) {
 		c.frameSignalCh = make(chan *tcpFrameSignal, 10)
 	}
 
+	// Listeners stay open until exit, so clients can reconnect at any time.
 	for _, listener := range c.listenerList {
+		addOnExitFunc(func() { _ = listener.Close() })
 		go c.serve(listener)
 	}
-	c.listenerList = nil
 }
 
 func (c *tcpFrontendConn) serve(listener *net.TCPListener) {
 	defer func() { _ = listener.Close() }()
-	beginTime := time.Now()
-	neverAccepted := true
 
 	for {
-		if neverAccepted {
-			_ = listener.SetDeadline(time.Now().Add(c.proxy.args.ConnectTimeout))
-		}
-
 		conn, err := listener.AcceptTCP()
 		if err != nil {
-			if neverAccepted && time.Since(beginTime) > c.proxy.args.ConnectTimeout-10*time.Millisecond {
-				return
+			if !errors.Is(err, net.ErrClosed) {
+				warning("frontend accept tcp failed: %v", err)
 			}
-			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
-				continue
-			}
-			warning("frontend accept tcp failed: %v", err)
 			return
-		}
-
-		if neverAccepted {
-			neverAccepted = false
-			_ = listener.SetDeadline(time.Time{})
-			addOnExitFunc(func() { _ = listener.Close() })
 		}
 
 		go c.handshake(conn)
