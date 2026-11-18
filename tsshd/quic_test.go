@@ -203,7 +203,7 @@ func (c *mtuTestConn) ReadFrom(buf []byte) (n int, addr net.Addr, err error) {
 	if n > c.mtu {
 		c.t.Fatalf("received datagram size %d exceeds MTU %d", n, c.mtu)
 	}
-	c.cnt.Add(1)
+	c.countFullSize(n)
 	return
 }
 
@@ -211,8 +211,15 @@ func (c *mtuTestConn) WriteTo(buf []byte, addr net.Addr) (int, error) {
 	if len(buf) > c.mtu {
 		c.t.Fatalf("datagram size %d exceeds MTU %d", len(buf), c.mtu)
 	}
-	c.cnt.Add(1)
+	c.countFullSize(len(buf))
 	return c.conn.WriteTo(buf, addr)
+}
+
+// countFullSize skips ACK-only packets. How many QUIC sends depends on timing.
+func (c *mtuTestConn) countFullSize(n int) {
+	if n > c.mtu/2 {
+		c.cnt.Add(1)
+	}
 }
 
 func TestQUIC_RespectMTU(t *testing.T) {
@@ -409,8 +416,8 @@ func TestQUIC_RespectMTU(t *testing.T) {
 		t.Fatalf("test timed out")
 	}
 
-	// sanity check: ensure UDP layer was exercised sufficiently.
-	if got := svrConn.cnt.Load(); got < 300 {
+	// 100 echoed datagrams, in and out.
+	if got := svrConn.cnt.Load(); got < 200 {
 		t.Fatalf("insufficient UDP traffic observed: cnt=%d", got)
 	}
 }
