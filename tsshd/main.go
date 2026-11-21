@@ -361,6 +361,9 @@ func monitorServerLiveness(args *tsshdArgs) {
 			continue
 		}
 
+		// Expire the proxy-side client path if no stream heartbeat has been received.
+		server.expireInactiveClientPath()
+
 		// Skip liveness check if aliveTimeout is zero.
 		// NOTE: In attachable mode, a new server may set a different aliveTimeout.
 		if server.aliveTimeout == 0 {
