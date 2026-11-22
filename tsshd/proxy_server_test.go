@@ -48,7 +48,12 @@ type udpFrontendTest struct {
 	port      int
 	cipher    cipher.Block
 	clientID  uint64
-	delivered chan []byte // packets the frontend passes to QUIC
+	delivered chan deliveredPacket // packets the frontend passes to QUIC
+}
+
+type deliveredPacket struct {
+	clientID uint64
+	data     []byte
 }
 
 func startUdpFrontendTest(t *testing.T, attachable bool) *udpFrontendTest {
@@ -66,7 +71,7 @@ func startUdpFrontendTest(t *testing.T, attachable bool) *udpFrontendTest {
 	require.NoError(t, err)
 
 	ft := &udpFrontendTest{t: t, proxy: proxy, info: info, port: port, cipher: block,
-		clientID: info.ClientID, delivered: make(chan []byte, 16)}
+		clientID: info.ClientID, delivered: make(chan deliveredPacket, 16)}
 	if attachable {
 		ft.clientID = 0x1234
 	}
@@ -74,14 +79,25 @@ func startUdpFrontendTest(t *testing.T, attachable bool) *udpFrontendTest {
 	go func() {
 		buf := make([]byte, 0xffff)
 		for {
-			n, _, err := proxy.ReadFrom(buf)
+			n, addr, err := proxy.ReadFrom(buf)
 			if err != nil {
 				return
 			}
-			ft.delivered <- append([]byte(nil), buf[:n]...)
+			ft.delivered <- deliveredPacket{addr.(*proxyClientAddr).clientID, append([]byte(nil), buf[:n]...)}
 		}
 	}()
 	return ft
+}
+
+// withClientID returns a view of ft that acts as another client.
+func (ft *udpFrontendTest) withClientID(clientID uint64) *udpFrontendTest {
+	other := *ft
+	other.clientID = clientID
+	return &other
+}
+
+func (ft *udpFrontendTest) serverAddr(ip string) netip.AddrPort {
+	return netip.AddrPortFrom(netip.MustParseAddr(ip), uint16(ft.port))
 }
 
 // newClient opens a client socket bound to ip.
@@ -93,7 +109,7 @@ func (ft *udpFrontendTest) newClient(ip string) *net.UDPConn {
 }
 
 func (ft *udpFrontendTest) send(conn *net.UDPConn, ip string, buf []byte) {
-	_, err := conn.WriteToUDPAddrPort(buf, netip.AddrPortFrom(netip.MustParseAddr(ip), uint16(ft.port)))
+	_, err := conn.WriteToUDPAddrPort(buf, ft.serverAddr(ip))
 	require.NoError(ft.t, err)
 }
 
@@ -137,7 +153,7 @@ func (ft *udpFrontendTest) requireAuthReply(conn *net.UDPConn, serialNumber uint
 func (ft *udpFrontendTest) requireDelivered(want []byte) {
 	select {
 	case got := <-ft.delivered:
-		require.Equal(ft.t, want, got)
+		require.Equal(ft.t, deliveredPacket{ft.clientID, want}, got)
 	case <-time.After(2 * time.Second):
 		ft.t.Fatalf("packet %q not delivered", want)
 	}
@@ -146,7 +162,7 @@ func (ft *udpFrontendTest) requireDelivered(want []byte) {
 func (ft *udpFrontendTest) requireNotDelivered() {
 	select {
 	case got := <-ft.delivered:
-		ft.t.Fatalf("packet %q delivered", got)
+		ft.t.Fatalf("packet %q delivered", got.data)
 	case <-time.After(200 * time.Millisecond):
 	}
 }
@@ -181,6 +197,33 @@ func forEachAttachable(t *testing.T, f func(t *testing.T, attachable bool)) {
 	for _, attachable := range []bool{false, true} {
 		t.Run(fmt.Sprint("Attachable=", attachable), func(t *testing.T) { f(t, attachable) })
 	}
+}
+
+// twoLocalAddrs returns two local addresses. A socket bound to the first can send to both.
+func twoLocalAddrs(t *testing.T) (string, string) {
+	for _, pair := range [][2]string{{"127.0.0.1", "127.0.0.2"}, {"::1", "fe80::1%lo0"}} {
+		if canListenOnIP(&tsshdArgs{}, netip.MustParseAddr(pair[0])) &&
+			canListenOnIP(&tsshdArgs{}, netip.MustParseAddr(pair[1])) {
+			return pair[0], pair[1]
+		}
+	}
+	t.Skip("no second local address")
+	return "", ""
+}
+
+// forEachSocketKind runs f with a wildcard socket and with one socket per address.
+func forEachSocketKind(t *testing.T, first, second string, f func(t *testing.T)) {
+	ips := []netip.Addr{netip.MustParseAddr(first), netip.MustParseAddr(second)}
+	t.Run("Wildcard", func(t *testing.T) {
+		if !canSelectReplySource(ipNetwork("udp", ips[0])) {
+			t.Skip("cannot select reply source addresses here")
+		}
+		f(t)
+	})
+	t.Run("PerAddress", func(t *testing.T) {
+		replaceListenProbes(t, func(string) bool { return false }, ips, canListenOnIP)
+		f(t)
+	})
 }
 
 func TestUdpFrontendIgnoresUnknownSenders(t *testing.T) {
@@ -231,27 +274,76 @@ func TestUdpFrontendIgnoresReplayedAuth(t *testing.T) {
 	})
 }
 
-// Data sent to another local address does not change the reply source.
+// A packet sent to another local address needs its own authentication.
 func TestUdpFrontendReplySourceChangesOnlyOnAuth(t *testing.T) {
-	if !canSelectReplySource("udp4") {
-		t.Skip("cannot select reply source addresses here")
-	}
-	skipUnlessBindable(t, "127.0.0.2")
+	first, second := twoLocalAddrs(t)
+	forEachSocketKind(t, first, second, func(t *testing.T) {
+		forEachAttachable(t, func(t *testing.T, attachable bool) {
+			ft := startUdpFrontendTest(t, attachable)
+			client := ft.newClient(first)
+			oldAddr, newAddr := ft.serverAddr(second), ft.serverAddr(first)
 
-	forEachAttachable(t, func(t *testing.T, attachable bool) {
-		ft := startUdpFrontendTest(t, attachable)
-		client := ft.newClient("127.0.0.1")
-		contacted := netip.MustParseAddrPort(fmt.Sprintf("127.0.0.2:%d", ft.port))
+			// The second address is not the one the system would reply from.
+			require.Equal(t, oldAddr, ft.connect(client, second, 1))
+			ft.requireServerSends(client, oldAddr)
 
-		// 127.0.0.2 is not the address the system would reply from.
-		require.Equal(t, contacted, ft.connect(client, "127.0.0.2", 1))
-		ft.requireServerSends(client, contacted)
+			ft.send(client, first, ft.dataPacket("to another address"))
+			ft.send(client, first, ft.authPacket(1))
+			ft.requireNoReply(client)
+			ft.requireNotDelivered()
+			ft.requireServerSends(client, oldAddr)
 
-		data := ft.dataPacket("to another address")
-		ft.send(client, "127.0.0.1", data)
-		ft.requireDelivered(data)
-		require.Equal(t, contacted.Addr(), ft.client().clientAddr.Load().local)
-		ft.requireServerSends(client, contacted)
+			// The old path stays until the new one is activated.
+			ft.send(client, first, ft.authPacket(2))
+			require.Equal(t, newAddr, ft.requireAuthReply(client, 2))
+			data := ft.dataPacket("on the old path")
+			ft.send(client, second, data)
+			ft.requireDelivered(data)
+			ft.requireServerSends(client, oldAddr)
+
+			data = ft.dataPacket("activate")
+			ft.send(client, first, data)
+			ft.requireDelivered(data)
+			ft.requireServerSends(client, newAddr)
+
+			ft.send(client, second, ft.dataPacket("on the old path"))
+			ft.requireNotDelivered()
+			ft.requireServerSends(client, newAddr)
+		})
+	})
+}
+
+// Two clients behind one remote address use different local addresses.
+func TestUdpFrontendClientsShareRemoteAddress(t *testing.T) {
+	first, second := twoLocalAddrs(t)
+	forEachSocketKind(t, first, second, func(t *testing.T) {
+		ft := startUdpFrontendTest(t, true)
+		conn := ft.newClient(first)
+		a, b := ft.withClientID(0xa), ft.withClientID(0xb)
+		addrA, addrB := ft.serverAddr(first), ft.serverAddr(second)
+
+		require.Equal(t, addrA, a.connect(conn, first, 1))
+		require.Equal(t, addrB, b.connect(conn, second, 1))
+
+		for range 2 {
+			data := a.dataPacket("from a")
+			a.send(conn, first, data)
+			a.requireDelivered(data)
+			data = b.dataPacket("from b")
+			b.send(conn, second, data)
+			b.requireDelivered(data)
+		}
+		a.requireServerSends(conn, addrA)
+		b.requireServerSends(conn, addrB)
+
+		// Closing one client keeps the path of the other.
+		a.client().Close()
+		a.send(conn, first, a.dataPacket("from a"))
+		a.requireNotDelivered()
+		data := b.dataPacket("from b")
+		b.send(conn, second, data)
+		b.requireDelivered(data)
+		b.requireServerSends(conn, addrB)
 	})
 }
 

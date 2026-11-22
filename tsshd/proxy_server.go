@@ -65,12 +65,17 @@ type clientHello struct {
 	clientNonce  []byte
 }
 
+// pathKey identifies a client path. local is the server address the client sent to.
+type pathKey struct {
+	remote netip.AddrPort
+	local  netip.Addr
+}
+
 // udpPath is the socket, remote and local address a client authenticated on.
 type udpPath struct {
 	socket udpSocket
-	remote netip.AddrPort
-	local  netip.Addr
-	oob    []byte // set when the path is accepted
+	pathKey
+	oob []byte // set when the path is accepted
 }
 
 func (p *udpPath) send(buf []byte) error {
@@ -230,9 +235,9 @@ type udpFrontendConn struct {
 	closed      chan struct{} // closed after all readLoops return
 	cacheClient atomic.Pointer[clientState]
 	clientMutex sync.Mutex
-	clientMap   map[netip.AddrPort]*clientState
+	clientMap   map[pathKey]*clientState
 	authedMutex sync.Mutex
-	authedMap   map[netip.AddrPort]*clientState
+	authedMap   map[pathKey]*clientState
 }
 
 func (c *udpFrontendConn) start(proxy *serverProxy) {
@@ -266,7 +271,7 @@ func (c *udpFrontendConn) readLoop(socket udpSocket) {
 			continue
 		}
 
-		c.packetCh <- udpPacket{buf[:n], udpPath{socket: socket, remote: remote, local: local}, done}
+		c.packetCh <- udpPacket{buf[:n], udpPath{socket: socket, pathKey: pathKey{remote, local}}, done}
 		<-done
 	}
 }
@@ -283,9 +288,9 @@ func (c *udpFrontendConn) addClientMap(client *clientState) {
 
 	c.clientMutex.Lock()
 	if c.clientMap == nil {
-		c.clientMap = make(map[netip.AddrPort]*clientState)
+		c.clientMap = make(map[pathKey]*clientState)
 	}
-	c.clientMap[addr.remote] = client
+	c.clientMap[addr.pathKey] = client
 	c.clientMutex.Unlock()
 }
 
@@ -299,7 +304,7 @@ func (c *udpFrontendConn) delClientMap(addr *udpPath) {
 	}
 
 	c.clientMutex.Lock()
-	delete(c.clientMap, addr.remote)
+	delete(c.clientMap, addr.pathKey)
 	c.clientMutex.Unlock()
 }
 
@@ -315,9 +320,9 @@ func (c *udpFrontendConn) addAuthedMap(authed *clientState) {
 
 	c.authedMutex.Lock()
 	if c.authedMap == nil {
-		c.authedMap = make(map[netip.AddrPort]*clientState)
+		c.authedMap = make(map[pathKey]*clientState)
 	}
-	c.authedMap[addr.remote] = authed
+	c.authedMap[addr.pathKey] = authed
 	c.authedMutex.Unlock()
 }
 
@@ -331,16 +336,15 @@ func (c *udpFrontendConn) delAuthedMap(addr *udpPath) {
 	}
 
 	c.authedMutex.Lock()
-	delete(c.authedMap, addr.remote)
+	delete(c.authedMap, addr.pathKey)
 	c.authedMutex.Unlock()
 }
 
-// isSameAddr compares only the remote address. A client may use any local address.
-func isSameAddr(path *udpPath, addr netip.AddrPort) bool {
-	return path != nil && path.remote == addr
+func isSameAddr(path *udpPath, addr pathKey) bool {
+	return path != nil && path.pathKey == addr
 }
 
-func (c *udpFrontendConn) getClient(addr netip.AddrPort) (*clientState, bool, bool) {
+func (c *udpFrontendConn) getClient(addr pathKey) (*clientState, bool, bool) {
 	if !c.proxy.args.Attachable {
 		client := c.proxy.soleClient
 		if isSameAddr(client.clientAddr.Load(), addr) {
@@ -392,12 +396,12 @@ func (c *udpFrontendConn) readFrom(buf []byte) (int, *clientState) {
 		}
 		n := copy(buf, packet.buf)
 		packet.done <- struct{}{}
-		addr := packet.path.remote
+		addr := packet.path.pathKey
 
 		client, isClientAddr, isAuthedAddr := c.getClient(addr)
 
 		// Case 1: packet from current effective client.
-		// Fast path — directly forward. Only authentication changes the path.
+		// Fast path — directly forward.
 		if isClientAddr {
 			if n <= kSafeToDropPacketLen {
 				continue
@@ -492,7 +496,7 @@ func (c *udpFrontendConn) readFrom(buf []byte) (int, *clientState) {
 		path := packet.path
 		path.oob = path.socket.replyOOB(path.local)
 		if client.serialNumber.CompareAndSwap(oldSerialNumber, newSerialNumber) {
-			debug("client [%x] [%d] authed from %s", clientID, newSerialNumber, addr)
+			debug("client [%x] [%d] authed from %s", clientID, newSerialNumber, addr.remote)
 			// Store as authenticated but not yet activated address.
 			client.setAuthedAddr(nil, &path)
 		} else {

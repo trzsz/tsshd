@@ -30,7 +30,7 @@ import (
 )
 
 // udpSocket is a listening socket of the UDP frontend. local is the address a
-// packet was sent to. Zero means the OS chooses.
+// packet was sent to, if the socket knows it.
 type udpSocket interface {
 	// readFrom must not be called concurrently.
 	readFrom(buf []byte) (n int, remote netip.AddrPort, local netip.Addr, err error)
@@ -43,14 +43,15 @@ type udpSocket interface {
 	Close() error
 }
 
-// plainSocket is bound to one address. local is always zero.
+// plainSocket reports the address it is bound to as local. It may be a wildcard.
 type plainSocket struct {
-	conn *net.UDPConn
+	conn  *net.UDPConn
+	local netip.Addr
 }
 
 func (s *plainSocket) readFrom(buf []byte) (int, netip.AddrPort, netip.Addr, error) {
 	n, remote, err := s.conn.ReadFromUDPAddrPort(buf)
-	return n, remote, netip.Addr{}, err
+	return n, remote, s.local, err
 }
 
 func (s *plainSocket) replyOOB(netip.Addr) []byte {
@@ -93,7 +94,7 @@ func listenUdpSocket(addr netip.Addr, port int, replySource bool) (udpSocket, er
 	_ = conn.SetWriteBuffer(kProxyBufferSize)
 
 	if !replySource {
-		return &plainSocket{conn}, nil
+		return &plainSocket{conn, addr}, nil
 	}
 	sock, err := newPktInfoSocket(conn)
 	if err != nil {

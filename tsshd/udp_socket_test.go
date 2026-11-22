@@ -87,7 +87,7 @@ func TestPlainSocket(t *testing.T) {
 	defer func() { _ = sock.Close() }()
 
 	client := dialTestSocket(t, sock.(*plainSocket).conn, "127.0.0.1")
-	requireRoundTrip(t, sock, client, netip.Addr{})
+	requireRoundTrip(t, sock, client, netip.MustParseAddr("127.0.0.1"))
 }
 
 // readLoop stops on this error.
