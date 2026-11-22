@@ -26,6 +26,7 @@ package tsshd
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"crypto/aes"
 	"crypto/cipher"
@@ -180,6 +181,12 @@ type clientProxy struct {
 	udpTraffic    *trafficStats
 	proxyCmds     []string
 	cumTraffic    cumulativeTraffic
+	// clientNonce is fresh for each client, so that the server never mistakes
+	// this client for an earlier one started with the same server info.
+	clientNonce []byte
+	// kcpAliveCheck means that KCP refreshes serverChecker itself, once a
+	// packet from the server has been authenticated and is not a replay.
+	kcpAliveCheck bool
 }
 
 // cumulativeTraffic counts UDP wire datagrams for the lifetime of the
@@ -482,9 +489,16 @@ func (p *clientProxy) renewUdpPath(ctx context.Context, proxyClient *SshUdpClien
 }
 
 func (p *clientProxy) sendAuthPacket(ctx context.Context, conn PacketConn) error {
-	data := make([]byte, 16)
+	data := make([]byte, 16, 20+kClientNonceSize)
 	binary.BigEndian.PutUint64(data[0:8], p.clientID)
 	binary.BigEndian.PutUint64(data[8:16], p.serialNumber)
+	if p.client.protoVersion >= 3 {
+		// Announce the protocol version and the client nonce, so that the
+		// server knows how the following KCP packets are protected before the
+		// first one arrives.
+		data = binary.BigEndian.AppendUint32(data, uint32(p.client.protoVersion))
+		data = append(data, p.clientNonce...)
+	}
 	buf := aesEncrypt(p.cipherBlock, data)
 	if buf == nil {
 		return errors.New("aes encrypt failed")
@@ -494,7 +508,13 @@ func (p *clientProxy) sendAuthPacket(ctx context.Context, conn PacketConn) error
 
 func (p *clientProxy) isAuthSuccessful(buf []byte) bool {
 	data := aesDecrypt(p.cipherBlock, buf)
-	if len(data) != 16 {
+	if p.client.protoVersion >= 3 {
+		// The server echoes the client nonce, so that an acknowledgment
+		// sent to an earlier client with the same server info is not accepted.
+		if len(data) != 16+kClientNonceSize || !bytes.Equal(data[16:], p.clientNonce) {
+			return false
+		}
+	} else if len(data) != 16 {
 		return false
 	}
 	serverID := binary.BigEndian.Uint64(data[0:8])
@@ -524,7 +544,9 @@ func (p *clientProxy) ReadFrom(buf []byte) (int, net.Addr, error) {
 				continue
 			}
 
-			p.serverChecker.updateNow()
+			if !p.kcpAliveCheck {
+				p.serverChecker.updateNow()
+			}
 
 			p.cumTraffic.recvPackets.Add(1)
 			p.cumTraffic.recvBytes.Add(uint64(n))
@@ -670,6 +692,11 @@ func startClientProxy(client *SshUdpClient, opts *UdpClientOptions) (*clientProx
 		clientID = binary.BigEndian.Uint64(buf)
 	}
 
+	clientNonce := make([]byte, kClientNonceSize)
+	if _, err := crypto_rand.Read(clientNonce); err != nil {
+		return nil, fmt.Errorf("rand client nonce failed: %v", err)
+	}
+
 	var proxyCmds []string
 	if opts.ProxyCommand != "" {
 		proxyCmds, err = splitCommandLine(opts.ProxyCommand)
@@ -691,6 +718,9 @@ func startClientProxy(client *SshUdpClient, opts *UdpClientOptions) (*clientProx
 		serverChecker: newTimeoutChecker(opts.HeartbeatTimeout),
 		proxyCmds:     proxyCmds,
 		udpTraffic:    &trafficStats{},
+		clientNonce:   clientNonce,
+		// Before protocol version 3, KCP cannot tell a replayed packet apart.
+		kcpAliveCheck: opts.ServerInfo.Mode == kUdpModeKCP && client.protoVersion >= 3,
 	}
 	proxy.backendCond = sync.NewCond(&proxy.backendMutex)
 

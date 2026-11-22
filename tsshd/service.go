@@ -428,10 +428,7 @@ func newKcpServerCrypto(info *ServerInfo, delegToProxy bool) (*rotatingCrypto, e
 		return nil, fmt.Errorf("rand salt failed: %v", err)
 	}
 
-	crypto, err := newRotatingCrypto(nil, pass, salt, 0, 0, delegToProxy)
-	if err != nil {
-		return nil, fmt.Errorf("new rotating crypto failed: %w", err)
-	}
+	crypto := newServerCrypto(pass, salt, delegToProxy)
 
 	info.Mode = kUdpModeKCP
 	info.Pass = fmt.Sprintf("%x", pass)

@@ -33,6 +33,7 @@ import (
 	"net"
 	"os"
 	"strconv"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -113,7 +114,7 @@ func runStreamEchoTest(t *testing.T, stream Stream) {
 	}
 }
 
-func runProxyEchoTest(t *testing.T, args *tsshdArgs) {
+func runProxyEchoTest(t *testing.T, args *tsshdArgs, protoVersion int) {
 	oriNew := newSshUdpServer
 	defer func() {
 		newSshUdpServer = oriNew
@@ -149,9 +150,15 @@ func runProxyEchoTest(t *testing.T, args *tsshdArgs) {
 
 	var wg sync.WaitGroup
 
-	for range clientCount {
+	for i := range clientCount {
+		// Clients speaking different protocol versions can attach to the same server.
+		clientProtoVersion := protoVersion
+		if i%2 == 1 {
+			clientProtoVersion = kTsshdProtocol
+		}
+
 		wg.Go(func() {
-			client := &SshUdpClient{activeChecker: newTimeoutChecker(0)}
+			client := &SshUdpClient{protoVersion: clientProtoVersion, activeChecker: newTimeoutChecker(0)}
 			proxy, err := startClientProxy(client, opts)
 			if err != nil {
 				t.Fatalf("start client proxy failed: %v", err)
@@ -231,7 +238,7 @@ func TestProxy(t *testing.T) {
 					t.Fatalf("SSH_CONNECTION should be unset, got %q", v)
 				}
 
-				runProxyEchoTest(t, args)
+				runProxyEchoTest(t, args, kTsshdProtocol)
 			})
 
 			t.Run("ListenOne", func(t *testing.T) {
@@ -241,8 +248,280 @@ func TestProxy(t *testing.T) {
 					t.Fatalf("SSH_CONNECTION mismatch: want %q, got %q", mockSshConn, v)
 				}
 
-				runProxyEchoTest(t, args)
+				runProxyEchoTest(t, args, kTsshdProtocol)
+			})
+
+			// Clients older than protocol version 3 neither announce their
+			// version nor use directional KCP keys, and must keep working.
+			t.Run("LegacyClient", func(t *testing.T) {
+				_ = os.Unsetenv("SSH_CONNECTION")
+				runProxyEchoTest(t, args, 2)
 			})
 		})
 	}
+}
+
+type idleFrontend struct {
+	frontendConnection
+}
+
+func (c *idleFrontend) start(proxy *serverProxy) {}
+
+func TestProxy_ClientHello(t *testing.T) {
+	info := &ServerInfo{}
+	server, err := startServerProxy(&tsshdArgs{KCP: true}, info, &idleFrontend{})
+	require.NoError(t, err)
+
+	newClient := func(protoVersion int) *clientProxy {
+		opts := &UdpClientOptions{ServerInfo: info, HeartbeatTimeout: time.Second}
+		proxy, err := startClientProxy(&SshUdpClient{protoVersion: protoVersion}, opts)
+		require.NoError(t, err)
+		t.Cleanup(func() { _ = proxy.Close() })
+		proxy.serialNumber = 1
+		return proxy
+	}
+
+	// authenticate delivers the authentication packet of the client to the server.
+	authenticate := func(proxy *clientProxy) *clientHello {
+		clientConn, serverConn := net.Pipe()
+		defer func() { _ = clientConn.Close() }()
+		defer func() { _ = serverConn.Close() }()
+
+		go func() { _ = proxy.sendAuthPacket(context.Background(), &tcpServerConn{clientConn}) }()
+
+		buf := make([]byte, 128)
+		n, err := recvUdpPacket(serverConn, buf)
+		require.NoError(t, err)
+
+		isAuthPacket, clientID, serialNumber, hello := server.openAuthPacket(buf[:n])
+		require.True(t, isAuthPacket)
+		require.Equal(t, info.ClientID, clientID)
+		require.Equal(t, uint64(1), serialNumber)
+		return hello
+	}
+
+	acknowledge := func(hello *clientHello) []byte {
+		buf, err := server.sealAuthPacket(1, hello)
+		require.NoError(t, err)
+		return buf
+	}
+
+	// Clients older than protocol version 3 do not announce anything.
+	legacyClient := newClient(2)
+	legacyHello := authenticate(legacyClient)
+	require.Equal(t, &clientHello{}, legacyHello)
+	require.True(t, legacyClient.isAuthSuccessful(acknowledge(legacyHello)))
+
+	// A newer client never negotiates more than the server supports.
+	require.Equal(t, kTsshdProtocol, authenticate(newClient(kTsshdProtocol+1)).protoVersion)
+
+	client := newClient(kTsshdProtocol)
+	hello := authenticate(client)
+	require.Equal(t, &clientHello{kTsshdProtocol, client.clientNonce}, hello)
+	require.Len(t, client.clientNonce, kClientNonceSize)
+
+	// The first authentication decides, and may be repeated when reconnecting.
+	require.True(t, server.acceptClientHello(server.soleClient, hello))
+	require.True(t, server.acceptClientHello(server.soleClient, authenticate(client)))
+	require.True(t, client.isAuthSuccessful(acknowledge(hello)))
+
+	// Another client started with the same server info has the same client ID
+	// and starts with the same serial number, but must not take over.
+	otherClient := newClient(kTsshdProtocol)
+	otherHello := authenticate(otherClient)
+	require.NotEqual(t, client.clientNonce, otherClient.clientNonce)
+	require.False(t, server.acceptClientHello(server.soleClient, otherHello))
+	require.False(t, server.acceptClientHello(server.soleClient, legacyHello))
+
+	// An acknowledgment sent to the first client must not convince the other
+	// one that it has been authenticated.
+	require.False(t, otherClient.isAuthSuccessful(acknowledge(hello)))
+	require.False(t, otherClient.isAuthSuccessful(acknowledge(legacyHello)))
+	require.False(t, legacyClient.isAuthSuccessful(acknowledge(hello)))
+
+	// The KCP traffic keys belong to the client that authenticated first.
+	newCrypto := func(proxy *clientProxy) *rotatingCrypto {
+		crypto, err := newClientCrypto(nil, kTsshdProtocol, proxy.clientID, proxy.clientNonce,
+			server.kcpCrypto.keyPass, server.kcpCrypto.keySalt)
+		require.NoError(t, err)
+		return crypto
+	}
+	_, err = openTestPacket(server.kcpCrypto, sealTestPacket(t, newCrypto(otherClient), []byte("hello")))
+	require.Error(t, err)
+	_, err = openTestPacket(server.kcpCrypto, sealTestPacket(t, newCrypto(client), []byte("hello")))
+	require.NoError(t, err)
+
+	// Authentication packets of any other length are rejected.
+	for _, size := range []int{0, 15, 17, 20, 35, 37, 52} {
+		isAuthPacket, _, _, _ := server.openAuthPacket(aesEncrypt(server.cipherBlock, make([]byte, size)))
+		require.False(t, isAuthPacket, "auth packet of %d bytes accepted", size)
+	}
+}
+
+// Since protocol version 3, datagrams that KCP does not accept, such as
+// replayed packets, must not make the server look alive.
+func TestProxy_KcpAliveCheck(t *testing.T) {
+	const kHeartbeatTimeout = 100 * time.Millisecond
+
+	info := &ServerInfo{ProtoVer: kTsshdProtocol, ProxyKey: strings.Repeat("00", 32)}
+	serverCrypto, err := newKcpServerCrypto(info, false)
+	require.NoError(t, err)
+
+	client := &SshUdpClient{protoVersion: kTsshdProtocol}
+	opts := &UdpClientOptions{ServerInfo: info, HeartbeatTimeout: kHeartbeatTimeout}
+	proxy, err := startClientProxy(client, opts)
+	require.NoError(t, err)
+	defer func() { _ = proxy.Close() }()
+	client.clientProxy = proxy
+	require.NoError(t, serverCrypto.setClientHello(kTsshdProtocol, proxy.clientID, proxy.clientNonce))
+
+	clientConn, serverConn := net.Pipe()
+	defer func() { _ = serverConn.Close() }()
+	proxy.backendConn.Store(&serverConnHolder{&tcpServerConn{clientConn}})
+
+	kcpClient, err := newKcpClient(opts, client, proxy, proxy.remoteAddr)
+	require.NoError(t, err)
+	defer func() { _ = kcpClient.Close() }()
+
+	isAlive := func() bool { return !proxy.serverChecker.isTimeout() }
+	send := func(packet []byte) {
+		t.Helper()
+		require.NoError(t, serverConn.SetWriteDeadline(time.Now().Add(time.Second)))
+		require.NoError(t, sendUdpPacket(serverConn, packet))
+	}
+
+	require.Eventually(t, func() bool { return !isAlive() }, time.Second, 10*time.Millisecond)
+
+	packet := sealTestPacket(t, serverCrypto, make([]byte, 64))
+	send(packet)
+	require.Eventually(t, isAlive, time.Second, 5*time.Millisecond)
+
+	require.Eventually(t, func() bool { return !isAlive() }, time.Second, 10*time.Millisecond)
+
+	// Neither replayed packets nor garbage refresh the checker.
+	for range 5 {
+		send(packet)
+		send(make([]byte, 64))
+	}
+	require.Never(t, isAlive, 2*kHeartbeatTimeout, 5*time.Millisecond)
+
+	send(sealTestPacket(t, serverCrypto, make([]byte, 64)))
+	require.Eventually(t, isAlive, time.Second, 5*time.Millisecond)
+}
+
+// Clients attached to the same server share the initial secret. Their traffic
+// keys are bound to the authenticated client ID, so that they stay apart even
+// if two clients announce the same nonce.
+func TestProxy_AttachedClientsWithSameNonce(t *testing.T) {
+	info := &ServerInfo{}
+	server, err := startServerProxy(&tsshdArgs{KCP: true, Attachable: true}, info, &idleFrontend{})
+	require.NoError(t, err)
+
+	clientNonce := bytes.Repeat([]byte{7}, kClientNonceSize)
+	pass, salt := server.kcpCrypto.keyPass, server.kcpCrypto.keySalt
+
+	var clientCryptos, serverCryptos []*rotatingCrypto
+	for clientID := uint64(1); clientID <= 2; clientID++ {
+		client := server.getClient(clientID)
+		require.NotNil(t, client)
+		require.True(t, server.acceptClientHello(client, &clientHello{kTsshdProtocol, clientNonce}))
+		serverCryptos = append(serverCryptos, client.kcpCrypto.Load())
+
+		crypto, err := newClientCrypto(nil, kTsshdProtocol, clientID, clientNonce, pass, salt)
+		require.NoError(t, err)
+		clientCryptos = append(clientCryptos, crypto)
+	}
+
+	for i := range 2 {
+		fromClient := sealTestPacket(t, clientCryptos[i], []byte("hello"))
+		_, err := openTestPacket(serverCryptos[1-i], fromClient)
+		require.Error(t, err, "packet accepted on the connection of another client")
+		_, err = openTestPacket(serverCryptos[i], fromClient)
+		require.NoError(t, err)
+
+		fromServer := sealTestPacket(t, serverCryptos[i], []byte("hello"))
+		_, err = openTestPacket(clientCryptos[1-i], fromServer)
+		require.Error(t, err, "packet sent to another client accepted")
+		_, err = openTestPacket(clientCryptos[i], fromServer)
+		require.NoError(t, err)
+	}
+}
+
+// queueFrontend hands the queued datagrams of the sole client to the server proxy.
+type queueFrontend struct {
+	proxy   *serverProxy
+	packets chan []byte
+}
+
+func (c *queueFrontend) start(proxy *serverProxy) { c.proxy = proxy }
+
+func (c *queueFrontend) readFrom(buf []byte) (int, *clientState) {
+	packet, ok := <-c.packets
+	if !ok {
+		return 0, nil
+	}
+	return copy(buf, packet), c.proxy.soleClient
+}
+
+func (c *queueFrontend) writeTo(buf []byte, client *clientState) error { return nil }
+
+// Datagrams that the KCP listener does not accept must not make the client
+// look alive, in particular the replayed packets since protocol version 3.
+func TestProxy_KcpClientAliveCheck(t *testing.T) {
+	const kHeartbeatTimeout = 100 * time.Millisecond
+
+	info := &ServerInfo{}
+	frontend := &queueFrontend{packets: make(chan []byte)}
+	proxy, err := startServerProxy(&tsshdArgs{KCP: true}, info, frontend)
+	require.NoError(t, err)
+
+	clientNonce := bytes.Repeat([]byte{7}, kClientNonceSize)
+	require.True(t, proxy.acceptClientHello(proxy.soleClient, &clientHello{kTsshdProtocol, clientNonce}))
+	clientCrypto, err := newClientCrypto(nil, kTsshdProtocol, info.ClientID, clientNonce,
+		proxy.kcpCrypto.keyPass, proxy.kcpCrypto.keySalt)
+	require.NoError(t, err)
+
+	clientChecker := newTimeoutChecker(kHeartbeatTimeout)
+	defer clientChecker.Close()
+	proxy.soleClient.server.Store(&sshUdpServer{clientChecker: clientChecker})
+
+	listener, err := listenKCP(proxy, proxy.kcpCrypto)
+	require.NoError(t, err)
+	defer func() { _ = listener.Close() }()
+	defer close(frontend.packets)
+
+	isAlive := func() bool { return !clientChecker.isTimeout() }
+	send := func(packet []byte) {
+		t.Helper()
+		select {
+		case frontend.packets <- packet:
+		case <-time.After(time.Second):
+			t.Fatal("server proxy did not read the packet")
+		}
+	}
+
+	require.Eventually(t, func() bool { return !isAlive() }, time.Second, 10*time.Millisecond)
+
+	// A single byte passes the crypto, which refreshes the checker, but is
+	// too short for the KCP listener to create a session that would outlive
+	// the test.
+	packet := sealTestPacket(t, clientCrypto, make([]byte, 1))
+	send(packet)
+	require.Eventually(t, isAlive, time.Second, 5*time.Millisecond)
+
+	require.Eventually(t, func() bool { return !isAlive() }, time.Second, 10*time.Millisecond)
+
+	// Neither replayed packets nor garbage refresh the checker.
+	for range 5 {
+		send(packet)
+		send(make([]byte, 64))
+	}
+	require.Never(t, isAlive, 2*kHeartbeatTimeout, 5*time.Millisecond)
+
+	send(sealTestPacket(t, clientCrypto, make([]byte, 1)))
+	require.Eventually(t, isAlive, time.Second, 5*time.Millisecond)
+
+	require.NoError(t, listener.SetReadDeadline(time.Now()))
+	_, err = listener.AcceptKCP()
+	require.Error(t, err, "KCP session created by the test packets")
 }

@@ -30,6 +30,7 @@ import (
 	"crypto/ecdh"
 	crypto_rand "crypto/rand"
 	"crypto/sha512"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
@@ -46,12 +47,107 @@ const kRekeyBytesThreshold = 1024 * 1024 * 1024 // 1G
 
 const kcpMemLayoutUnexpected = "Unexpected KCP crypto memory layout detected"
 
+// Since protocol version 3, each direction of a KCP connection is protected
+// by its own key, and both keys are bound to the client ID and to the nonce
+// announced by the client.
+const kKcpDirectionalKeysProtoVer = 3
+
+// AES-GCM with the standard nonce and tag sizes.
+const (
+	kPacketNonceSize = 12
+	kPacketTagSize   = 16
+)
+
+const (
+	kKcpClientToServerLabel = "tsshd kcp client to server"
+	kKcpServerToClientLabel = "tsshd kcp server to client"
+)
+
+// The packet number occupies the last 8 bytes of the nonce.
+const kPacketNumberSize = 8
+
+const (
+	kReplayWindowBlocks = 64
+	// One block is always being reused, so it cannot be relied upon.
+	kReplayWindowSize = (kReplayWindowBlocks - 1) * 64
+)
+
+var errPacketReplayed = errors.New("packet replayed or too old")
+
+// replayWindow records the packet numbers already received under one key,
+// using the sliding bitmap from RFC 6479. Packet numbers start at 1.
+type replayWindow struct {
+	mutex   sync.Mutex
+	highest uint64
+	bitmap  [kReplayWindowBlocks]uint64
+}
+
+func (w *replayWindow) isNew(number uint64) bool {
+	if number > w.highest {
+		return true
+	}
+	if number == 0 || w.highest-number >= kReplayWindowSize {
+		return false
+	}
+	return w.bitmap[number/64%kReplayWindowBlocks]&(1<<(number%64)) == 0
+}
+
+// check reports whether the packet number may still be accepted.
+// It must be called before the packet is authenticated.
+func (w *replayWindow) check(number uint64) bool {
+	w.mutex.Lock()
+	defer w.mutex.Unlock()
+	return w.isNew(number)
+}
+
+// update records the packet number and reports whether it was accepted.
+// It must only be called after the packet has been authenticated.
+func (w *replayWindow) update(number uint64) bool {
+	w.mutex.Lock()
+	defer w.mutex.Unlock()
+
+	if !w.isNew(number) {
+		return false
+	}
+
+	if number > w.highest {
+		// Clear the blocks that the window advances into.
+		block := number / 64
+		for i := min(block-w.highest/64, kReplayWindowBlocks); i > 0; i-- {
+			w.bitmap[(block-i+1)%kReplayWindowBlocks] = 0
+		}
+		w.highest = number
+	}
+
+	w.bitmap[number/64%kReplayWindowBlocks] |= 1 << (number % 64)
+	return true
+}
+
+// trafficKey is one generation of the KCP packet keys.
+//
+// Before protocol version 3, both directions share a single key and every
+// packet carries a random nonce, so recvWindow is nil.
+//
+// Since protocol version 3, each direction has its own key and the nonce
+// carries a packet number, which the receiver accepts at most once.
+type trafficKey struct {
+	sealer     cipher.AEAD
+	opener     cipher.AEAD
+	sendNumber atomic.Uint64
+	recvWindow *replayWindow
+}
+
 type rotatingCrypto struct {
 	mutex            sync.Mutex
 	client           *SshUdpClient
+	isServer         bool
+	protoVersion     int
+	clientID         uint64
+	clientNonce      []byte
+	onPacketAccepted func()
 	keyPass          []byte
 	keySalt          []byte
-	gcmList          []cipher.AEAD
+	keyList          []*trafficKey
 	activeIdx        int
 	nonceSize        int
 	overhead         int
@@ -90,13 +186,30 @@ func (r *rotatingCrypto) Seal(dst, nonce, plaintext, additionalData []byte) []by
 		return append(dst, plaintext...)
 	}
 
+	var key *trafficKey
 	r.mutex.Lock()
-	gcm := r.gcmList[r.activeIdx]
+	if r.activeIdx < len(r.keyList) {
+		key = r.keyList[r.activeIdx]
+	}
 	r.mutex.Unlock()
+
+	if key == nil {
+		// The server has no key until the client has authenticated, and has
+		// nobody to send to either. Never fall back to sending the plaintext.
+		return append(dst, make([]byte, len(plaintext)+r.overhead)...)
+	}
 
 	r.consumeBytes(uint64(len(plaintext)))
 
-	return gcm.Seal(dst, nonce, plaintext, additionalData)
+	if key.recvWindow != nil && len(nonce) >= kPacketNumberSize {
+		// The nonce is the packet prefix that goes on the wire.
+		// Replace the random value with the packet number.
+		prefixSize := len(nonce) - kPacketNumberSize
+		clear(nonce[:prefixSize])
+		binary.BigEndian.PutUint64(nonce[prefixSize:], key.sendNumber.Add(1))
+	}
+
+	return key.sealer.Seal(dst, nonce, plaintext, additionalData)
 }
 
 func (r *rotatingCrypto) sealPacket(buf []byte, inPlace bool) ([]byte, error) {
@@ -115,7 +228,8 @@ func (r *rotatingCrypto) sealPacket(buf []byte, inPlace bool) ([]byte, error) {
 	out := make([]byte, r.nonceSize+len(plaintext)+r.overhead)
 	dst := out[:r.nonceSize]
 	copy(dst, nonce)
-	return r.Seal(dst, nonce, plaintext, nil), nil
+	// Seal may rewrite the nonce, so it must refer to the output packet.
+	return r.Seal(dst, dst, plaintext, nil), nil
 }
 
 func (r *rotatingCrypto) Open(dst, nonce, ciphertext, additionalData []byte) (plaintext []byte, err error) {
@@ -124,19 +238,37 @@ func (r *rotatingCrypto) Open(dst, nonce, ciphertext, additionalData []byte) (pl
 	}
 
 	r.mutex.Lock()
-	gcmList := r.gcmList[:]
+	keyList := r.keyList[:]
 	r.mutex.Unlock()
 
-	lastIdx := len(gcmList) - 1
-	for i, gcm := range gcmList {
+	lastIdx := len(keyList) - 1
+	for i, key := range keyList {
+		var number uint64
+		if key.recvWindow != nil {
+			if len(nonce) < kPacketNumberSize {
+				return nil, io.ErrShortBuffer
+			}
+			number = binary.BigEndian.Uint64(nonce[len(nonce)-kPacketNumberSize:])
+			if !key.recvWindow.check(number) {
+				err = errPacketReplayed
+				r.debug("gcm [%d/%d] open failed: %v", i+1, len(keyList), err)
+				continue
+			}
+		}
 		buf := dst
 		if i != lastIdx {
 			buf = nil
 		}
-		plaintext, err = gcm.Open(buf, nonce, ciphertext, additionalData)
+		plaintext, err = key.opener.Open(buf, nonce, ciphertext, additionalData)
 		if err != nil {
-			r.debug("gcm [%d/%d] open failed: %v", i+1, len(gcmList), err)
+			r.debug("gcm [%d/%d] open failed: %v", i+1, len(keyList), err)
 			continue
+		}
+		if key.recvWindow != nil && !key.recvWindow.update(number) {
+			return nil, fmt.Errorf("gcm open failed: %w", errPacketReplayed)
+		}
+		if r.onPacketAccepted != nil {
+			r.onPacketAccepted()
 		}
 		if i > 0 {
 			r.promoteKey(i)
@@ -196,38 +328,106 @@ func (r *rotatingCrypto) consumeBytes(n uint64) {
 	}
 }
 
-func (r *rotatingCrypto) installKey(secret []byte, active bool) error {
-	h := hkdf.New(sha512.New384, secret, r.keySalt, nil)
+func (r *rotatingCrypto) newGCM(secret, info []byte) (cipher.AEAD, error) {
+	h := hkdf.New(sha512.New384, secret, r.keySalt, info)
 	key := make([]byte, 32)
 	if _, err := io.ReadFull(h, key); err != nil {
-		return fmt.Errorf("hkdf read key failed: %w", err)
+		return nil, fmt.Errorf("hkdf read key failed: %w", err)
 	}
 	block, err := aes.NewCipher(key)
 	if err != nil {
-		return fmt.Errorf("aes new cipher failed: %w", err)
+		return nil, fmt.Errorf("aes new cipher failed: %w", err)
 	}
 	gcm, err := cipher.NewGCM(block)
 	if err != nil {
-		return fmt.Errorf("cipher new gcm failed: %w", err)
+		return nil, fmt.Errorf("cipher new gcm failed: %w", err)
+	}
+	return gcm, nil
+}
+
+// deriveKey must be called with r.mutex held.
+func (r *rotatingCrypto) deriveKey(secret []byte) (*trafficKey, error) {
+	if r.protoVersion < kKcpDirectionalKeysProtoVer {
+		gcm, err := r.newGCM(secret, nil)
+		if err != nil {
+			return nil, err
+		}
+		return &trafficKey{sealer: gcm, opener: gcm}, nil
 	}
 
+	// Clients attached to the same server share the secret of the initial
+	// key. The client ID keeps their keys apart even if two of them announce
+	// the same nonce, and the nonce keeps the keys of one client ID fresh.
+	binding := append(binary.BigEndian.AppendUint64(nil, r.clientID), r.clientNonce...)
+
+	clientToServer, err := r.newGCM(secret, append([]byte(kKcpClientToServerLabel), binding...))
+	if err != nil {
+		return nil, err
+	}
+	serverToClient, err := r.newGCM(secret, append([]byte(kKcpServerToClientLabel), binding...))
+	if err != nil {
+		return nil, err
+	}
+
+	if r.isServer {
+		return &trafficKey{sealer: serverToClient, opener: clientToServer, recvWindow: &replayWindow{}}, nil
+	}
+	return &trafficKey{sealer: clientToServer, opener: serverToClient, recvWindow: &replayWindow{}}, nil
+}
+
+func (r *rotatingCrypto) installKey(secret []byte, active bool) error {
 	r.mutex.Lock()
 	defer r.mutex.Unlock()
 
-	r.gcmList = append(r.gcmList, gcm)
-
-	if active {
-		r.activeIdx = len(r.gcmList) - 1
+	key, err := r.deriveKey(secret)
+	if err != nil {
+		return err
 	}
 
-	if isRekey := len(r.gcmList) > 1; isRekey {
+	r.keyList = append(r.keyList, key)
+
+	if active {
+		r.activeIdx = len(r.keyList) - 1
+	}
+
+	if isRekey := len(r.keyList) > 1; isRekey {
 		r.lastRekeyTime = time.Now()
 	}
 	r.bytesConsumed, r.bytesTriggered = 0, false
 	r.rekeyInFlight = false
 
 	if !r.delegatedToProxy {
-		r.debug("traffic key installed: key count [%d] active index [%d]", len(r.gcmList), r.activeIdx)
+		r.debug("traffic key installed: key count [%d] active index [%d]", len(r.keyList), r.activeIdx)
+	}
+
+	return nil
+}
+
+// setClientHello installs the initial traffic key of the server, matching
+// the client ID, the protocol version and the client nonce that the client
+// announced in its authentication packet.
+//
+// It always precedes the first KCP packet, since the server proxy drops the
+// packets from unauthenticated addresses. The nonce is fresh for each client,
+// so that a new client never reuses the keys and the packet numbers of a
+// previous one, even if both were started with the same server info.
+func (r *rotatingCrypto) setClientHello(protoVersion int, clientID uint64, clientNonce []byte) error {
+	r.mutex.Lock()
+	defer r.mutex.Unlock()
+
+	if len(r.keyList) > 0 {
+		return errors.New("traffic key has been installed")
+	}
+
+	r.protoVersion, r.clientID, r.clientNonce = protoVersion, clientID, clientNonce
+	key, err := r.deriveKey(r.keyPass)
+	if err != nil {
+		return err
+	}
+	r.keyList, r.activeIdx = []*trafficKey{key}, 0
+
+	if !r.delegatedToProxy {
+		r.debug("traffic key installed for client protocol version [%d]", protoVersion)
 	}
 
 	return nil
@@ -237,17 +437,17 @@ func (r *rotatingCrypto) promoteKey(idx int) {
 	r.mutex.Lock()
 	defer r.mutex.Unlock()
 
-	if idx >= len(r.gcmList) {
+	if idx >= len(r.keyList) {
 		return
 	}
 
-	r.debug("traffic key promoted: key count [%d] promote index [%d]", len(r.gcmList), idx)
+	r.debug("traffic key promoted: key count [%d] promote index [%d]", len(r.keyList), idx)
 
-	newLen := len(r.gcmList) - idx
-	newList := make([]cipher.AEAD, newLen)
-	copy(newList, r.gcmList[idx:])
+	newLen := len(r.keyList) - idx
+	newList := make([]*trafficKey, newLen)
+	copy(newList, r.keyList[idx:])
 
-	r.gcmList = newList
+	r.keyList = newList
 	r.activeIdx = 0
 }
 
@@ -375,21 +575,19 @@ func (r *rotatingCrypto) Close() {
 	}
 }
 
-func newRotatingCrypto(client *SshUdpClient, pass, salt []byte, bytesThreshold uint64, timeThreshold time.Duration,
-	delegToProxy bool) (*rotatingCrypto, error) {
-	r := &rotatingCrypto{client: client, keyPass: pass, keySalt: salt,
-		timeThreshold: timeThreshold, bytesThreshold: bytesThreshold, delegatedToProxy: delegToProxy}
+func newClientCrypto(client *SshUdpClient, protoVersion int, clientID uint64, clientNonce, pass, salt []byte) (*rotatingCrypto, error) {
+	r := &rotatingCrypto{client: client, protoVersion: protoVersion, clientID: clientID, clientNonce: clientNonce,
+		keyPass: pass, keySalt: salt, timeThreshold: kRekeyTimeThreshold, bytesThreshold: kRekeyBytesThreshold,
+		nonceSize: kPacketNonceSize, overhead: kPacketTagSize}
 
 	if err := r.installKey(pass, true); err != nil {
 		return nil, err
 	}
 
-	r.nonceSize, r.overhead = r.gcmList[0].NonceSize(), r.gcmList[0].Overhead()
-
-	if client != nil && timeThreshold > 0 {
+	if client != nil {
 		r.stopCh = make(chan struct{})
 		go func() {
-			ticker := time.NewTicker(timeThreshold)
+			ticker := time.NewTicker(r.timeThreshold)
 			defer ticker.Stop()
 
 			r.debug("time-based rekey triggered (initial)")
@@ -398,7 +596,7 @@ func newRotatingCrypto(client *SshUdpClient, pass, salt []byte, bytesThreshold u
 			for !r.client.IsClosed() {
 				select {
 				case <-ticker.C:
-					r.debug("time-based rekey triggered: threshold [%v]", timeThreshold)
+					r.debug("time-based rekey triggered: threshold [%v]", r.timeThreshold)
 					r.startRekey()
 
 				case <-r.stopCh:
@@ -409,4 +607,11 @@ func newRotatingCrypto(client *SshUdpClient, pass, salt []byte, bytesThreshold u
 	}
 
 	return r, nil
+}
+
+// newServerCrypto returns a crypto without any traffic key. The initial key
+// is installed by setClientHello once the client has authenticated.
+func newServerCrypto(pass, salt []byte, delegToProxy bool) *rotatingCrypto {
+	return &rotatingCrypto{isServer: true, keyPass: pass, keySalt: salt, delegatedToProxy: delegToProxy,
+		nonceSize: kPacketNonceSize, overhead: kPacketTagSize}
 }

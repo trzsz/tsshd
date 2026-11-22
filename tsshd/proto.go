@@ -547,9 +547,19 @@ func newKcpClient(opts *UdpClientOptions, client *SshUdpClient, udpConn net.Pack
 		return nil, fmt.Errorf("decode salt [%s] failed: %w", opts.ServerInfo.Salt, err)
 	}
 
-	crypto, err := newRotatingCrypto(client, pass, salt, kRekeyBytesThreshold, kRekeyTimeThreshold, false)
+	protoVersion, clientID := min(opts.ServerInfo.ProtoVer, kTsshdProtocol), opts.ServerInfo.ClientID
+	var clientNonce []byte
+	if client != nil {
+		// The same client ID and nonce that the client proxy announces when authenticating.
+		protoVersion, clientID, clientNonce = client.protoVersion, client.clientProxy.clientID, client.clientProxy.clientNonce
+	}
+
+	crypto, err := newClientCrypto(client, protoVersion, clientID, clientNonce, pass, salt)
 	if err != nil {
 		return nil, fmt.Errorf("new rotating crypto failed: %w", err)
+	}
+	if client != nil && client.clientProxy.kcpAliveCheck {
+		crypto.onPacketAccepted = client.clientProxy.serverChecker.updateNow
 	}
 	block := kcp.NewAEADCrypt(crypto)
 
