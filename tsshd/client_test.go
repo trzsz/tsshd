@@ -113,7 +113,7 @@ func TestQuicConstructorHandshakeTimeout(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	peer := &startupPeer{conn, block}
+	peer := &startupPeer{conn, block, nil}
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
@@ -241,7 +241,8 @@ func TestBusStartupBlockedIO(t *testing.T) {
 // packets to QUIC/KCP. It avoids process-wide server factories and cleanup hooks.
 type startupPeer struct {
 	net.PacketConn
-	block cipher.Block
+	block  cipher.Block
+	crypto *rotatingCrypto
 }
 
 func (p *startupPeer) ReadFrom(buf []byte) (int, net.Addr, error) {
@@ -252,7 +253,16 @@ func (p *startupPeer) ReadFrom(buf []byte) (int, net.Addr, error) {
 		}
 
 		data := aesDecrypt(&p.block, buf[:n])
-		if len(data) == 16 {
+		if len(data) == 20+kClientNonceSize {
+			// Since protocol version 3, the client announces its protocol version
+			// and a nonce, which is echoed and bound to the KCP traffic keys.
+			protoVersion, clientNonce := int(binary.BigEndian.Uint32(data[16:20])), data[20:]
+			if p.crypto != nil {
+				_ = p.crypto.setClientHello(protoVersion, binary.BigEndian.Uint64(data[:8]), clientNonce)
+			}
+			data = append(data[:16:16], clientNonce...)
+		}
+		if len(data) == 16 || len(data) == 16+kClientNonceSize {
 			binary.BigEndian.PutUint64(data[:8], 42)
 
 			// Authentication ACK is encrypted.
@@ -282,7 +292,7 @@ func newStartupServer(t *testing.T, mode string, handle func(Stream) error) (*Ud
 	if err != nil {
 		t.Fatal(err)
 	}
-	peer := &startupPeer{conn, block}
+	peer := &startupPeer{conn, block, nil}
 	info := &ServerInfo{ProtoVer: kTsshdProtocol, ProxyKey: strings.Repeat("00", 32), ServerID: 42, ClientID: 23}
 	var accept func() (Stream, func(), error)
 	var closeListener func() error
@@ -306,6 +316,7 @@ func newStartupServer(t *testing.T, mode string, handle func(Stream) error) (*Ud
 		if err != nil {
 			t.Fatalf("newKcpServerCrypto failed: %v", err)
 		}
+		peer.crypto = crypto
 		listener, err := listenKCP(peer, crypto)
 		if err != nil {
 			t.Fatal(err)
