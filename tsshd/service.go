@@ -305,6 +305,10 @@ type listenAddr struct {
 	ip netip.Addr
 	// Set for a wildcard UDP socket that replies from the contacted address.
 	replySource bool
+	// Interface addresses to test on the port before a wildcard TCP listen.
+	// On macOS and BSD the wildcard listen succeeds even when another process
+	// holds one of them on that port, and that process gets its connections.
+	probes []netip.Addr
 }
 
 func getListenAddrs(args *tsshdArgs) ([]listenAddr, error) {
@@ -324,26 +328,34 @@ func getListenAddrs(args *tsshdArgs) ([]listenAddr, error) {
 }
 
 func getFamilyListenAddrs(args *tsshdArgs, wildcard netip.Addr) []listenAddr {
-	// TCP replies always come from the address the client connected to. UDP
-	// replies don't, unless the socket can choose the source address.
-	if !args.TCP {
-		if canSelectReplySource(ipNetwork("udp", wildcard)) {
-			return []listenAddr{{ip: wildcard, replySource: true}}
-		}
+	if !args.TCP && canSelectReplySource(ipNetwork("udp", wildcard)) {
+		return []listenAddr{{ip: wildcard, replySource: true}}
+	}
 
-		var addrs []listenAddr
-		for _, ip := range getInterfaceAddrs() {
-			if ip.Is4() == wildcard.Is4() && canListenOnIP(args, ip) {
-				addrs = append(addrs, listenAddr{ip: ip})
-			}
-		}
-		if len(addrs) > 0 {
-			return addrs
+	var ips []netip.Addr
+	for _, ip := range getInterfaceAddrs() {
+		if ip.Is4() == wildcard.Is4() && canListenOnIP(args, ip) {
+			ips = append(ips, ip)
 		}
 	}
 
+	// TCP replies always come from the address the client connected to. UDP
+	// replies don't, so without a way to choose the source address, UDP
+	// listens on each address.
+	if !args.TCP && len(ips) > 0 {
+		addrs := make([]listenAddr, 0, len(ips))
+		for _, ip := range ips {
+			addrs = append(addrs, listenAddr{ip: ip})
+		}
+		return addrs
+	}
+
 	if canListenOnIP(args, wildcard) {
-		return []listenAddr{{ip: wildcard}}
+		addr := listenAddr{ip: wildcard}
+		if args.TCP {
+			addr.probes = ips
+		}
+		return []listenAddr{addr}
 	}
 	return nil
 }
@@ -427,6 +439,14 @@ func tcpListenOnPort(addrs []listenAddr, port int) (_ frontendConnection, err er
 		}
 	}()
 	for _, addr := range addrs {
+		for _, ip := range addr.probes {
+			var probe *net.TCPListener
+			probe, err = net.ListenTCP(ipNetwork("tcp", ip), net.TCPAddrFromAddrPort(netip.AddrPortFrom(ip, uint16(port))))
+			if err != nil {
+				return nil, err
+			}
+			_ = probe.Close()
+		}
 		var listener *net.TCPListener
 		listener, err = net.ListenTCP(ipNetwork("tcp", addr.ip), net.TCPAddrFromAddrPort(netip.AddrPortFrom(addr.ip, uint16(port))))
 		if err != nil {

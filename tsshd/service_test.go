@@ -29,6 +29,7 @@ import (
 	"net"
 	"net/netip"
 	"runtime"
+	"strconv"
 	"testing"
 	"time"
 
@@ -83,6 +84,7 @@ func TestGetListenAddrs(t *testing.T) {
 	ip6a, ip6b := netip.MustParseAddr("2001:db8::1%eth0"), netip.MustParseAddr("fe80::1%eth0")
 	ifaceAddrs := []netip.Addr{ip4a, ip6a, ip6b, ip4b}
 	any4, any6 := netip.IPv4Unspecified(), netip.IPv6Unspecified()
+	probes4, probes6 := []netip.Addr{ip4a, ip4b}, []netip.Addr{ip6a, ip6b}
 
 	both := func(string) bool { return true }
 	neither := func(string) bool { return false }
@@ -100,33 +102,35 @@ func TestGetListenAddrs(t *testing.T) {
 		want        []listenAddr
 	}{
 		{"WildcardPerFamily", tsshdArgs{}, both, ifaceAddrs, listenAll,
-			[]listenAddr{{any4, true}, {any6, true}}},
+			[]listenAddr{{any4, true, nil}, {any6, true, nil}}},
 		{"InterfaceAddrs", tsshdArgs{}, neither, ifaceAddrs, listenAll,
-			[]listenAddr{{ip4a, false}, {ip4b, false}, {ip6a, false}, {ip6b, false}}},
+			[]listenAddr{{ip4a, false, nil}, {ip4b, false, nil}, {ip6a, false, nil}, {ip6b, false, nil}}},
 		{"NoInterfaceAddr", tsshdArgs{}, neither, nil, listenAll,
-			[]listenAddr{{any4, false}, {any6, false}}},
+			[]listenAddr{{any4, false, nil}, {any6, false, nil}}},
 		{"NoListenableInterfaceAddr", tsshdArgs{}, neither, ifaceAddrs, listenWildcard,
-			[]listenAddr{{any4, false}, {any6, false}}},
+			[]listenAddr{{any4, false, nil}, {any6, false, nil}}},
 		{"IPv4Flag", tsshdArgs{IPv4: true}, both, ifaceAddrs, listenAll,
-			[]listenAddr{{any4, true}}},
+			[]listenAddr{{any4, true, nil}}},
 		{"IPv6Flag", tsshdArgs{IPv6: true}, both, ifaceAddrs, listenAll,
-			[]listenAddr{{any6, true}}},
+			[]listenAddr{{any6, true, nil}}},
 		{"IPv6FlagInterfaceAddrs", tsshdArgs{IPv6: true}, neither, ifaceAddrs, listenAll,
-			[]listenAddr{{ip6a, false}, {ip6b, false}}},
+			[]listenAddr{{ip6a, false, nil}, {ip6b, false, nil}}},
 		{"BothFlags", tsshdArgs{IPv4: true, IPv6: true}, both, ifaceAddrs, listenAll,
-			[]listenAddr{{any4, true}, {any6, true}}},
+			[]listenAddr{{any4, true, nil}, {any6, true, nil}}},
 		{"OnlyIPv6Capable", tsshdArgs{}, ipv6Only, ifaceAddrs, listenAll,
-			[]listenAddr{{ip4a, false}, {ip4b, false}, {any6, true}}},
+			[]listenAddr{{ip4a, false, nil}, {ip4b, false, nil}, {any6, true, nil}}},
 		{"IPv6Unavailable", tsshdArgs{}, neither, ifaceAddrs, listenIPv4,
-			[]listenAddr{{ip4a, false}, {ip4b, false}}},
+			[]listenAddr{{ip4a, false, nil}, {ip4b, false, nil}}},
 		{"TCP", tsshdArgs{TCP: true}, both, ifaceAddrs, listenAll,
-			[]listenAddr{{any4, false}, {any6, false}}},
+			[]listenAddr{{any4, false, probes4}, {any6, false, probes6}}},
 		{"TCPNotCapable", tsshdArgs{TCP: true}, neither, ifaceAddrs, listenAll,
-			[]listenAddr{{any4, false}, {any6, false}}},
+			[]listenAddr{{any4, false, probes4}, {any6, false, probes6}}},
 		{"TCPIPv4Flag", tsshdArgs{TCP: true, IPv4: true}, both, ifaceAddrs, listenAll,
-			[]listenAddr{{any4, false}}},
+			[]listenAddr{{any4, false, probes4}}},
 		{"TCPIPv6Unavailable", tsshdArgs{TCP: true}, both, ifaceAddrs, listenIPv4,
-			[]listenAddr{{any4, false}}},
+			[]listenAddr{{any4, false, probes4}}},
+		{"TCPNoListenableInterfaceAddr", tsshdArgs{TCP: true}, both, ifaceAddrs, listenWildcard,
+			[]listenAddr{{any4, false, nil}, {any6, false, nil}}},
 	}
 
 	for _, tt := range tests {
@@ -239,6 +243,21 @@ func TestServerStartsWithAvailableFamilies(t *testing.T) {
 			require.ErrorContains(t, err, "listen")
 		})
 	}
+}
+
+func TestTcpListenSkipsPortTakenOnOneAddress(t *testing.T) {
+	taken, err := net.Listen("tcp4", "127.0.0.1:0")
+	require.NoError(t, err)
+	defer func() { _ = taken.Close() }()
+	port := taken.Addr().(*net.TCPAddr).Port
+
+	conn, _, err := listenOnFreePort(&tsshdArgs{TCP: true, IPv4: true, Port: strconv.Itoa(port)})
+	if err == nil {
+		for _, listener := range conn.(*tcpFrontendConn).listenerList {
+			_ = listener.Close()
+		}
+	}
+	require.Error(t, err)
 }
 
 func TestInterfaceAddrsZoneOnlyOnLinkLocal(t *testing.T) {
