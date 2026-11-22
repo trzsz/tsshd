@@ -299,11 +299,14 @@ func (p *clientProxy) renewTransportPath(ctx context.Context, proxyClient *SshUd
 	return nil
 }
 
-func (p *clientProxy) dialStream(ctx context.Context, proxyClient *SshUdpClient) (*serverConnHolder, error) {
+func (p *clientProxy) dialStream(ctx context.Context, proxyClient *SshUdpClient, network string) (*serverConnHolder, error) {
 	if proxyClient != nil {
-		tcpConn, err := proxyClient.dialContext(p.serverNet, p.serverAddr, ctx)
+		// dialContext waits for the jump host until the deadline, even if ctx is cancelled.
+		tcpConn, err := doWithContext(ctx, func() (Stream, error) {
+			return proxyClient.dialContext(network, p.serverAddr, ctx)
+		})
 		if err != nil {
-			return nil, fmt.Errorf("proxy dial [%s] [%s] failed: %v", p.serverNet, p.serverAddr, err)
+			return nil, fmt.Errorf("proxy dial [%s] [%s] failed: %v", network, p.serverAddr, err)
 		}
 		return &serverConnHolder{&tcpServerConn{tcpConn}}, nil
 	}
@@ -374,15 +377,15 @@ func (p *clientProxy) dialStream(ctx context.Context, proxyClient *SshUdpClient)
 	}
 
 	dialer := &net.Dialer{}
-	rawConn, err := dialer.DialContext(ctx, p.serverNet, p.serverAddr)
+	rawConn, err := dialer.DialContext(ctx, network, p.serverAddr)
 	if err != nil {
-		return nil, fmt.Errorf("dial [%s] [%s] failed: %v", p.serverNet, p.serverAddr, err)
+		return nil, fmt.Errorf("dial [%s] [%s] failed: %v", network, p.serverAddr, err)
 	}
 
 	tcpConn, ok := rawConn.(*net.TCPConn)
 	if !ok {
 		_ = rawConn.Close()
-		return nil, fmt.Errorf("dial [%s] [%s] returned unexpected connection type: %T", p.serverNet, p.serverAddr, rawConn)
+		return nil, fmt.Errorf("dial [%s] [%s] returned unexpected connection type: %T", network, p.serverAddr, rawConn)
 	}
 
 	setDSCP(tcpConn, kProxyDSCP)
@@ -392,30 +395,35 @@ func (p *clientProxy) dialStream(ctx context.Context, proxyClient *SshUdpClient)
 }
 
 func (p *clientProxy) renewTcpPath(ctx context.Context, proxyClient *SshUdpClient) (*serverConnHolder, error) {
-	conn, err := p.dialStream(ctx, proxyClient)
-	if err != nil {
-		return nil, err
+	networks := p.raceNetworks()
+	if proxyClient == nil && len(p.proxyCmds) > 0 {
+		// The proxy command picks the address family.
+		networks = []string{"tcp"}
 	}
+	return p.racePath(ctx, networks, p.authTcpPath, func(ctx context.Context, network string) (*serverConnHolder, error) {
+		return p.dialStream(ctx, proxyClient, network)
+	})
+}
 
+// authTcpPath closes conn if it fails.
+func (p *clientProxy) authTcpPath(ctx context.Context, conn *serverConnHolder) error {
 	if err := p.sendAuthPacket(ctx, conn); err != nil {
 		_ = conn.Close()
-		return nil, err
+		return fmt.Errorf("send auth packet failed: %v", err)
 	}
 
 	buffer := make([]byte, 256)
 	n, err := doWithContext(ctx, func() (int, error) { return conn.Read(buffer) })
 	if err != nil {
 		_ = conn.Close()
-		return nil, fmt.Errorf("recv auth packet failed: %v", err)
+		return fmt.Errorf("recv auth packet failed: %v", err)
 	}
 
 	if !p.isAuthSuccessful(buffer[:n]) {
 		_ = conn.Close()
-		return nil, errors.New("proxy auth failed")
+		return errors.New("proxy auth failed")
 	}
-	p.client.debug("serial number [%d] auth success", p.serialNumber.Load())
-
-	return conn, nil
+	return nil
 }
 
 func (p *clientProxy) renewUdpPath(ctx context.Context, proxyClient *SshUdpClient) (*serverConnHolder, error) {
@@ -499,14 +507,22 @@ func (p *clientProxy) authUdpPath(ctx context.Context, conn *serverConnHolder) e
 	}
 }
 
-// raceUdpPath tries IPv4 and IPv6 at once unless a family is forced.
-// All attempts use the same serial number, so the server accepts only the first.
 func (p *clientProxy) raceUdpPath(ctx context.Context, dial func(context.Context, string) (*serverConnHolder, error)) (*serverConnHolder, error) {
-	networks := []string{p.serverNet}
-	if p.serverNet == "udp" {
-		networks = []string{"udp4", "udp6"}
-	}
+	return p.racePath(ctx, p.raceNetworks(), p.authUdpPath, dial)
+}
 
+// raceNetworks returns IPv4 and IPv6 unless a family is forced.
+func (p *clientProxy) raceNetworks() []string {
+	if p.serverNet == "udp" || p.serverNet == "tcp" {
+		return []string{p.serverNet + "4", p.serverNet + "6"}
+	}
+	return []string{p.serverNet}
+}
+
+// racePath tries all networks at once and keeps the first path that authenticates.
+// All attempts use the same serial number, so the server accepts only the first.
+func (p *clientProxy) racePath(ctx context.Context, networks []string, auth func(context.Context, *serverConnHolder) error,
+	dial func(context.Context, string) (*serverConnHolder, error)) (*serverConnHolder, error) {
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
@@ -520,7 +536,7 @@ func (p *clientProxy) raceUdpPath(ctx context.Context, dial func(context.Context
 		go func() {
 			conn, err := dial(ctx, network)
 			if err == nil {
-				if err = p.authUdpPath(ctx, conn); err != nil {
+				if err = auth(ctx, conn); err != nil {
 					err = fmt.Errorf("renew path to [%s] [%s] failed: %v", network, p.serverAddr, err)
 				}
 			}
