@@ -426,7 +426,10 @@ func (p *clientProxy) renewUdpPath(ctx context.Context, proxyClient *SshUdpClien
 
 func (p *clientProxy) dialPacket(ctx context.Context, proxyClient *SshUdpClient, network string) (*serverConnHolder, error) {
 	if proxyClient != nil {
-		udpConn, err := proxyClient.dialUDP(network, p.serverAddr, ctx, false)
+		// dialUDP waits for the jump host until the deadline, even if ctx is cancelled.
+		udpConn, err := doWithContext(ctx, func() (PacketConn, error) {
+			return proxyClient.dialUDP(network, p.serverAddr, ctx, false)
+		})
 		if err != nil {
 			return nil, fmt.Errorf("proxy dial [%s] [%s] failed: %v", network, p.serverAddr, err)
 		}

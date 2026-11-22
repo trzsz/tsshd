@@ -28,6 +28,7 @@ import (
 	"context"
 	"crypto/aes"
 	"encoding/json"
+	"io"
 	"net"
 	"strconv"
 	"strings"
@@ -290,4 +291,66 @@ func TestRaceUdpPath_SkipsLargeDatagram(t *testing.T) {
 	})
 	require.NoError(t, err)
 	_ = path.Close()
+}
+
+// jumpHost serves dial streams like tsshd on a jump host.
+type jumpHost struct {
+	protocolClient
+	server *sshUdpServer
+	stall  bool // never answer a dial
+	mutex  sync.Mutex
+	peers  []net.Conn
+}
+
+func (j *jumpHost) newStream(context.Context) (Stream, error) {
+	conn, peer := net.Pipe()
+	j.mutex.Lock()
+	j.peers = append(j.peers, peer)
+	j.mutex.Unlock()
+	go func() {
+		stream := startupPipeStream{peer}
+		defer func() { _ = stream.Close() }()
+		cmd, err := recvCommand(stream)
+		if err != nil || !j.stall && cmd != "dial" {
+			return
+		}
+		if err := sendSuccess(stream); err != nil {
+			return
+		}
+		if j.stall {
+			_, _ = io.Copy(io.Discard, stream)
+			return
+		}
+		j.server.handleDialEvent(stream)
+	}()
+	return startupPipeStream{conn}, nil
+}
+
+func newJumpHost(t *testing.T, stall bool) *SshUdpClient {
+	jump := &jumpHost{server: &sshUdpServer{clientChecker: newTimeoutChecker(0)}, stall: stall}
+	client := &SshUdpClient{protoClient: jump, clientProxy: &clientProxy{serverChecker: newTimeoutChecker(0)}}
+	t.Cleanup(func() {
+		jump.mutex.Lock()
+		for _, peer := range jump.peers {
+			_ = peer.Close()
+		}
+		jump.mutex.Unlock()
+		jump.server.clientChecker.Close()
+		client.clientProxy.serverChecker.Close()
+	})
+	return client
+}
+
+// A dial that the jump host never answers must not hold back the other family.
+func TestRaceUdpPath_JumpHostStalledDial(t *testing.T) {
+	server := listenRandomUDP(t)
+	serveAuth(t, server)
+	stalled := newJumpHost(t, true)
+	addr := net.JoinHostPort("localhost", strconv.Itoa(server.LocalAddr().(*net.UDPAddr).Port))
+	require.Equal(t, "udp4", raceOnce(t, addr, func(p *clientProxy, ctx context.Context, network string) (*serverConnHolder, error) {
+		if network == "udp6" {
+			return p.dialPacket(ctx, stalled, network)
+		}
+		return dialDirect(p, ctx, network)
+	}))
 }
