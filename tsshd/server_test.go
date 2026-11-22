@@ -25,10 +25,113 @@ SOFTWARE.
 package tsshd
 
 import (
+	"fmt"
 	"net"
 	dbg "runtime/debug"
+	"sync/atomic"
 	"testing"
+	"time"
 )
+
+// closeTrackingProto is a protocolServer that only records whether it was closed.
+type closeTrackingProto struct {
+	closed atomic.Bool
+}
+
+func (p *closeTrackingProto) reset() {}
+
+func (p *closeTrackingProto) Close() error {
+	p.closed.Store(true)
+	return nil
+}
+
+func (p *closeTrackingProto) getUdpForwarder() *udpForwarder { return nil }
+
+// newTestServerWithoutBus returns a server in the state newSshUdpServer leaves it in:
+// the connection is established, but the client has not initialized the bus yet.
+func newTestServerWithoutBus() (*sshUdpServer, *closeTrackingProto) {
+	proto := &closeTrackingProto{}
+	server := &sshUdpServer{args: &tsshdArgs{}, client: &clientState{}, proto: proto,
+		streamMap: make(map[uint64]Stream),
+	}
+	return server, proto
+}
+
+// TestServerCloseBeforeBusInit verifies that a server can be closed even if the
+// client never initialized the bus, which is what happens on connect timeout when
+// a client completes the handshake and then stalls. The client checker does not
+// exist yet at that point, and closing must not panic and take down tsshd.
+func TestServerCloseBeforeBusInit(t *testing.T) {
+	defer func() {
+		if r := recover(); r != nil {
+			t.Fatalf("panic: %v\n%s", r, dbg.Stack())
+		}
+	}()
+
+	server, proto := newTestServerWithoutBus()
+
+	server.Close()
+
+	if !proto.closed.Load() {
+		t.Fatal("transport was not closed")
+	}
+	if !server.client.closed.Load() {
+		t.Fatal("client was not closed")
+	}
+	if server.streamMap != nil {
+		t.Fatal("server should no longer accept new streams")
+	}
+
+	server.Close() // closing again should be a no-op
+}
+
+// TestServerHandleStreamBeforeBusInit verifies that the cleanup of a stream opened
+// before the bus does not panic when the server is closed without a client checker.
+func TestServerHandleStreamBeforeBusInit(t *testing.T) {
+	server, _ := newTestServerWithoutBus()
+
+	serverEnd, clientEnd := net.Pipe()
+	defer func() { _ = clientEnd.Close() }()
+
+	// The client opens a stream but never sends a command.
+	done := make(chan any, 1)
+	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				done <- fmt.Sprintf("%v\n%s", r, dbg.Stack())
+				return
+			}
+			done <- nil
+		}()
+		server.handleStream(&pipeStream{Conn: serverEnd})
+	}()
+
+	// Wait for the stream to be registered, so that closing the server closes it.
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		server.streamMutex.Lock()
+		count := len(server.streamMap)
+		server.streamMutex.Unlock()
+		if count == 1 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("stream was not registered")
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+
+	server.Close()
+
+	select {
+	case r := <-done:
+		if r != nil {
+			t.Fatalf("panic: %v", r)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("handle stream did not return after the server was closed")
+	}
+}
 
 func TestServerLazyMap(t *testing.T) {
 	defer func() {

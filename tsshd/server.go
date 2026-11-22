@@ -272,7 +272,13 @@ func (s *sshUdpServer) Close() {
 	debug("client [%x] shutting down server", s.client.proxyAddr.clientID)
 
 	// Stop the client checker and its background goroutines.
-	s.clientChecker.Close()
+	//
+	// The client checker is created during bus initialization, so it is nil
+	// if the server is closed before the client has initialized the bus,
+	// e.g. on connect timeout.
+	if checker := s.clientChecker; checker != nil {
+		checker.Close()
+	}
 
 	// Best-effort shutdown of the bus stream.
 	//
@@ -341,7 +347,9 @@ func (s *sshUdpServer) handleStream(stream Stream) {
 		// We delay the final closure to provide a grace period for the transport layer
 		// to complete data delivery, especially during connection roaming or high latency.
 		for range 60 {
-			if s.clientChecker.isTimeout() {
+			// The client checker is only available once the bus has been initialized.
+			// Streams opened before that have no reconnection to wait for.
+			if s.serving.Load() && s.clientChecker.isTimeout() {
 				// Wait for potential reconnection to ensure the last packets can be delivered.
 				_ = s.clientChecker.waitUntilReconnected()
 			}
