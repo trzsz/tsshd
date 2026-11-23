@@ -345,6 +345,7 @@ func (c *sessionContext) newOutputForwarder(name string, reader io.ReadCloser, s
 		stream:     stream,
 		done:       make(chan struct{}),
 		writeBufCh: make(chan []byte, 1),
+		writableCh: make(chan struct{}, 1),
 	}
 }
 

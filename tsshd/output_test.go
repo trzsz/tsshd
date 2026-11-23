@@ -34,6 +34,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/stretchr/testify/assert"
@@ -45,6 +46,7 @@ type mockStream struct {
 	buf   bytes.Buffer
 	err   error
 	first bool
+	delay time.Duration
 }
 
 func newMockStream() *mockStream {
@@ -61,6 +63,9 @@ func (s *mockStream) Write(p []byte) (int, error) {
 	if s.first {
 		time.Sleep(10 * time.Millisecond)
 		s.first = false
+	}
+	if s.delay > 0 {
+		time.Sleep(s.delay)
 	}
 	if s.err != nil {
 		return 0, s.err
@@ -622,6 +627,53 @@ func TestForwardOutput_ReconnectWhileReadBlocked(t *testing.T) {
 	close(block)
 	<-done
 	assert.Equal("a\nb\nc\nd\n", stream.String())
+}
+
+func TestForwardOutput_WakeOnWriterReady(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		assert := assert.New(t)
+		s, reset := newTestSessionContext(false, false, 10)
+		defer reset()
+
+		stream := newMockStream()
+		stream.first, stream.delay = false, time.Millisecond
+		data := strings.Repeat("a", 256)
+		reader := &chunkReader{data: [][]byte{[]byte(data)}, chunk: 1}
+
+		start := time.Now()
+		s.newOutputForwarder("stdout", reader, stream).forward()
+
+		assert.Equal(data, stream.String())
+		// Only the writer sleeps, so any extra time means that the forwarder
+		// did not resume as soon as the writer made room in the queue.
+		assert.Equal(256*stream.delay, time.Since(start))
+	})
+}
+
+func TestForwardOutput_FlushWakeOnWriterReady(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		assert := assert.New(t)
+		s, reset := newTestSessionContext(false, false, 1000)
+		defer reset()
+
+		stream := newMockStream()
+		stream.first, stream.delay = false, time.Millisecond
+		data := strings.Repeat("a\n", 256)
+
+		forwarder := s.newOutputForwarder("stdout", nil, stream)
+		go forwarder.writerLoop()
+		forwarder.cacheOutput([]byte(data))
+
+		start := time.Now()
+		forwarder.flushOutput()
+		close(forwarder.writeBufCh)
+		<-forwarder.done
+
+		assert.Equal(data, stream.String())
+		// Only the writer sleeps, so any extra time means that the flush
+		// did not resume as soon as the writer made room in the queue.
+		assert.Equal(256*stream.delay, time.Since(start))
+	})
 }
 
 func TestForwardOutput_TimeoutWithoutNewLine(t *testing.T) {

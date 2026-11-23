@@ -133,6 +133,13 @@ type serverOutputForwarder struct {
 	done        chan struct{}
 	writeBufCh  chan []byte
 
+	// writableCh is signaled by writerLoop each time it takes a buffer from
+	// writeBufCh, so that a sender blocked on the full queue can retry at once.
+	writableCh chan struct{}
+
+	// waitTimer is reused by waitWriter, whose callers all hold handleMutex.
+	waitTimer *time.Timer
+
 	cacheLines       [][]byte
 	tmuxOutputPrefix string
 
@@ -158,11 +165,31 @@ type serverOutputForwarder struct {
 func (f *serverOutputForwarder) writerLoop() {
 	defer func() { _ = f.stream.CloseWrite(); close(f.done) }()
 	for buf := range f.writeBufCh {
+		select {
+		case f.writableCh <- struct{}{}:
+		default:
+		}
 		if err := writeAll(f.stream, buf); err != nil {
 			f.writeError.Store(true)
 			warning("write to [%s] failed: %v", f.name, err)
 			return
 		}
+	}
+}
+
+// waitWriter blocks until writerLoop has made room in writeBufCh or has exited.
+// It also returns after a short interval so that the caller can recheck the
+// client state, which has no channel to wait on.
+func (f *serverOutputForwarder) waitWriter() {
+	if f.waitTimer == nil {
+		f.waitTimer = time.NewTimer(10 * time.Millisecond)
+	} else {
+		f.waitTimer.Reset(10 * time.Millisecond)
+	}
+	select {
+	case <-f.writableCh:
+	case <-f.done:
+	case <-f.waitTimer.C:
 	}
 }
 
@@ -286,7 +313,7 @@ func (f *serverOutputForwarder) flushOutput() {
 				if f.writeError.Load() {
 					return
 				}
-				time.Sleep(10 * time.Millisecond)
+				f.waitWriter()
 			}
 		}
 	}
@@ -422,7 +449,7 @@ out:
 			if f.writeError.Load() {
 				return
 			}
-			time.Sleep(10 * time.Millisecond)
+			f.waitWriter()
 		}
 	}
 
