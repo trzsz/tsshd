@@ -67,7 +67,10 @@ func (s *sshUdpServer) initBusAndServer(stream Stream, msg *busMessage) error {
 		return errors.New("bus has been initialized")
 	}
 
-	s.initClientChecker(msg.HeartbeatTimeout)
+	if err := s.initClientChecker(msg.HeartbeatTimeout); err != nil {
+		return err
+	}
+
 	s.clientAliveTime.Store(time.Now().UnixMilli())
 	s.aliveTimeout, s.intervalTime = msg.AliveTimeout, msg.IntervalTime
 

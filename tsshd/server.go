@@ -35,6 +35,8 @@ import (
 
 var activeSshUdpServer atomic.Pointer[sshUdpServer]
 
+var errServerClosed = errors.New("server is closed")
+
 type streamHandler interface {
 	handleStream(stream Stream)
 }
@@ -60,6 +62,8 @@ type sshUdpServer struct {
 	aliveTimeout  time.Duration
 	intervalTime  time.Duration
 	clientChecker *timeoutChecker
+
+	activationMutex sync.Mutex
 
 	// bus related
 	serving   atomic.Bool
@@ -122,19 +126,23 @@ var newSshUdpServer = func(args *tsshdArgs, proxy *serverProxy, addr net.Addr, p
 		streamMap: make(map[uint64]Stream),
 	}
 
-	go func() {
-		// close the server if it does not enter the serving state within connect timeout.
-		time.Sleep(args.ConnectTimeout)
-		if !server.serving.Load() {
-			debug("client [%x] bus initialization timed out after %v", server.client.proxyAddr.clientID, args.ConnectTimeout)
-			server.Close()
-		}
-	}()
+	// close the server if it does not enter the serving state within connect timeout.
+	time.AfterFunc(args.ConnectTimeout, func() { server.closeServer(true) })
 
 	return server
 }
 
-func (s *sshUdpServer) initClientChecker(timeout time.Duration) {
+func (s *sshUdpServer) initClientChecker(timeout time.Duration) error {
+	s.activationMutex.Lock()
+	defer s.activationMutex.Unlock()
+
+	if s.closed.Load() {
+		return errServerClosed
+	}
+	if s.clientChecker != nil {
+		return errors.New("client checker has already been initialized")
+	}
+
 	s.clientChecker = newTimeoutChecker(timeout)
 
 	if enableDebugLogging.Load() {
@@ -203,10 +211,28 @@ func (s *sshUdpServer) initClientChecker(timeout time.Duration) {
 			go sess.onReconnected()
 		}
 	})
+
+	return nil
 }
 
 func (s *sshUdpServer) activateServer(sessionName string) error {
 	debug("client [%x] starting server activation", s.client.proxyAddr.clientID)
+
+	if s.args.Attachable {
+		// Serialize server activation with session attach/detach operations.
+		// This ensures the active server transition and cleanup of sessions
+		// owned by the previous server happen atomically.
+		attachMutex.Lock()
+		defer attachMutex.Unlock()
+	}
+
+	s.activationMutex.Lock()
+	defer s.activationMutex.Unlock()
+
+	if s.closed.Load() {
+		return errServerClosed
+	}
+
 	if !s.args.Attachable {
 		if !activeSshUdpServer.CompareAndSwap(nil, s) {
 			return errors.New("active server is already in use")
@@ -215,12 +241,6 @@ func (s *sshUdpServer) activateServer(sessionName string) error {
 		s.serving.Store(true)
 		return nil
 	}
-
-	// Serialize server activation with session attach/detach operations.
-	// This ensures the active server transition and cleanup of sessions
-	// owned by the previous server happen atomically.
-	attachMutex.Lock()
-	defer attachMutex.Unlock()
 
 	if busClosing.Load() {
 		return errors.New("bus is closed")
@@ -265,14 +285,40 @@ func (s *sshUdpServer) activateServer(sessionName string) error {
 }
 
 func (s *sshUdpServer) Close() {
-	if !s.closed.CompareAndSwap(false, true) {
+	s.closeServer(false)
+}
+
+func (s *sshUdpServer) closeServer(onlyIfNotServing bool) {
+	s.activationMutex.Lock()
+
+	if onlyIfNotServing && s.serving.Load() {
+		s.activationMutex.Unlock()
 		return
 	}
 
-	debug("client [%x] shutting down server", s.client.proxyAddr.clientID)
+	if !s.closed.CompareAndSwap(false, true) {
+		s.activationMutex.Unlock()
+		return
+	}
+
+	checker := s.clientChecker
+
+	s.activationMutex.Unlock()
+
+	if onlyIfNotServing {
+		debug("client [%x] bus initialization timed out after %v", s.client.proxyAddr.clientID, s.args.ConnectTimeout)
+	} else {
+		debug("client [%x] shutting down server", s.client.proxyAddr.clientID)
+	}
 
 	// Stop the client checker and its background goroutines.
-	s.clientChecker.Close()
+	//
+	// The client checker is created during bus initialization, so it is nil
+	// if the server is closed before the client has initialized the bus,
+	// e.g. on connect timeout.
+	if checker != nil {
+		checker.Close()
+	}
 
 	// Best-effort shutdown of the bus stream.
 	//
@@ -341,7 +387,9 @@ func (s *sshUdpServer) handleStream(stream Stream) {
 		// We delay the final closure to provide a grace period for the transport layer
 		// to complete data delivery, especially during connection roaming or high latency.
 		for range 60 {
-			if s.clientChecker.isTimeout() {
+			// The client checker is only available once the bus has been initialized.
+			// Streams opened before that have no reconnection to wait for.
+			if s.serving.Load() && s.clientChecker.isTimeout() {
 				// Wait for potential reconnection to ensure the last packets can be delivered.
 				_ = s.clientChecker.waitUntilReconnected()
 			}
@@ -446,6 +494,10 @@ func (s *sshUdpServer) closeActiveStreams() {
 }
 
 func (s *sshUdpServer) isClientAlive() bool {
+	if !s.serving.Load() {
+		return false
+	}
+
 	return time.Since(time.UnixMilli(s.clientAliveTime.Load())) < s.clientChecker.heartbeatTimeout
 }
 
@@ -488,15 +540,13 @@ func (s *sshUdpServer) captureClientPathCleanup() func(reason string) {
 // Tracking clientAliveTime independently prevents spoofed UDP datagrams
 // from indefinitely extending the lifetime of the proxy-side client path.
 func (s *sshUdpServer) expireInactiveClientPath() {
-	checker := s.clientChecker
-	if checker == nil || checker.heartbeatTimeout <= 0 {
-		s.pendingPathExpiry = nil
+	if !s.serving.Load() || s.clientChecker.heartbeatTimeout <= 0 {
 		return
 	}
 
 	now := time.Now()
 	aliveTime := s.clientAliveTime.Load()
-	timeout := 3 * checker.heartbeatTimeout
+	timeout := 3 * s.clientChecker.heartbeatTimeout
 
 	if now.Sub(time.UnixMilli(aliveTime)) <= timeout {
 		s.pendingPathExpiry = nil
