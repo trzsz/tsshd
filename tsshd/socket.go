@@ -191,23 +191,28 @@ func handleViewRequest(conn net.Conn) error {
 	return nil
 }
 
+func nextAttachClientID(current, serverID uint64) uint64 {
+	id := current + 1
+	for id == 0 || id == serverID {
+		id++
+	}
+	return id
+}
+
 func handleAttachRequest(conn net.Conn) error {
 	globalSocketInfo.attachMutex.Lock()
 	defer globalSocketInfo.attachMutex.Unlock()
 
-	globalSocketInfo.serverInfo.ClientID++
-	if globalSocketInfo.serverInfo.ClientID == 0 {
-		// Skip the reserved zero ClientID after uint64 wraparound.
-		globalSocketInfo.serverInfo.ClientID++
-	}
+	info := globalSocketInfo.serverInfo
+	info.ClientID = nextAttachClientID(info.ClientID, info.ServerID)
 
-	infoStr, err := json.Marshal(globalSocketInfo.serverInfo)
+	infoStr, err := json.Marshal(info)
 	if err != nil {
 		_, _ = fmt.Fprintf(conn, "ERROR: generate server info failed: %v\n", err)
 		return fmt.Errorf("json marshal server info failed: %v", err)
 	}
 
-	debug("allocated attach client id [%x]", globalSocketInfo.serverInfo.ClientID)
+	debug("allocated attach client id [%x]", info.ClientID)
 
 	if _, err := fmt.Fprintf(conn, "\a%s\n", infoStr); err != nil {
 		return fmt.Errorf("write attach response failed: %v", err)

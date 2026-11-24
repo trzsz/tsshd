@@ -27,6 +27,7 @@ package tsshd
 import (
 	"bytes"
 	"context"
+	"encoding/binary"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -266,6 +267,67 @@ type idleFrontend struct {
 }
 
 func (c *idleFrontend) start(proxy *serverProxy) {}
+
+func TestProxy_AttachableReservesServerID(t *testing.T) {
+	info := &ServerInfo{}
+	server, err := startServerProxy(&tsshdArgs{Attachable: true, Socket: true}, info, &idleFrontend{})
+	require.NoError(t, err)
+	require.NotZero(t, info.ClientID)
+	require.NotZero(t, info.ServerID)
+
+	checkAcknowledgment := func(hello *clientHello) {
+		t.Helper()
+		ack, err := server.sealAuthPacket(1, hello)
+		require.NoError(t, err)
+		accepted, _, _, _ := server.openAuthPacket(ack)
+		require.False(t, accepted)
+	}
+	checkAcknowledgment(&clientHello{})
+	checkAcknowledgment(&clientHello{protoVersion: 3, clientNonce: make([]byte, kClientNonceSize)})
+
+	// A correctly sized v3 request must also carry a client ID.
+	request := make([]byte, 20+kClientNonceSize)
+	binary.BigEndian.PutUint64(request[:8], info.ClientID)
+	binary.BigEndian.PutUint64(request[8:16], 1)
+	binary.BigEndian.PutUint32(request[16:20], 3)
+	accepted, _, _, _ := server.openAuthPacket(aesEncrypt(server.cipherBlock, request))
+	require.True(t, accepted)
+
+	binary.BigEndian.PutUint64(request[:8], info.ServerID)
+	accepted, _, _, _ = server.openAuthPacket(aesEncrypt(server.cipherBlock, request))
+	require.False(t, accepted)
+}
+
+func TestProxy_AttachableClientChoosesID(t *testing.T) {
+	info := &ServerInfo{}
+	_, err := startServerProxy(&tsshdArgs{Attachable: true}, info, &idleFrontend{})
+	require.NoError(t, err)
+	require.Zero(t, info.ClientID)
+	require.NotZero(t, info.ServerID)
+
+	client, err := startClientProxy(&SshUdpClient{}, &UdpClientOptions{ServerInfo: info})
+	require.NoError(t, err)
+	defer func() { _ = client.Close() }()
+	require.NotZero(t, client.clientID)
+	require.NotEqual(t, info.ServerID, client.clientID)
+}
+
+func TestProxy_ClientRejectsServerID(t *testing.T) {
+	for _, version := range []int{2, 3} {
+		info := &ServerInfo{ProtoVer: version, ClientID: 23, ServerID: 23, ProxyKey: strings.Repeat("00", 32)}
+		client, err := NewSshUdpClient(&UdpClientOptions{ServerInfo: info, ConnectTimeout: 100 * time.Millisecond})
+		require.EqualError(t, err, "client ID must differ from server ID")
+		require.Nil(t, client)
+	}
+}
+
+func TestNextAttachClientID(t *testing.T) {
+	const maxID = ^uint64(0)
+	require.Equal(t, uint64(2), nextAttachClientID(1, 3))
+	require.Equal(t, uint64(4), nextAttachClientID(2, 3))
+	require.Equal(t, uint64(1), nextAttachClientID(maxID-1, maxID))
+	require.Equal(t, uint64(2), nextAttachClientID(maxID, 1))
+}
 
 func TestProxy_ClientHello(t *testing.T) {
 	info := &ServerInfo{}
