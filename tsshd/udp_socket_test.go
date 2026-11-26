@@ -39,7 +39,9 @@ import (
 // skipUnlessBindable skips the test if ip can't be bound, e.g. 127.0.0.2 on macOS.
 func skipUnlessBindable(t *testing.T, ip string) {
 	t.Helper()
-	conn, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.ParseIP(ip)})
+	ipAddr, err := netip.ParseAddr(ip)
+	require.NoError(t, err)
+	conn, err := net.ListenUDP("udp", net.UDPAddrFromAddrPort(netip.AddrPortFrom(ipAddr, 0)))
 	if err != nil {
 		t.Skipf("cannot bind %s: %v", ip, err)
 	}
@@ -54,7 +56,9 @@ func dialTestSocket(t *testing.T, conn *net.UDPConn, ip string) *net.UDPConn {
 	require.NoError(t, conn.SetReadDeadline(deadline))
 
 	port := conn.LocalAddr().(*net.UDPAddr).Port
-	client, err := net.DialUDP("udp", nil, &net.UDPAddr{IP: net.ParseIP(ip), Port: port})
+	ipAddr, err := netip.ParseAddr(ip)
+	require.NoError(t, err)
+	client, err := net.DialUDP("udp", nil, net.UDPAddrFromAddrPort(netip.AddrPortFrom(ipAddr, uint16(port))))
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = client.Close() })
 	require.NoError(t, client.SetReadDeadline(deadline))

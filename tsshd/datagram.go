@@ -463,6 +463,15 @@ func (c *unixgramConn) Close() error {
 }
 
 func dialUDP(msg *dialUdpMessage) (io.ReadWriteCloser, error) {
+	ctx := context.Background()
+	if msg.Timeout > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, msg.Timeout)
+		defer cancel()
+	}
+
+	dialer := &net.Dialer{}
+
 	if msg.Net == "unixgram" {
 		tmpFile, err := os.CreateTemp("", "tsshd_unixgram_*.sock")
 		if err != nil {
@@ -477,30 +486,19 @@ func dialUDP(msg *dialUdpMessage) (io.ReadWriteCloser, error) {
 		}
 		laddr := &net.UnixAddr{Net: "unixgram", Name: localAddr}
 		raddr := &net.UnixAddr{Net: "unixgram", Name: msg.Addr}
-		conn, err := net.DialUnix("unixgram", laddr, raddr)
+
+		conn, err := dialer.DialUnix(ctx, "unixgram", laddr, raddr)
 		if err != nil {
 			if _, err := os.Stat(localAddr); err == nil {
 				_ = os.Remove(localAddr)
 			}
 			return nil, err
 		}
+
 		return &unixgramConn{conn, newFileUnlinker(localAddr, nil)}, nil
 	}
 
-	var err error
-	var addr *net.UDPAddr
-	if msg.Timeout > 0 {
-		addr, err = doWithTimeout(func() (*net.UDPAddr, error) {
-			return net.ResolveUDPAddr(msg.Net, msg.Addr)
-		}, msg.Timeout)
-	} else {
-		addr, err = net.ResolveUDPAddr(msg.Net, msg.Addr)
-	}
-	if err != nil {
-		return nil, err
-	}
-
-	return net.DialUDP(msg.Net, nil, addr)
+	return dialer.DialContext(ctx, msg.Net, msg.Addr)
 }
 
 func forwardUDP(pconn *packetConn, conn io.ReadWriteCloser, msg *dialUdpMessage) {

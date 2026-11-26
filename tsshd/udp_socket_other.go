@@ -36,6 +36,6 @@ func replySourceSupported(bool) bool {
 	return false
 }
 
-func newPktInfoSocket(*net.UDPConn) (udpSocket, error) {
+func newPktInfoSocket(*net.UDPConn, bool) (udpSocket, error) {
 	return nil, errors.New("reply source selection is not supported on this platform")
 }

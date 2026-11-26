@@ -430,7 +430,6 @@ When Wish receives a request from the client to start `tsshd`, you can use `exec
 
 1.  **Instruction Detection**: Capture the client's request to execute `tsshd` within the Wish middleware.
 2.  **Secondary Launch**: Start a sub-process locally on the server (running the current program in `tsshd` mode).
-3.  **Environment Inheritance**: Pass current connection info (like `SSH_CONNECTION`) to the sub-process.
 
 #### C. Why Choose This Architecture?
 

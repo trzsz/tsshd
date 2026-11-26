@@ -33,7 +33,6 @@ import (
 	"net"
 	"os"
 	"os/exec"
-	"strings"
 	"sync"
 
 	"charm.land/ssh"
@@ -230,10 +229,6 @@ func handleBusiness(sess Session) bool {
 // launchTsshServer hands off the current SSH session to a tsshd-backed
 // execution mode by re-executing the current binary as a subprocess.
 //
-// The subprocess inherits the parent environment, except that
-// SSH_CONNECTION is rebuilt from the active session so the new process
-// sees the correct client/server endpoints.
-//
 // The subprocess acts as a short-lived launcher. It starts the long-lived
 // tsshd process in the background and then exits, allowing the tsshd process
 // to take over the subsequent session handling.
@@ -263,16 +258,6 @@ func launchTsshServer(args []string, sess ssh.Session) {
 	// Create a subprocess running the same binary with the provided args.
 	cmd := exec.Command(exePath, args...)
 
-	// Rebuild environment variables, overriding SSH_CONNECTION with
-	// the addresses of the current SSH session.
-	for _, env := range os.Environ() {
-		if !strings.HasPrefix(env, "SSH_CONNECTION=") {
-			cmd.Env = append(cmd.Env, env)
-		}
-	}
-	cmd.Env = append(cmd.Env, fmt.Sprintf("SSH_CONNECTION=%s %s",
-		addrToString(sess.RemoteAddr()), addrToString(sess.LocalAddr())))
-
 	// Run the launcher and capture its combined stdout and stderr.
 	// The launcher starts the long-lived tsshd process in the background
 	// and then exits, so CombinedOutput returns when the launcher exits.
@@ -287,13 +272,4 @@ func launchTsshServer(args []string, sess ssh.Session) {
 
 	// Exit the current session after the tsshd startup result is reported.
 	_ = sess.Exit(0)
-}
-
-// Format net.Addr into "host port" form compatible with SSH_CONNECTION.
-func addrToString(addr net.Addr) string {
-	host, port, err := net.SplitHostPort(addr.String())
-	if err != nil {
-		return addr.String()
-	}
-	return fmt.Sprintf("%s %s", host, port)
 }

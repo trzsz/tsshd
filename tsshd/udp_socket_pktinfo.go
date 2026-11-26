@@ -30,6 +30,7 @@ import (
 	"net"
 	"net/netip"
 	"runtime"
+	"syscall"
 
 	"golang.org/x/net/ipv4"
 	"golang.org/x/net/ipv6"
@@ -49,8 +50,8 @@ type pktInfoSocket struct {
 	oob  []byte // used by readFrom only
 }
 
-func newPktInfoSocket(conn *net.UDPConn) (udpSocket, error) {
-	s := &pktInfoSocket{conn: conn, ipv6: conn.LocalAddr().(*net.UDPAddr).IP.To4() == nil}
+func newPktInfoSocket(conn *net.UDPConn, isIPv6 bool) (udpSocket, error) {
+	s := &pktInfoSocket{conn: conn, ipv6: isIPv6}
 	if s.ipv6 {
 		if err := ipv6.NewPacketConn(conn).SetControlMessage(ipv6.FlagDst, true); err != nil {
 			return nil, err
@@ -66,24 +67,29 @@ func newPktInfoSocket(conn *net.UDPConn) (udpSocket, error) {
 }
 
 func (s *pktInfoSocket) readFrom(buf []byte) (int, netip.AddrPort, netip.Addr, error) {
-	n, oobn, _, remote, err := s.conn.ReadMsgUDPAddrPort(buf, s.oob)
+	n, oobn, flags, remote, err := s.conn.ReadMsgUDPAddrPort(buf, s.oob)
 	if err != nil {
 		return 0, remote, netip.Addr{}, err
 	}
 
-	var dst net.IP
+	// Packet information may be incomplete, so let the OS choose
+	// the reply source if the control message was truncated.
+	if flags&syscall.MSG_CTRUNC != 0 {
+		return n, remote, netip.Addr{}, nil
+	}
+
+	var local netip.Addr
 	if s.ipv6 {
 		var cm ipv6.ControlMessage
 		if cm.Parse(s.oob[:oobn]) == nil {
-			dst = cm.Dst
+			local, _ = netip.AddrFromSlice(cm.Dst)
 		}
 	} else {
 		var cm ipv4.ControlMessage
 		if cm.Parse(s.oob[:oobn]) == nil {
-			dst = cm.Dst
+			local, _ = netip.AddrFromSlice(cm.Dst)
 		}
 	}
-	local, _ := netip.AddrFromSlice(dst)
 	return n, remote, local.Unmap(), nil
 }
 

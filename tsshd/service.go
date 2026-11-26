@@ -265,31 +265,43 @@ var canListenOnIP = func(args *tsshdArgs, ip netip.Addr) bool {
 // zone, because Windows can't bind ::1 with one. It is a variable for tests.
 var getInterfaceAddrs = func() []netip.Addr {
 	var ips []netip.Addr
-	addIP := func(ip net.IP, zone string) {
-		if addr, ok := netip.AddrFromSlice(ip); ok {
-			if addr = addr.Unmap(); addr.Is6() && addr.IsLinkLocalUnicast() {
-				addr = addr.WithZone(zone)
-			}
-			ips = append(ips, addr)
+
+	addAddr := func(addr netip.Addr, zone string) {
+		if !addr.IsValid() {
+			return
 		}
+		addr = addr.Unmap()
+		if addr.Is6() && addr.IsLinkLocalUnicast() {
+			addr = addr.WithZone(zone)
+		}
+		ips = append(ips, addr)
 	}
 
 	ifaces, err := net.Interfaces()
-	if err == nil {
-		for _, iface := range ifaces {
-			addrs, err := iface.Addrs()
-			if err == nil {
-				for _, addr := range addrs {
-					switch v := addr.(type) {
-					case *net.IPNet:
-						addIP(v.IP, iface.Name)
-					case *net.IPAddr:
-						addIP(v.IP, iface.Name)
-					}
+	if err != nil {
+		return ips
+	}
+
+	for _, iface := range ifaces {
+		addrs, err := iface.Addrs()
+		if err != nil {
+			continue
+		}
+
+		for _, addr := range addrs {
+			switch v := addr.(type) {
+			case *net.IPNet:
+				if ip, ok := netip.AddrFromSlice(v.IP); ok {
+					addAddr(ip, iface.Name)
+				}
+			case *net.IPAddr:
+				if ip, ok := netip.AddrFromSlice(v.IP); ok {
+					addAddr(ip, iface.Name)
 				}
 			}
 		}
 	}
+
 	return ips
 }
 
@@ -361,6 +373,10 @@ func getFamilyListenAddrs(args *tsshdArgs, wildcard netip.Addr) []listenAddr {
 }
 
 func listenOnFreePort(args *tsshdArgs) (frontendConnection, int, error) {
+	return listenOnFreePortWithRandom(args, math_rand.Intn)
+}
+
+func listenOnFreePortWithRandom(args *tsshdArgs, randomIntn func(int) int) (frontendConnection, int, error) {
 	tsshdPort := args.Port
 	if tsshdPort == "" {
 		tsshdPort = kDefaultPortRange
@@ -377,14 +393,14 @@ func listenOnFreePort(args *tsshdArgs) (frontendConnection, int, error) {
 
 	addrs, err := getListenAddrs(args)
 	if err != nil {
-		return nil, 0, fmt.Errorf("get available udp address failed: %v", err)
+		return nil, 0, fmt.Errorf("get available listen address failed: %v", err)
 	}
 
 	var lastErr error
 	for _, portRange := range portRanges {
 		portRangeLow, portRangeHigh := int(portRange[0]), int(portRange[1])
 		size := portRangeHigh - portRangeLow + 1
-		port := portRangeLow + math_rand.Intn(size)
+		port := portRangeLow + randomIntn(size)
 		for range size {
 			var conn frontendConnection
 			if args.TCP {
@@ -404,9 +420,9 @@ func listenOnFreePort(args *tsshdArgs) (frontendConnection, int, error) {
 	}
 
 	if lastErr != nil {
-		return nil, 0, fmt.Errorf("listen udp on [%s] failed: %v", tsshdPort, lastErr)
+		return nil, 0, fmt.Errorf("listen on [%s] failed: %v", tsshdPort, lastErr)
 	}
-	return nil, 0, fmt.Errorf("listen udp on [%s] failed", tsshdPort)
+	return nil, 0, fmt.Errorf("listen on [%s] failed", tsshdPort)
 }
 
 func udpListenOnPort(addrs []listenAddr, port int) (_ frontendConnection, err error) {

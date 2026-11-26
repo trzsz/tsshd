@@ -450,22 +450,22 @@ func (s *sshUdpServer) isClientAlive() bool {
 }
 
 func (s *sshUdpServer) captureClientPathCleanup() func(reason string) {
-	oldAuthedAddr := s.client.authedAddr.Load()
-	oldClientAddr := s.client.clientAddr.Load()
+	oldAuthedPath := s.client.authedPath.Load()
+	oldClientPath := s.client.clientPath.Load()
 	oldClientConn := s.client.clientConn.Load()
 
-	if oldAuthedAddr == nil && oldClientAddr == nil && oldClientConn == nil {
+	if oldAuthedPath == nil && oldClientPath == nil && oldClientConn == nil {
 		return nil
 	}
 
 	return func(reason string) {
-		if oldAuthedAddr != nil && oldAuthedAddr == s.client.authedAddr.Load() {
-			debug("client [%x] clearing authed addr due to %s", s.client.proxyAddr.clientID, reason)
-			s.client.setAuthedAddr(oldAuthedAddr, nil)
+		if oldAuthedPath != nil && oldAuthedPath == s.client.authedPath.Load() {
+			debug("client [%x] clearing authed path due to %s", s.client.proxyAddr.clientID, reason)
+			s.client.setAuthedPath(oldAuthedPath, nil)
 		}
-		if oldClientAddr != nil && oldClientAddr == s.client.clientAddr.Load() {
-			debug("client [%x] clearing client addr due to %s", s.client.proxyAddr.clientID, reason)
-			s.client.setClientAddr(oldClientAddr, nil)
+		if oldClientPath != nil && oldClientPath == s.client.clientPath.Load() {
+			debug("client [%x] clearing client path due to %s", s.client.proxyAddr.clientID, reason)
+			s.client.setClientPath(oldClientPath, nil)
 		}
 		if oldClientConn != nil && oldClientConn == s.client.clientConn.Load() {
 			debug("client [%x] clearing client conn due to %s", s.client.proxyAddr.clientID, reason)

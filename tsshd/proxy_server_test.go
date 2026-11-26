@@ -102,7 +102,9 @@ func (ft *udpFrontendTest) serverAddr(ip string) netip.AddrPort {
 
 // newClient opens a client socket bound to ip.
 func (ft *udpFrontendTest) newClient(ip string) *net.UDPConn {
-	conn, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.ParseIP(ip)})
+	ipAddr, err := netip.ParseAddr(ip)
+	require.NoError(ft.t, err)
+	conn, err := net.ListenUDP("udp", net.UDPAddrFromAddrPort(netip.AddrPortFrom(ipAddr, 0)))
 	require.NoError(ft.t, err)
 	ft.t.Cleanup(func() { _ = conn.Close() })
 	return conn
@@ -257,7 +259,7 @@ func TestUdpFrontendIgnoresReplayedAuth(t *testing.T) {
 		// Replayed while the client is authenticated but not yet active.
 		ft.send(replayer, "127.0.0.1", ft.authPacket(1))
 		ft.requireNoReply(replayer)
-		require.Equal(t, remote, ft.client().authedAddr.Load().remote)
+		require.Equal(t, remote, ft.client().authedPath.Load().key.remote)
 
 		data := ft.dataPacket("activate")
 		ft.send(client, "127.0.0.1", data)
@@ -266,8 +268,8 @@ func TestUdpFrontendIgnoresReplayedAuth(t *testing.T) {
 		// Replayed while the client is active.
 		ft.send(replayer, "127.0.0.1", ft.authPacket(1))
 		ft.requireNoReply(replayer)
-		require.Equal(t, remote, ft.client().clientAddr.Load().remote)
-		require.Nil(t, ft.client().authedAddr.Load())
+		require.Equal(t, remote, ft.client().clientPath.Load().key.remote)
+		require.Nil(t, ft.client().authedPath.Load())
 
 		ft.requireServerSends(client, netip.MustParseAddrPort(fmt.Sprintf("127.0.0.1:%d", ft.port)))
 		ft.requireNoReply(replayer)
@@ -367,4 +369,41 @@ func TestUdpFrontendReadFromEndsWhenSocketsClose(t *testing.T) {
 	case <-time.After(3 * time.Second):
 		t.Fatal("readFrom did not return after the sockets closed")
 	}
+}
+
+func TestUdpFrontendResendsAuthAck(t *testing.T) {
+	forEachAttachable(t, func(t *testing.T, attachable bool) {
+		ft := startUdpFrontendTest(t, attachable)
+		client := ft.newClient("127.0.0.1")
+
+		auth := ft.authPacket(1)
+
+		// The first ACK is deliberately discarded to simulate packet loss
+		// from the client's perspective.
+		ft.send(client, "127.0.0.1", auth)
+		firstFrom := ft.requireAuthReply(client, 1)
+
+		state := ft.client()
+		firstPath := state.authedPath.Load()
+		require.NotNil(t, firstPath)
+		require.Nil(t, state.clientPath.Load())
+
+		// Retransmit the same authentication packet on the same UDP path.
+		ft.send(client, "127.0.0.1", auth)
+		secondFrom := ft.requireAuthReply(client, 1)
+
+		// The server must resend the ACK on the accepted path without
+		// creating a new authenticated path.
+		require.Equal(t, firstFrom, secondFrom)
+		require.Same(t, firstPath, state.authedPath.Load())
+		require.Nil(t, state.clientPath.Load())
+
+		// A non-auth packet activates the authenticated path.
+		data := ft.dataPacket("activate")
+		ft.send(client, "127.0.0.1", data)
+		ft.requireDelivered(data)
+
+		require.Same(t, firstPath, state.clientPath.Load())
+		require.Nil(t, state.authedPath.Load())
+	})
 }

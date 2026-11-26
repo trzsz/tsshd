@@ -89,6 +89,7 @@ func (m *echoServer) handleStream(stream Stream) {
 
 func runStreamEchoTest(t *testing.T, stream Stream) {
 	for size := 1; size <= 2000; size += 3 {
+		_ = stream.SetDeadline(time.Now().Add(2 * time.Second))
 
 		send := make([]byte, size)
 		for i := range send {
@@ -278,7 +279,7 @@ func TestProxy(t *testing.T) {
 					network = "tcp6"
 				}
 				runProxyEchoClients(t, args, newProxyEchoOptions(args, info, "127.0.0.1"), kTsshdProtocol, func(proxy *clientProxy) {
-					proxy.serverNet = network
+					proxy.networks = []string{network}
 					proxy.serverAddr = net.JoinHostPort("::1", strconv.Itoa(info.Port))
 				})
 			})
@@ -495,6 +496,16 @@ func (c *queueFrontend) readFrom(buf []byte) (int, *clientState) {
 }
 
 func (c *queueFrontend) writeTo(buf []byte, client *clientState) error { return nil }
+
+func (c *queueFrontend) addClientMap(*clientState) {}
+
+func (c *queueFrontend) delClientMap(*clientState, *udpPath) {}
+
+func (c *queueFrontend) addAuthedMap(*clientState) {}
+
+func (c *queueFrontend) delAuthedMap(*clientState, *udpPath) {}
+
+func (c *queueFrontend) Close() {}
 
 // Datagrams that the KCP listener does not accept must not make the client
 // look alive, in particular the replayed packets since protocol version 3.

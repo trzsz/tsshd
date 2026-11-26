@@ -430,7 +430,6 @@ func handleBusiness(sess Session) {
 
 1.  **检测指令**：在 Wish 中间件中捕获客户端执行 `tsshd` 的请求。
 2.  **二次启动**：在服务端本地启动一个子进程（当前程序的 tsshd 模式）。
-3.  **环境继承**：将当前的连接信息（如 `SSH_CONNECTION`）传递给子进程。
 
 ### C. 为什么选择这种架构？
 

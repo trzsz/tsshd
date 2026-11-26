@@ -74,12 +74,12 @@ type pathKey struct {
 // udpPath is the socket, remote and local address a client authenticated on.
 type udpPath struct {
 	socket udpSocket
-	pathKey
-	oob []byte // set when the path is accepted
+	key    pathKey
+	oob    []byte // set when the path is accepted
 }
 
 func (p *udpPath) send(buf []byte) error {
-	return p.socket.writeTo(buf, p.remote, p.oob)
+	return p.socket.writeTo(buf, p.key.remote, p.oob)
 }
 
 type clientState struct {
@@ -89,20 +89,21 @@ type clientState struct {
 	proxyAddr    proxyClientAddr
 	serialNumber atomic.Uint64
 	clientConn   atomic.Pointer[net.TCPConn]
-	clientAddr   atomic.Pointer[udpPath]
-	authedAddr   atomic.Pointer[udpPath]
-	udpFrontConn atomic.Pointer[udpFrontendConn]
+	clientPath   atomic.Pointer[udpPath]
+	authedPath   atomic.Pointer[udpPath]
+	frontendConn frontendConnection
 	clientMutex  sync.Mutex
 	clientCond   *sync.Cond
 	kcpCrypto    atomic.Pointer[rotatingCrypto]
 	udpTraffic   atomic.Pointer[trafficStats]
 	helloMutex   sync.Mutex
 	hello        *clientHello
+	tcpAuthMutex sync.Mutex
 }
 
 func (c *clientState) remoteAddr() string {
-	if addr := c.clientAddr.Load(); addr != nil {
-		return addr.remote.String()
+	if path := c.clientPath.Load(); path != nil {
+		return path.key.remote.String()
 	}
 	if conn := c.clientConn.Load(); conn != nil {
 		return conn.RemoteAddr().String()
@@ -130,8 +131,14 @@ func (c *clientState) waitClientConn() *net.TCPConn {
 	return conn
 }
 
-func (c *clientState) setClientConn(oldConn, newConn *net.TCPConn) {
+func (c *clientState) setClientConn(oldConn, newConn *net.TCPConn) bool {
 	c.clientMutex.Lock()
+
+	closed := c.closed.Load()
+	if closed {
+		newConn = nil
+	}
+
 	if oldConn == nil {
 		oldConn = c.clientConn.Swap(newConn)
 	} else {
@@ -147,71 +154,89 @@ func (c *clientState) setClientConn(oldConn, newConn *net.TCPConn) {
 	if oldConn != nil {
 		_ = oldConn.Close()
 	}
+
+	return !closed
 }
 
-func (c *clientState) setClientAddr(oldAddr, newAddr *udpPath) {
-	conn := c.udpFrontConn.Load()
+func (c *clientState) setClientPath(oldPath, newPath *udpPath) bool {
+	c.clientMutex.Lock()
+	defer c.clientMutex.Unlock()
 
-	if oldAddr == nil {
-		oldAddr = c.clientAddr.Swap(newAddr)
+	closed := c.closed.Load()
+	if closed {
+		newPath = nil
+	}
+
+	if oldPath == nil {
+		oldPath = c.clientPath.Swap(newPath)
 	} else {
-		if !c.clientAddr.CompareAndSwap(oldAddr, newAddr) {
-			oldAddr = nil
+		if !c.clientPath.CompareAndSwap(oldPath, newPath) {
+			oldPath = nil
 		}
 	}
 
-	if newAddr != nil && conn != nil {
-		conn.addClientMap(c)
+	if oldPath != nil {
+		c.frontendConn.delClientMap(c, oldPath)
 	}
 
-	if oldAddr != nil {
-		if conn != nil {
-			conn.delClientMap(oldAddr)
-		}
+	if newPath != nil {
+		c.frontendConn.addClientMap(c)
 	}
+
+	return !closed
 }
 
-func (c *clientState) setAuthedAddr(oldAddr, newAddr *udpPath) {
-	conn := c.udpFrontConn.Load()
+func (c *clientState) setAuthedPath(oldPath, newPath *udpPath) bool {
+	c.clientMutex.Lock()
+	defer c.clientMutex.Unlock()
 
-	if oldAddr == nil {
-		oldAddr = c.authedAddr.Swap(newAddr)
+	closed := c.closed.Load()
+	if closed {
+		newPath = nil
+	}
+
+	if oldPath == nil {
+		oldPath = c.authedPath.Swap(newPath)
 	} else {
-		if !c.authedAddr.CompareAndSwap(oldAddr, newAddr) {
-			oldAddr = nil
+		if !c.authedPath.CompareAndSwap(oldPath, newPath) {
+			oldPath = nil
 		}
 	}
 
-	if newAddr != nil && conn != nil {
-		conn.addAuthedMap(c)
+	if oldPath != nil {
+		c.frontendConn.delAuthedMap(c, oldPath)
 	}
 
-	if oldAddr != nil && conn != nil {
-		conn.delAuthedMap(oldAddr)
+	if newPath != nil {
+		c.frontendConn.addAuthedMap(c)
 	}
+
+	return !closed
 }
 
 func (c *clientState) Close() {
+	c.clientMutex.Lock()
+
 	if !c.closed.CompareAndSwap(false, true) {
+		c.clientMutex.Unlock()
 		return
 	}
+
+	if c.clientCond != nil {
+		c.clientCond.Broadcast()
+		c.clientCond = nil
+	}
+
+	c.clientMutex.Unlock()
 
 	// clientState instances are retained to prevent replay attacks,
 	// so release references that are no longer needed.
 
-	if c.clientCond != nil {
-		c.clientMutex.Lock()
-		c.clientCond.Broadcast()
-		c.clientCond = nil
-		c.clientMutex.Unlock()
-	}
-
 	c.server.Store(nil)
 	c.kcpCrypto.Store(nil)
 	c.setClientConn(nil, nil)
-	c.setClientAddr(nil, nil)
-	c.setAuthedAddr(nil, nil)
-	c.udpFrontConn.Store(nil)
+	c.setClientPath(nil, nil)
+	c.setAuthedPath(nil, nil)
 	c.udpTraffic.Store(nil)
 }
 
@@ -219,6 +244,11 @@ type frontendConnection interface {
 	start(*serverProxy)
 	readFrom([]byte) (int, *clientState)
 	writeTo([]byte, *clientState) error
+	addClientMap(*clientState)
+	delClientMap(*clientState, *udpPath)
+	addAuthedMap(*clientState)
+	delAuthedMap(*clientState, *udpPath)
+	Close()
 }
 
 // udpPacket hands a packet from a socket reader to readFrom.
@@ -271,7 +301,7 @@ func (c *udpFrontendConn) readLoop(socket udpSocket) {
 			continue
 		}
 
-		c.packetCh <- udpPacket{buf[:n], udpPath{socket: socket, pathKey: pathKey{remote, local}}, done}
+		c.packetCh <- udpPacket{buf[:n], udpPath{socket: socket, key: pathKey{remote, local}}, done}
 		<-done
 	}
 }
@@ -281,8 +311,8 @@ func (c *udpFrontendConn) addClientMap(client *clientState) {
 		return
 	}
 
-	addr := client.clientAddr.Load()
-	if addr == nil {
+	path := client.clientPath.Load()
+	if path == nil {
 		return
 	}
 
@@ -290,21 +320,23 @@ func (c *udpFrontendConn) addClientMap(client *clientState) {
 	if c.clientMap == nil {
 		c.clientMap = make(map[pathKey]*clientState)
 	}
-	c.clientMap[addr.pathKey] = client
+	c.clientMap[path.key] = client
 	c.clientMutex.Unlock()
 }
 
-func (c *udpFrontendConn) delClientMap(addr *udpPath) {
+func (c *udpFrontendConn) delClientMap(client *clientState, path *udpPath) {
 	if !c.proxy.args.Attachable {
 		return
 	}
 
-	if addr == nil {
+	if path == nil {
 		return
 	}
 
 	c.clientMutex.Lock()
-	delete(c.clientMap, addr.pathKey)
+	if c.clientMap[path.key] == client {
+		delete(c.clientMap, path.key)
+	}
 	c.clientMutex.Unlock()
 }
 
@@ -313,8 +345,8 @@ func (c *udpFrontendConn) addAuthedMap(authed *clientState) {
 		return
 	}
 
-	addr := authed.authedAddr.Load()
-	if addr == nil {
+	path := authed.authedPath.Load()
+	if path == nil {
 		return
 	}
 
@@ -322,70 +354,80 @@ func (c *udpFrontendConn) addAuthedMap(authed *clientState) {
 	if c.authedMap == nil {
 		c.authedMap = make(map[pathKey]*clientState)
 	}
-	c.authedMap[addr.pathKey] = authed
+	c.authedMap[path.key] = authed
 	c.authedMutex.Unlock()
 }
 
-func (c *udpFrontendConn) delAuthedMap(addr *udpPath) {
+func (c *udpFrontendConn) delAuthedMap(client *clientState, path *udpPath) {
 	if !c.proxy.args.Attachable {
 		return
 	}
 
-	if addr == nil {
+	if path == nil {
 		return
 	}
 
 	c.authedMutex.Lock()
-	delete(c.authedMap, addr.pathKey)
+	if c.authedMap[path.key] == client {
+		delete(c.authedMap, path.key)
+	}
 	c.authedMutex.Unlock()
 }
 
-func isSameAddr(path *udpPath, addr pathKey) bool {
-	return path != nil && path.pathKey == addr
+func (c *udpFrontendConn) Close() {
+	for _, socket := range c.sockets {
+		_ = socket.Close()
+	}
 }
 
-func (c *udpFrontendConn) getClient(addr pathKey) (*clientState, bool, bool) {
+func isSamePath(path *udpPath, key pathKey) bool {
+	return path != nil && path.key == key
+}
+
+func (c *udpFrontendConn) getClient(key pathKey) (*clientState, bool, bool) {
 	if !c.proxy.args.Attachable {
 		client := c.proxy.soleClient
-		if isSameAddr(client.clientAddr.Load(), addr) {
+		if isSamePath(client.clientPath.Load(), key) {
 			return client, true, false
 		}
-		if isSameAddr(client.authedAddr.Load(), addr) {
+		if isSamePath(client.authedPath.Load(), key) {
 			return client, false, true
 		}
 		return nil, false, false
 	}
 
 	if client := c.cacheClient.Load(); client != nil {
-		if isSameAddr(client.clientAddr.Load(), addr) {
+		if isSamePath(client.clientPath.Load(), key) {
 			return client, true, false
 		}
-		if isSameAddr(client.authedAddr.Load(), addr) {
+		if isSamePath(client.authedPath.Load(), key) {
 			return client, false, true
 		}
 	}
 
 	c.clientMutex.Lock()
-	client := c.clientMap[addr]
+	client := c.clientMap[key]
 	c.clientMutex.Unlock()
 
-	if client != nil && isSameAddr(client.clientAddr.Load(), addr) {
+	if client != nil && isSamePath(client.clientPath.Load(), key) {
 		c.cacheClient.Store(client)
 		return client, true, false
 	}
 
 	c.authedMutex.Lock()
-	authed := c.authedMap[addr]
+	authed := c.authedMap[key]
 	c.authedMutex.Unlock()
 
-	if authed != nil && isSameAddr(authed.authedAddr.Load(), addr) {
+	if authed != nil && isSamePath(authed.authedPath.Load(), key) {
 		return authed, false, true
 	}
 
 	return nil, false, false
 }
 
-// readFrom returns a nil client once all sockets are closed.
+// readFrom processes incoming UDP packets and client authentication.
+// Calls must be serialized; serverProxy.ReadFrom ensures this with readMutex.
+// It returns a nil client once all sockets are closed.
 func (c *udpFrontendConn) readFrom(buf []byte) (int, *clientState) {
 	for {
 		var packet udpPacket
@@ -396,13 +438,13 @@ func (c *udpFrontendConn) readFrom(buf []byte) (int, *clientState) {
 		}
 		n := copy(buf, packet.buf)
 		packet.done <- struct{}{}
-		addr := packet.path.pathKey
+		key := packet.path.key
 
-		client, isClientAddr, isAuthedAddr := c.getClient(addr)
+		client, isClientPath, isAuthedPath := c.getClient(key)
 
 		// Case 1: packet from current effective client.
 		// Fast path — directly forward.
-		if isClientAddr {
+		if isClientPath {
 			if n <= kSafeToDropPacketLen {
 				continue
 			}
@@ -410,62 +452,84 @@ func (c *udpFrontendConn) readFrom(buf []byte) (int, *clientState) {
 		}
 
 		// Case 2: packet from authenticated but not yet activated client.
-		if isAuthedAddr {
+		if isAuthedPath {
 
 			// Check whether this is still an authentication packet.
 			isAuthPacket, clientID, newSerialNumber, hello := c.proxy.openAuthPacket(buf[:n])
 
-			// First non-auth packet means handshake phase completed.
-			// Promote authedAddr to effective client.
-			if !isAuthPacket {
-				if addr := client.authedAddr.Load(); addr != nil {
-					client.setClientAddr(nil, addr)
-					client.setAuthedAddr(nil, nil)
-					c.proxy.onNewClientConn(client)
-					if n <= kSafeToDropPacketLen {
-						continue
-					}
-					return n, client
-				} else {
-					warning("authed addr missing: client_id=%x, new_serial=%d", clientID, newSerialNumber)
-					continue
-				}
+			path := client.authedPath.Load()
+			if path == nil {
+				warning("authed path missing: client_id=%x, remote=%s", client.proxyAddr.clientID, key.remote)
+				continue
 			}
 
-			// Client ID mismatch — this should not happen.
+			// First non-auth packet means handshake phase completed.
+			// Promote authedPath to effective client.
+			if !isAuthPacket {
+				if !client.setClientPath(nil, path) {
+					debug("set client path failed: client [%x] is closed", client.proxyAddr.clientID)
+					continue
+				}
+				if !client.setAuthedPath(nil, nil) {
+					debug("skip clearing authed path: client [%x] is closed", client.proxyAddr.clientID)
+					continue
+				}
+				c.proxy.onNewClientConn(client)
+				if n <= kSafeToDropPacketLen {
+					continue
+				}
+				return n, client
+			}
+
+			// With pre-v3 protocols, the server's authentication response may be
+			// reflected back and mistaken for a client authentication packet. In
+			// attachable mode, the server ID in that response may be interpreted as
+			// a new client ID. Normal clients never send such packets.
 			if clientID != client.proxyAddr.clientID {
-				warning("client id mismatch: expected=%d, got=%d", client.proxyAddr.clientID, clientID)
-				client.setAuthedAddr(nil, nil)
+				warning("unexpected auth packet on authed path: expected_client_id=%x, received_client_id=%x, remote=%s",
+					client.proxyAddr.clientID, clientID, key.remote)
+				client.setAuthedPath(nil, nil)
 				continue
 			}
 
 			// Redundant authentication packet.
-			// Update serial number if newer and resend auth response.
+			// Accept the current or a newer serial number and resend the auth response.
 			oldSerialNumber := client.serialNumber.Load()
 			if newSerialNumber < oldSerialNumber {
-				debug("authenticate rejected: old_serial=%d, new_serial=%d", oldSerialNumber, newSerialNumber)
+				// The client serial number only increases. Retransmissions on the current
+				// authenticated path may carry the current serial, but never an older one.
+				// Packets from an old path must not arrive on this path.
+				warning("stale auth packet on authed path: client_id=%x, current_serial=%d, received_serial=%d, remote=%s",
+					client.proxyAddr.clientID, oldSerialNumber, newSerialNumber, key.remote)
 				continue
 			}
+
 			if !c.proxy.acceptClientHello(client, hello) {
 				continue
 			}
+
 			if !client.serialNumber.CompareAndSwap(oldSerialNumber, newSerialNumber) {
-				debug("authenticate conflict: old_serial=%d, new_serial=%d", oldSerialNumber, newSerialNumber)
-				newSerialNumber = client.serialNumber.Load()
+				// Calls to readFrom are serialized, so the serial number should not change between the load and CAS.
+				warning("unexpected serial change on authed path: client_id=%x, expected_serial=%d, received_serial=%d, current_serial=%d, remote=%s",
+					client.proxyAddr.clientID, oldSerialNumber, newSerialNumber, client.serialNumber.Load(), key.remote)
+				continue
 			}
+
 			// Reply on the authenticated path.
-			if b, err := c.proxy.sealAuthPacket(newSerialNumber, hello); err != nil {
+			b, err := c.proxy.sealAuthPacket(newSerialNumber, hello)
+			if err != nil {
 				warning("seal auth packet failed: %v", err)
-			} else if path := client.authedAddr.Load(); path == nil {
-				warning("authed addr missing: client_id=%x, new_serial=%d", clientID, newSerialNumber)
-			} else if err := path.send(b); err != nil {
+				continue
+			}
+			if err := path.send(b); err != nil {
 				warning("send auth packet failed: %v", err)
+				continue
 			}
 			continue
 		}
 
-		// Case 3: packet from unknown address.
-		// Only valid authentication packets can create a new authed address.
+		// Case 3: packet from unknown path.
+		// Only valid authentication packets can create a new authed path.
 		isAuthPacket, clientID, newSerialNumber, hello := c.proxy.openAuthPacket(buf[:n])
 		if !isAuthPacket {
 			continue
@@ -481,10 +545,13 @@ func (c *udpFrontendConn) readFrom(buf []byte) (int, *clientState) {
 			continue
 		}
 
-		client.udpFrontConn.Store(c)
 		oldSerialNumber := client.serialNumber.Load()
 		if newSerialNumber <= oldSerialNumber {
-			debug("authenticate rejected: old_serial=%d, new_serial=%d", oldSerialNumber, newSerialNumber)
+			// Ignore stale authentication packets from unknown paths.
+			// They may be delayed requests from an old path, packets from the
+			// slower IPv4/IPv6 attempt in a dual-stack race, or replayed packets.
+			debug("ignoring stale auth packet from unknown path: client_id=%x, current_serial=%d, received_serial=%d, remote=%s",
+				clientID, oldSerialNumber, newSerialNumber, key.remote)
 			continue
 		}
 
@@ -492,33 +559,44 @@ func (c *udpFrontendConn) readFrom(buf []byte) (int, *clientState) {
 			continue
 		}
 
+		if !client.serialNumber.CompareAndSwap(oldSerialNumber, newSerialNumber) {
+			// Calls to readFrom are serialized, so the serial number should not change between the load and CAS.
+			warning("unexpected serial change on new path: client_id=%x, expected_serial=%d, received_serial=%d, current_serial=%d, remote=%s",
+				clientID, oldSerialNumber, newSerialNumber, client.serialNumber.Load(), key.remote)
+			continue
+		}
+
 		// Build oob once per accepted path, not per packet.
 		path := packet.path
-		path.oob = path.socket.replyOOB(path.local)
-		if client.serialNumber.CompareAndSwap(oldSerialNumber, newSerialNumber) {
-			debug("client [%x] [%d] authed from %s", clientID, newSerialNumber, addr.remote)
-			// Store as authenticated but not yet activated address.
-			client.setAuthedAddr(nil, &path)
-		} else {
-			debug("authenticate conflict: old_serial=%d, new_serial=%d", oldSerialNumber, newSerialNumber)
-			newSerialNumber = client.serialNumber.Load()
+		path.oob = path.socket.replyOOB(path.key.local)
+
+		// Store as authenticated but not yet activated path.
+		if !client.setAuthedPath(nil, &path) {
+			debug("set authed path failed: client [%x] is closed", clientID)
+			continue
 		}
+		debug("client [%x] [%d] authed from %s", clientID, newSerialNumber, key.remote)
+
 		// Send authentication response (ack).
-		if b, err := c.proxy.sealAuthPacket(newSerialNumber, hello); err != nil {
+		b, err := c.proxy.sealAuthPacket(newSerialNumber, hello)
+		if err != nil {
 			warning("seal auth packet failed: %v", err)
-		} else if err := path.send(b); err != nil {
+			continue
+		}
+		if err := path.send(b); err != nil {
 			warning("send auth packet failed: %v", err)
+			continue
 		}
 	}
 }
 
 func (c *udpFrontendConn) writeTo(buf []byte, client *clientState) error {
-	addr := client.clientAddr.Load()
-	if addr == nil {
+	path := client.clientPath.Load()
+	if path == nil {
 		return errClientDisconnected
 	}
 
-	return addr.send(buf)
+	return path.send(buf)
 }
 
 type tcpFrameSignal struct {
@@ -531,14 +609,14 @@ type tcpFrameSignal struct {
 type tcpFrontendConn struct {
 	proxy         *serverProxy
 	listenerList  []*net.TCPListener
-	frameSignalCh chan *tcpFrameSignal
+	frameSignalCh chan tcpFrameSignal
 }
 
 func (c *tcpFrontendConn) start(proxy *serverProxy) {
 	c.proxy = proxy
 
 	if proxy.args.Attachable {
-		c.frameSignalCh = make(chan *tcpFrameSignal, 10)
+		c.frameSignalCh = make(chan tcpFrameSignal, 10)
 	}
 
 	// Listeners stay open until exit, so clients can reconnect at any time.
@@ -551,14 +629,28 @@ func (c *tcpFrontendConn) start(proxy *serverProxy) {
 func (c *tcpFrontendConn) serve(listener *net.TCPListener) {
 	defer func() { _ = listener.Close() }()
 
+	warned := false
 	for {
 		conn, err := listener.AcceptTCP()
 		if err != nil {
-			if !errors.Is(err, net.ErrClosed) {
-				warning("frontend accept tcp failed: %v", err)
+			if errors.Is(err, net.ErrClosed) {
+				return
 			}
-			return
+
+			var netErr net.Error
+			if errors.As(err, &netErr) && netErr.Timeout() {
+				continue
+			}
+
+			if !warned {
+				warning("frontend accept tcp failed: %v", err)
+				warned = true
+			}
+			time.Sleep(10 * time.Millisecond)
+			continue
 		}
+
+		warned = false
 
 		go c.handshake(conn)
 	}
@@ -595,16 +687,30 @@ func (c *tcpFrontendConn) handshake(conn *net.TCPConn) {
 		debug("handshake failed: client [%x] is closed", clientID)
 		return
 	}
+
+	// Serialize authentication and connection replacement.
+	client.tcpAuthMutex.Lock()
+	defer client.tcpAuthMutex.Unlock()
+
 	oldSerialNumber := client.serialNumber.Load()
+
 	if newSerialNumber <= oldSerialNumber {
-		debug("handshake rejected: old_serial=%d, new_serial=%d", oldSerialNumber, newSerialNumber)
+		// Ignore stale authentication packets from unknown paths.
+		// They may be delayed requests from an old path, packets from the
+		// slower IPv4/IPv6 attempt in a dual-stack race, or replayed packets.
+		debug("ignoring stale auth packet from connection: client_id=%x, current_serial=%d, received_serial=%d, remote=%s",
+			clientID, oldSerialNumber, newSerialNumber, conn.RemoteAddr())
 		return
 	}
+
 	if !c.proxy.acceptClientHello(client, hello) {
 		return
 	}
+
 	if !client.serialNumber.CompareAndSwap(oldSerialNumber, newSerialNumber) {
-		debug("handshake conflict: old_serial=%d, new_serial=%d", oldSerialNumber, newSerialNumber)
+		// Serialized by tcpAuthMutex, so the serial number should not change between the load and CAS.
+		warning("unexpected serial change on tcp path: client_id=%x, expected_serial=%d, received_serial=%d, current_serial=%d, remote=%s",
+			clientID, oldSerialNumber, newSerialNumber, client.serialNumber.Load(), conn.RemoteAddr())
 		return
 	}
 
@@ -623,7 +729,11 @@ func (c *tcpFrontendConn) handshake(conn *net.TCPConn) {
 	_ = conn.SetReadBuffer(kProxyBufferSize)
 	_ = conn.SetWriteBuffer(kProxyBufferSize)
 
-	client.setClientConn(nil, conn)
+	if !client.setClientConn(nil, conn) {
+		debug("set client conn failed: client [%x] is closed", clientID)
+		return
+	}
+
 	c.proxy.onNewClientConn(client)
 	ok = true
 
@@ -636,10 +746,7 @@ func (c *tcpFrontendConn) readLoop(conn *net.TCPConn, client *clientState) {
 	buf := make([]byte, 2)
 	ackCh := make(chan error)
 
-	defer func() {
-		client.setClientConn(conn, nil)
-		close(ackCh)
-	}()
+	defer client.setClientConn(conn, nil)
 
 	for conn == client.clientConn.Load() {
 
@@ -647,7 +754,7 @@ func (c *tcpFrontendConn) readLoop(conn *net.TCPConn, client *clientState) {
 			return
 		}
 
-		c.frameSignalCh <- &tcpFrameSignal{
+		c.frameSignalCh <- tcpFrameSignal{
 			conn:   conn,
 			client: client,
 			length: int(binary.BigEndian.Uint16(buf)),
@@ -713,6 +820,20 @@ func (c *tcpFrontendConn) writeTo(buf []byte, client *clientState) error {
 	return nil
 }
 
+func (c *tcpFrontendConn) addClientMap(*clientState) {}
+
+func (c *tcpFrontendConn) delClientMap(*clientState, *udpPath) {}
+
+func (c *tcpFrontendConn) addAuthedMap(*clientState) {}
+
+func (c *tcpFrontendConn) delAuthedMap(*clientState, *udpPath) {}
+
+func (c *tcpFrontendConn) Close() {
+	for _, listener := range c.listenerList {
+		_ = listener.Close()
+	}
+}
+
 type serverProxy struct {
 	args         *tsshdArgs
 	readMutex    sync.Mutex
@@ -730,7 +851,7 @@ type serverProxy struct {
 }
 
 func (p *serverProxy) newClientState(clientID uint64) (*clientState, error) {
-	client := &clientState{proxyAddr: proxyClientAddr{clientID}}
+	client := &clientState{proxyAddr: proxyClientAddr{clientID}, frontendConn: p.frontendConn}
 
 	if p.args.TCP {
 		client.clientCond = sync.NewCond(&client.clientMutex)
@@ -852,6 +973,13 @@ func (p *serverProxy) acceptClientHello(client *clientState, hello *clientHello)
 }
 
 func (p *serverProxy) onNewClientConn(client *clientState) {
+	client.clientMutex.Lock()
+	defer client.clientMutex.Unlock()
+
+	if client.closed.Load() {
+		return
+	}
+
 	if enableDebugLogging.Load() {
 		debug("client [%x] [%d] active from %s", client.proxyAddr.clientID, client.serialNumber.Load(), client.remoteAddr())
 	}
@@ -893,6 +1021,12 @@ func (p *serverProxy) ReadFrom(buf []byte) (int, net.Addr, error) {
 				continue
 			}
 			n = nn
+		}
+
+		// For attachable clients, Close sets closed before clearing kcpCrypto.
+		// Load the key first, then discard the packet if the client was closed.
+		if client.closed.Load() {
+			continue
 		}
 
 		break

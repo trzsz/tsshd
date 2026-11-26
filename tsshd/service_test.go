@@ -30,6 +30,7 @@ import (
 	"net/netip"
 	"runtime"
 	"strconv"
+	"syscall"
 	"testing"
 	"time"
 
@@ -67,6 +68,14 @@ func TestParsePortRanges(t *testing.T) {
 	assert.Equal([][2]uint16{{10, 11}}, parsePortRanges("10 - 11 -"))
 }
 
+func testTCPAddr(ip netip.Addr, port int) *net.TCPAddr {
+	return net.TCPAddrFromAddrPort(netip.AddrPortFrom(ip, uint16(port)))
+}
+
+func testUDPAddr(ip netip.Addr, port int) *net.UDPAddr {
+	return net.UDPAddrFromAddrPort(netip.AddrPortFrom(ip, uint16(port)))
+}
+
 // replaceListenProbes fakes the host the listen plan sees.
 func replaceListenProbes(t *testing.T, replySource func(network string) bool, ifaceAddrs []netip.Addr,
 	listenable func(args *tsshdArgs, ip netip.Addr) bool) {
@@ -91,6 +100,7 @@ func TestGetListenAddrs(t *testing.T) {
 	ipv6Only := func(network string) bool { return network == "udp6" }
 	listenAll := func(*tsshdArgs, netip.Addr) bool { return true }
 	listenIPv4 := func(_ *tsshdArgs, ip netip.Addr) bool { return ip.Is4() }
+	listenIPv6 := func(_ *tsshdArgs, ip netip.Addr) bool { return ip.Is6() }
 	listenWildcard := func(_ *tsshdArgs, ip netip.Addr) bool { return ip.IsUnspecified() }
 
 	tests := []struct {
@@ -131,6 +141,12 @@ func TestGetListenAddrs(t *testing.T) {
 			[]listenAddr{{any4, false, probes4}}},
 		{"TCPNoListenableInterfaceAddr", tsshdArgs{TCP: true}, both, ifaceAddrs, listenWildcard,
 			[]listenAddr{{any4, false, nil}, {any6, false, nil}}},
+		{"IPv4Unavailable", tsshdArgs{}, neither, ifaceAddrs, listenIPv6,
+			[]listenAddr{{ip6a, false, nil}, {ip6b, false, nil}}},
+		{"TCPIPv4Unavailable", tsshdArgs{TCP: true}, both, ifaceAddrs, listenIPv6,
+			[]listenAddr{{any6, false, probes6}}},
+		{"TCPIPv6Flag", tsshdArgs{TCP: true, IPv6: true}, both, ifaceAddrs, listenAll,
+			[]listenAddr{{any6, false, probes6}}},
 	}
 
 	for _, tt := range tests {
@@ -146,21 +162,9 @@ func TestGetListenAddrs(t *testing.T) {
 		replaceListenProbes(t, neither, ifaceAddrs, func(*tsshdArgs, netip.Addr) bool { return false })
 		for _, args := range []tsshdArgs{{}, {TCP: true}} {
 			_, err := getListenAddrs(&args)
-			require.ErrorContains(t, err, "listen")
+			require.ErrorContains(t, err, "no address can be listened on")
 		}
 	})
-}
-
-func listenTestPorts(t *testing.T, args *tsshdArgs) ([]udpSocket, int) {
-	conn, port, err := listenOnFreePort(args)
-	require.NoError(t, err)
-	sockets := conn.(*udpFrontendConn).sockets
-	t.Cleanup(func() {
-		for _, socket := range sockets {
-			_ = socket.Close()
-		}
-	})
-	return sockets, port
 }
 
 func skipUnlessWildcardSockets(t *testing.T) {
@@ -173,8 +177,14 @@ func skipUnlessWildcardSockets(t *testing.T) {
 
 func TestUdpListenBothFamiliesOnOnePort(t *testing.T) {
 	skipUnlessWildcardSockets(t)
-	sockets, port := listenTestPorts(t, &tsshdArgs{Port: "31000-65000"})
-	require.Len(t, sockets, 2)
+
+	conn, port, err := listenOnFreePort(&tsshdArgs{Port: "31000-65000"})
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		conn.Close()
+	})
+
+	require.Len(t, conn.(*udpFrontendConn).sockets, 2)
 
 	// Both wildcard addresses are taken on the port.
 	for _, network := range []string{"udp4", "udp6"} {
@@ -214,54 +224,331 @@ func TestUdpListenPortTakenForOneFamily(t *testing.T) {
 	require.NotNil(t, taken, "no port with a free next port")
 	defer func() { _ = taken.Close() }()
 
-	sockets, got := listenTestPorts(t, &tsshdArgs{Port: fmt.Sprintf("%d-%d", port, port+1)})
+	conn, got, err := listenOnFreePortWithRandom(
+		&tsshdArgs{Port: fmt.Sprintf("%d-%d", port, port+1)},
+		func(int) int { return 0 })
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		conn.Close()
+	})
+
 	require.Equal(t, port+1, got)
-	require.Len(t, sockets, 2)
+	require.Len(t, conn.(*udpFrontendConn).sockets, 2)
 	// The IPv4 socket on the taken port was closed.
 	require.True(t, isFree("udp4", port))
 }
 
 func TestServerStartsWithAvailableFamilies(t *testing.T) {
-	oriReplySource, oriCanListen := canSelectReplySource, canListenOnIP
-	replaceListenProbes(t,
-		func(network string) bool { return network == "udp4" && oriReplySource(network) },
-		getInterfaceAddrs(),
-		func(args *tsshdArgs, ip netip.Addr) bool { return ip.Is4() && oriCanListen(args, ip) })
+	tests := []struct {
+		name         string
+		host         string
+		ipv4         bool
+		replyNetwork string
+	}{
+		{
+			name:         "IPv4Only",
+			host:         "127.0.0.1",
+			ipv4:         true,
+			replyNetwork: "udp4",
+		},
+		{
+			name:         "IPv6Only",
+			host:         "::1",
+			ipv4:         false,
+			replyNetwork: "udp6",
+		},
+	}
 
-	for _, tcp := range []bool{false, true} {
-		t.Run(fmt.Sprint("TCP=", tcp), func(t *testing.T) {
-			args := &tsshdArgs{TCP: tcp, Port: "31000-65000", ConnectTimeout: 3 * time.Second}
-			addrs, err := getListenAddrs(args)
-			require.NoError(t, err)
-			for _, addr := range addrs {
-				require.True(t, addr.ip.Is4(), addr.ip)
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			tcpNetwork, udpNetwork := "tcp4", "udp4"
+			loopback := netip.MustParseAddr("127.0.0.1")
+			if !tt.ipv4 {
+				tcpNetwork, udpNetwork = "tcp6", "udp6"
+				loopback = netip.IPv6Loopback()
 			}
-			runProxyEchoTest(t, args, "127.0.0.1", kTsshdProtocol)
 
-			args.IPv6 = true
-			_, _, err = initServer(args)
-			require.ErrorContains(t, err, "listen")
+			tcpProbe, err := net.ListenTCP(tcpNetwork, testTCPAddr(loopback, 0))
+			if err != nil {
+				t.Skipf("%s loopback unavailable: %v", tcpNetwork, err)
+			}
+			require.NoError(t, tcpProbe.Close())
+
+			udpProbe, err := net.ListenUDP(udpNetwork, testUDPAddr(loopback, 0))
+			if err != nil {
+				t.Skipf("%s loopback unavailable: %v", udpNetwork, err)
+			}
+			require.NoError(t, udpProbe.Close())
+
+			oriReplySource, oriCanListen := canSelectReplySource, canListenOnIP
+			replaceListenProbes(t,
+				func(network string) bool {
+					return network == tt.replyNetwork && oriReplySource(network)
+				},
+				getInterfaceAddrs(),
+				func(args *tsshdArgs, ip netip.Addr) bool {
+					return ip.Is4() == tt.ipv4 && oriCanListen(args, ip)
+				})
+
+			for _, tcp := range []bool{false, true} {
+				t.Run(fmt.Sprint("TCP=", tcp), func(t *testing.T) {
+					// Neither address family is explicitly selected.
+					// tsshd must automatically use the available family.
+					args := &tsshdArgs{
+						TCP:            tcp,
+						Port:           "31000-65000",
+						ConnectTimeout: 3 * time.Second,
+					}
+
+					addrs, err := getListenAddrs(args)
+					require.NoError(t, err)
+					require.NotEmpty(t, addrs)
+					for _, addr := range addrs {
+						require.Equal(t, tt.ipv4, addr.ip.Is4(), addr.ip)
+					}
+
+					// The server must actually start and forward data.
+					runProxyEchoTest(t, args, tt.host, kTsshdProtocol)
+
+					// Explicitly selecting the unavailable family must fail.
+					unavailableArgs := &tsshdArgs{
+						TCP:            tcp,
+						IPv4:           !tt.ipv4,
+						IPv6:           tt.ipv4,
+						Port:           "31000-65000",
+						ConnectTimeout: 3 * time.Second,
+					}
+
+					_, _, err = initServer(unavailableArgs)
+					if err == nil {
+						// Avoid leaving a server running if the assertion fails.
+						cleanupOnExit()
+					}
+					require.ErrorContains(t, err, "no address can be listened on")
+				})
+			}
 		})
 	}
 }
 
 func TestTcpListenSkipsPortTakenOnOneAddress(t *testing.T) {
-	taken, err := net.Listen("tcp4", "127.0.0.1:0")
-	require.NoError(t, err)
-	defer func() { _ = taken.Close() }()
-	port := taken.Addr().(*net.TCPAddr).Port
-
-	conn, _, err := listenOnFreePort(&tsshdArgs{TCP: true, IPv4: true, Port: strconv.Itoa(port)})
-	if err == nil {
-		for _, listener := range conn.(*tcpFrontendConn).listenerList {
-			_ = listener.Close()
-		}
+	tests := []struct {
+		name    string
+		network string
+		ip      netip.Addr
+		args    tsshdArgs
+	}{
+		{
+			name:    "IPv4",
+			network: "tcp4",
+			ip:      netip.MustParseAddr("127.0.0.1"),
+			args:    tsshdArgs{TCP: true, IPv4: true},
+		},
+		{
+			name:    "IPv6",
+			network: "tcp6",
+			ip:      netip.IPv6Loopback(),
+			args:    tsshdArgs{TCP: true, IPv6: true},
+		},
 	}
-	require.Error(t, err)
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			taken, err := net.ListenTCP(tt.network, testTCPAddr(tt.ip, 0))
+			if err != nil {
+				t.Skipf("cannot bind %s: %v", tt.ip, err)
+			}
+			defer func() { _ = taken.Close() }()
+
+			port := taken.Addr().(*net.TCPAddr).Port
+			tt.args.Port = strconv.Itoa(port)
+
+			addrs, err := getListenAddrs(&tt.args)
+			require.NoError(t, err)
+
+			probeFound := false
+			specificAddr := tt.ip
+
+			for _, addr := range addrs {
+				for _, ip := range addr.probes {
+					if ip == specificAddr {
+						probeFound = true
+					}
+				}
+			}
+			require.True(t, probeFound, "occupied address %s not included in TCP probes", specificAddr)
+
+			conn, _, err := listenOnFreePort(&tt.args)
+			if conn != nil {
+				conn.Close()
+			}
+			require.Error(t, err)
+		})
+	}
 }
 
 func TestInterfaceAddrsZoneOnlyOnLinkLocal(t *testing.T) {
 	for _, addr := range getInterfaceAddrs() {
 		require.Equal(t, addr.Is6() && addr.IsLinkLocalUnicast(), addr.Zone() != "", addr)
+	}
+}
+
+func TestTcpListenClosesListenersOnPartialFailure(t *testing.T) {
+	// Occupy an IPv6-specific address on an ephemeral port.
+	taken, err := net.ListenTCP("tcp6", testTCPAddr(netip.IPv6Loopback(), 0))
+	if err != nil {
+		t.Skipf("cannot bind IPv6 loopback: %v", err)
+	}
+	defer func() { _ = taken.Close() }()
+
+	port := taken.Addr().(*net.TCPAddr).Port
+
+	// Ensure IPv4 wildcard can bind the same port.
+	probe, err := net.ListenTCP("tcp4", testTCPAddr(netip.IPv4Unspecified(), port))
+	if err != nil {
+		t.Skipf("IPv4 wildcard cannot bind the same port: %v", err)
+	}
+	require.NoError(t, probe.Close())
+
+	addrs := []listenAddr{
+		{ip: netip.IPv4Unspecified()},
+		{ip: netip.MustParseAddr("::1")},
+	}
+
+	// IPv4 listener should be created first, then IPv6 should fail.
+	conn, err := tcpListenOnPort(addrs, port)
+	if conn != nil {
+		conn.Close()
+	}
+	require.Error(t, err)
+	require.Nil(t, conn)
+	var opErr *net.OpError
+	require.ErrorAs(t, err, &opErr)
+	require.Equal(t, "tcp6", opErr.Net)
+
+	// The IPv4 listener created before the IPv6 bind failed must be closed.
+	ipv4, err := net.ListenTCP("tcp4", testTCPAddr(netip.IPv4Unspecified(), port))
+	require.NoError(t, err, "IPv4 TCP listener was not closed after the IPv6 bind failed")
+	_ = ipv4.Close()
+}
+
+func TestUdpListenClosesSocketsOnPartialFailure(t *testing.T) {
+	taken, err := net.ListenUDP("udp6", testUDPAddr(netip.IPv6Unspecified(), 0))
+	if err != nil {
+		t.Skipf("cannot bind IPv6 UDP wildcard: %v", err)
+	}
+	defer func() { _ = taken.Close() }()
+
+	port := taken.LocalAddr().(*net.UDPAddr).Port
+
+	// Ensure IPv4 can bind the same port while IPv6 is occupied.
+	probe, err := net.ListenUDP("udp4", testUDPAddr(netip.IPv4Unspecified(), port))
+	if err != nil {
+		t.Skipf("IPv6 wildcard also prevents IPv4 bind: %v", err)
+	}
+	require.NoError(t, probe.Close())
+
+	addrs := []listenAddr{
+		{ip: netip.IPv4Unspecified()},
+		{ip: netip.IPv6Unspecified()},
+	}
+
+	conn, err := udpListenOnPort(addrs, port)
+	if conn != nil {
+		conn.Close()
+	}
+	require.Error(t, err)
+	require.Nil(t, conn)
+
+	var opErr *net.OpError
+	require.ErrorAs(t, err, &opErr)
+	require.Equal(t, "udp6", opErr.Net)
+
+	// The IPv4 socket created before the IPv6 bind failed must be closed.
+	ipv4, err := net.ListenUDP("udp4", testUDPAddr(netip.IPv4Unspecified(), port))
+	require.NoError(t, err, "IPv4 UDP socket was not closed after the IPv6 bind failed")
+	_ = ipv4.Close()
+}
+
+func TestUdpListenRejectsPortTakenOnSpecificAddress(t *testing.T) {
+	tests := []struct {
+		name         string
+		network      string
+		specificIP   netip.Addr
+		wildcardIP   netip.Addr
+		specificAddr netip.Addr
+		ipv4         bool
+		ipv6         bool
+	}{
+		{
+			name:         "IPv4",
+			network:      "udp4",
+			specificIP:   netip.MustParseAddr("127.0.0.1"),
+			wildcardIP:   netip.IPv4Unspecified(),
+			specificAddr: netip.MustParseAddr("127.0.0.1"),
+			ipv4:         true,
+		},
+		{
+			name:         "IPv6",
+			network:      "udp6",
+			specificIP:   netip.IPv6Loopback(),
+			wildcardIP:   netip.IPv6Unspecified(),
+			specificAddr: netip.MustParseAddr("::1"),
+			ipv6:         true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			// First occupy a specific address on an ephemeral port.
+			specific, err := net.ListenUDP(tt.network, testUDPAddr(tt.specificIP, 0))
+			if err != nil {
+				t.Skipf("cannot bind %s: %v", tt.specificAddr, err)
+			}
+			defer func() { _ = specific.Close() }()
+
+			port := specific.LocalAddr().(*net.UDPAddr).Port
+
+			// Binding the wildcard address to the same port must fail.
+			wildcard, wildcardErr := net.ListenUDP(tt.network, testUDPAddr(tt.wildcardIP, port))
+			if wildcard != nil {
+				_ = wildcard.Close()
+			}
+
+			if runtime.GOOS != "windows" {
+				require.ErrorIs(t, wildcardErr, syscall.EADDRINUSE, "wildcard UDP socket should conflict with the specific address")
+			}
+
+			args := &tsshdArgs{
+				IPv4: tt.ipv4,
+				IPv6: tt.ipv6,
+				Port: strconv.Itoa(port),
+			}
+
+			// Verify that tsshd's listen plan actually covers the occupied
+			// address, either through a wildcard socket or a specific socket.
+			addrs, err := getListenAddrs(args)
+			require.NoError(t, err)
+			require.NotEmpty(t, addrs)
+
+			coversSpecificAddr := false
+			for _, addr := range addrs {
+				require.Equal(t, tt.specificAddr.Is4(), addr.ip.Is4(), "unexpected address family in listen plan: %s", addr.ip)
+
+				if addr.ip.IsUnspecified() || addr.ip == tt.specificAddr {
+					coversSpecificAddr = true
+				}
+			}
+			require.True(t, coversSpecificAddr, "listen plan does not cover occupied address %s: %+v", tt.specificAddr, addrs)
+
+			// tsshd must not select the occupied port.
+			conn, gotPort, err := listenOnFreePort(args)
+			if conn != nil {
+				conn.Close()
+			}
+			require.Error(t, err)
+			require.Nil(t, conn)
+			require.Zero(t, gotPort)
+		})
 	}
 }

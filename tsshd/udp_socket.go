@@ -70,7 +70,8 @@ func (s *plainSocket) Close() error {
 // canSelectReplySource reports whether a wildcard socket of network can choose
 // the reply source. It is a variable for tests.
 var canSelectReplySource = func(network string) bool {
-	if !replySourceSupported(network == "udp6") {
+	ipv6 := network == "udp6"
+	if !replySourceSupported(ipv6) {
 		return false
 	}
 	conn, err := net.ListenUDP(network, nil)
@@ -78,12 +79,13 @@ var canSelectReplySource = func(network string) bool {
 		return false
 	}
 	defer func() { _ = conn.Close() }()
-	_, err = newPktInfoSocket(conn)
+	_, err = newPktInfoSocket(conn, ipv6)
 	return err == nil
 }
 
 // listenUdpSocket opens a socket on addr. With replySource, addr must be a wildcard.
 func listenUdpSocket(addr netip.Addr, port int, replySource bool) (udpSocket, error) {
+	addr = addr.Unmap()
 	conn, err := net.ListenUDP(ipNetwork("udp", addr), net.UDPAddrFromAddrPort(netip.AddrPortFrom(addr, uint16(port))))
 	if err != nil {
 		return nil, err
@@ -96,7 +98,7 @@ func listenUdpSocket(addr netip.Addr, port int, replySource bool) (udpSocket, er
 	if !replySource {
 		return &plainSocket{conn, addr}, nil
 	}
-	sock, err := newPktInfoSocket(conn)
+	sock, err := newPktInfoSocket(conn, addr.Is6())
 	if err != nil {
 		_ = conn.Close()
 		return nil, err

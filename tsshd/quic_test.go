@@ -31,6 +31,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"net/netip"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -83,11 +84,7 @@ func (c *udpPacketConn) SetWriteBuffer(bytes int) error {
 func listenRandomUDP(t *testing.T) *udpPacketConn {
 	const addr = "127.0.0.1:0"
 
-	udpAddr, err := net.ResolveUDPAddr("udp", addr)
-	if err != nil {
-		t.Fatalf("failed to resolve UDP address %q: %v", addr, err)
-	}
-
+	udpAddr := net.UDPAddrFromAddrPort(netip.MustParseAddrPort(addr))
 	conn, err := net.ListenUDP("udp", udpAddr)
 	if err != nil {
 		t.Fatalf("failed to listen on UDP address %q: %v", addr, err)
