@@ -32,7 +32,6 @@ import (
 	"fmt"
 	"io"
 	"net"
-	"os"
 	"strconv"
 	"strings"
 	"sync"
@@ -91,6 +90,7 @@ func (m *echoServer) handleStream(stream Stream) {
 
 func runStreamEchoTest(t *testing.T, stream Stream) {
 	for size := 1; size <= 2000; size += 3 {
+		_ = stream.SetDeadline(time.Now().Add(2 * time.Second))
 
 		send := make([]byte, size)
 		for i := range send {
@@ -115,12 +115,13 @@ func runStreamEchoTest(t *testing.T, stream Stream) {
 	}
 }
 
-func runProxyEchoTest(t *testing.T, args *tsshdArgs, protoVersion int) {
+// startProxyEchoServer starts an echo server for the test.
+func startProxyEchoServer(t *testing.T, args *tsshdArgs) *ServerInfo {
 	oriNew := newSshUdpServer
-	defer func() {
+	t.Cleanup(func() {
 		newSshUdpServer = oriNew
 		cleanupOnExit()
-	}()
+	})
 
 	server := &echoServer{t}
 	newSshUdpServer = func(args *tsshdArgs, proxy *serverProxy, addr net.Addr, proto protocolServer) streamHandler {
@@ -136,14 +137,25 @@ func runProxyEchoTest(t *testing.T, args *tsshdArgs, protoVersion int) {
 	if err := json.Unmarshal([]byte(output), &info); err != nil {
 		t.Fatalf("json unmarshal failed: %v", err)
 	}
+	return &info
+}
 
-	opts := &UdpClientOptions{
-		TsshdAddr:        net.JoinHostPort("127.0.0.1", strconv.Itoa(info.Port)),
-		ServerInfo:       &info,
+func newProxyEchoOptions(args *tsshdArgs, info *ServerInfo, host string) *UdpClientOptions {
+	return &UdpClientOptions{
+		TsshdAddr:        net.JoinHostPort(host, strconv.Itoa(info.Port)),
+		ServerInfo:       info,
 		ConnectTimeout:   args.ConnectTimeout,
 		HeartbeatTimeout: 3 * time.Second,
 	}
+}
 
+func runProxyEchoTest(t *testing.T, args *tsshdArgs, host string, protoVersion int) {
+	info := startProxyEchoServer(t, args)
+	runProxyEchoClients(t, args, newProxyEchoOptions(args, info, host), protoVersion, nil)
+}
+
+// runProxyEchoClients runs the echo test before and after a second renewTransportPath.
+func runProxyEchoClients(t *testing.T, args *tsshdArgs, opts *UdpClientOptions, protoVersion int, beforeRenew func(*clientProxy)) {
 	clientCount := 1
 	if args.Attachable {
 		clientCount = 3
@@ -192,6 +204,9 @@ func runProxyEchoTest(t *testing.T, args *tsshdArgs, protoVersion int) {
 
 			runStreamEchoTest(t, stream)
 
+			if beforeRenew != nil {
+				beforeRenew(proxy)
+			}
 			ctx, cancel = context.WithTimeout(context.Background(), opts.ConnectTimeout)
 			err = proxy.renewTransportPath(ctx, nil)
 			cancel()
@@ -233,30 +248,47 @@ func TestProxy(t *testing.T) {
 				ConnectTimeout: 3 * time.Second,
 			}
 
-			t.Run("ListenAll", func(t *testing.T) {
-				_ = os.Unsetenv("SSH_CONNECTION")
-				if v := os.Getenv("SSH_CONNECTION"); v != "" {
-					t.Fatalf("SSH_CONNECTION should be unset, got %q", v)
-				}
+			for _, host := range []string{"127.0.0.1", "::1", "localhost"} {
+				t.Run(host, func(t *testing.T) {
+					skipUnlessUsableHost(t, host)
+					runProxyEchoTest(t, args, host, kTsshdProtocol)
+				})
+			}
 
-				runProxyEchoTest(t, args, kTsshdProtocol)
+			// trzsz/trzsz-ssh#258: IPv6 SSH login, IPv4 client.
+			t.Run("IPv6SshConnection", func(t *testing.T) {
+				t.Setenv("SSH_CONNECTION", "::1 50818 ::1 22")
+				info := startProxyEchoServer(t, args)
+				opts := newProxyEchoOptions(args, info, "127.0.0.1")
+				opts.IPv4 = true
+				runProxyEchoClients(t, args, opts, kTsshdProtocol, nil)
 			})
 
-			t.Run("ListenOne", func(t *testing.T) {
-				const mockSshConn = "127.0.0.1 50818 127.0.0.1 22"
-				t.Setenv("SSH_CONNECTION", mockSshConn)
-				if v := os.Getenv("SSH_CONNECTION"); v != mockSshConn {
-					t.Fatalf("SSH_CONNECTION mismatch: want %q, got %q", mockSshConn, v)
-				}
+			t.Run("FirstContactAfterConnectTimeout", func(t *testing.T) {
+				idleArgs := *args
+				idleArgs.ConnectTimeout = 300 * time.Millisecond
+				info := startProxyEchoServer(t, &idleArgs)
+				time.Sleep(2 * idleArgs.ConnectTimeout)
+				runProxyEchoClients(t, &idleArgs, newProxyEchoOptions(args, info, "127.0.0.1"), kTsshdProtocol, nil)
+			})
 
-				runProxyEchoTest(t, args, kTsshdProtocol)
+			t.Run("MoveToOtherFamily", func(t *testing.T) {
+				skipUnlessBindable(t, "::1")
+				info := startProxyEchoServer(t, args)
+				network := "udp6"
+				if tt.tcp {
+					network = "tcp6"
+				}
+				runProxyEchoClients(t, args, newProxyEchoOptions(args, info, "127.0.0.1"), kTsshdProtocol, func(proxy *clientProxy) {
+					proxy.networks = []string{network}
+					proxy.serverAddr = net.JoinHostPort("::1", strconv.Itoa(info.Port))
+				})
 			})
 
 			// Clients older than protocol version 3 neither announce their
 			// version nor use directional KCP keys, and must keep working.
 			t.Run("LegacyClient", func(t *testing.T) {
-				_ = os.Unsetenv("SSH_CONNECTION")
-				runProxyEchoTest(t, args, 2)
+				runProxyEchoTest(t, args, "127.0.0.1", 2)
 			})
 		})
 	}
@@ -316,7 +348,7 @@ func TestProxy_ClientRejectsServerID(t *testing.T) {
 	for _, version := range []int{2, 3} {
 		info := &ServerInfo{ProtoVer: version, ClientID: 23, ServerID: 23, ProxyKey: strings.Repeat("00", 32)}
 		client, err := NewSshUdpClient(&UdpClientOptions{ServerInfo: info, ConnectTimeout: 100 * time.Millisecond})
-		require.EqualError(t, err, "client ID must differ from server ID")
+		require.ErrorContains(t, err, "client ID must differ from server ID")
 		require.Nil(t, client)
 	}
 }
@@ -339,7 +371,7 @@ func TestProxy_ClientHello(t *testing.T) {
 		proxy, err := startClientProxy(&SshUdpClient{protoVersion: protoVersion}, opts)
 		require.NoError(t, err)
 		t.Cleanup(func() { _ = proxy.Close() })
-		proxy.serialNumber = 1
+		proxy.serialNumber.Store(1)
 		return proxy
 	}
 
@@ -527,6 +559,16 @@ func (c *queueFrontend) readFrom(buf []byte) (int, *clientState) {
 
 func (c *queueFrontend) writeTo(buf []byte, client *clientState) error { return nil }
 
+func (c *queueFrontend) addClientMap(*clientState) {}
+
+func (c *queueFrontend) delClientMap(*clientState, *udpPath) {}
+
+func (c *queueFrontend) addAuthedMap(*clientState) {}
+
+func (c *queueFrontend) delAuthedMap(*clientState, *udpPath) {}
+
+func (c *queueFrontend) Close() {}
+
 // Datagrams that the KCP listener does not accept must not make the client
 // look alive, in particular the replayed packets since protocol version 3.
 func TestProxy_KcpClientAliveCheck(t *testing.T) {
@@ -586,4 +628,26 @@ func TestProxy_KcpClientAliveCheck(t *testing.T) {
 	require.NoError(t, listener.SetReadDeadline(time.Now()))
 	_, err = listener.AcceptKCP()
 	require.Error(t, err, "KCP session created by the test packets")
+}
+
+// skipUnlessUsableHost skips ::1 without IPv6 and localhost without both families.
+func skipUnlessUsableHost(t *testing.T, host string) {
+	t.Helper()
+	if host == "127.0.0.1" {
+		return
+	}
+	skipUnlessBindable(t, "::1")
+	if host == "localhost" {
+		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		defer cancel()
+		ips, err := net.DefaultResolver.LookupNetIP(ctx, "ip", host)
+		var has4, has6 bool
+		for _, ip := range ips {
+			has4 = has4 || ip.Unmap().Is4()
+			has6 = has6 || !ip.Unmap().Is4()
+		}
+		if !has4 || !has6 {
+			t.Skipf("%s is not dual-stack: %v, %v", host, ips, err)
+		}
+	}
 }

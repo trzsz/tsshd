@@ -48,7 +48,7 @@ var enableWarningLogging atomic.Bool
 var clientDebugFn atomic.Pointer[func(int64, string)]
 var clientWarningFn atomic.Pointer[func(string)]
 
-var debugMsgChan chan *debugMessage
+var debugMsgChan chan debugMessage
 var initDebugSenderOnce sync.Once
 
 var warningMsgChan chan string
@@ -135,7 +135,7 @@ func debug(format string, a ...any) {
 	}
 
 	initDebugSenderOnce.Do(func() {
-		debugMsgChan = make(chan *debugMessage, 100)
+		debugMsgChan = make(chan debugMessage, 100)
 		busClosingWG.Go(func() {
 			for msg := range debugMsgChan {
 				server := activeSshUdpServer.Load()
@@ -153,7 +153,7 @@ func debug(format string, a ...any) {
 
 	now := time.Now()
 	writeDebugLog(&now, msg)
-	dbgMsg := &debugMessage{Msg: msg, Time: now.UnixMilli()}
+	dbgMsg := debugMessage{Msg: msg, Time: now.UnixMilli()}
 
 	busClosingMu.Lock()
 	defer busClosingMu.Unlock()
@@ -634,4 +634,39 @@ func findLeafProcesses(procs map[int]*procInfo) []*procInfo {
 	}
 
 	return leaves
+}
+
+type joinedError struct {
+	errs []error
+}
+
+func (e *joinedError) Error() string {
+	msgs := make([]string, 0, len(e.errs))
+	for _, err := range e.errs {
+		if err != nil {
+			msgs = append(msgs, err.Error())
+		}
+	}
+	return strings.Join(msgs, "; ")
+}
+
+func (e *joinedError) Unwrap() []error {
+	return e.errs
+}
+
+func joinErrors(errs ...error) error {
+	filtered := make([]error, 0, len(errs))
+	for _, err := range errs {
+		if err != nil {
+			filtered = append(filtered, err)
+		}
+	}
+	switch len(filtered) {
+	case 0:
+		return nil
+	case 1:
+		return filtered[0]
+	default:
+		return &joinedError{errs: filtered}
+	}
 }

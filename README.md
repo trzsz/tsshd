@@ -56,6 +56,8 @@ tssh and tsshd works exactly like ssh, there are no plans to support local echo 
 
 - The `tsshd` process listens on a random UDP port in the range 61001–61999 (configurable via `TsshdPort`), and sends the port number and session secret keys back to the `tssh` process through the SSH channel. The SSH connection is then closed, and `tssh` communicates with `tsshd` over UDP.
 
+- The `tsshd` process listens on that port on all local IPv4 and IPv6 addresses (`--ipv4` or `--ipv6` limits it to one family) until it exits, so firewalls need to allow the port for both address families. On Windows, and for IPv4 on FreeBSD, it listens on each interface address present when it starts. Unless an address family is forced, `tssh` tries IPv4 and IPv6 at the same time on every connect and reconnect, and uses the first one that `tsshd` answers on. With a `ProxyCommand`, the command picks the address family instead.
+
 ### Installation
 
 - Install with apt on Ubuntu
@@ -428,7 +430,6 @@ When Wish receives a request from the client to start `tsshd`, you can use `exec
 
 1.  **Instruction Detection**: Capture the client's request to execute `tsshd` within the Wish middleware.
 2.  **Secondary Launch**: Start a sub-process locally on the server (running the current program in `tsshd` mode).
-3.  **Environment Inheritance**: Pass current connection info (like `SSH_CONNECTION`) to the sub-process.
 
 #### C. Why Choose This Architecture?
 

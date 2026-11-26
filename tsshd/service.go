@@ -33,11 +33,13 @@ import (
 	"crypto/x509"
 	"encoding/json"
 	"encoding/pem"
+	"errors"
 	"fmt"
 	"io"
 	"math/big"
 	math_rand "math/rand"
 	"net"
+	"net/netip"
 	"os"
 	"strconv"
 	"strings"
@@ -242,13 +244,15 @@ func parsePortRanges(tsshdPort string) [][2]uint16 {
 	return ranges
 }
 
-func canListenOnIP(args *tsshdArgs, udpAddr *net.UDPAddr) bool {
+// canListenOnIP is a variable for tests.
+var canListenOnIP = func(args *tsshdArgs, ip netip.Addr) bool {
 	var err error
 	var conn io.Closer
+	addr := netip.AddrPortFrom(ip, 0)
 	if args.TCP {
-		conn, err = net.ListenTCP("tcp", &net.TCPAddr{IP: udpAddr.IP, Zone: udpAddr.Zone})
+		conn, err = net.ListenTCP(ipNetwork("tcp", ip), net.TCPAddrFromAddrPort(addr))
 	} else {
-		conn, err = net.ListenUDP("udp", udpAddr)
+		conn, err = net.ListenUDP(ipNetwork("udp", ip), net.UDPAddrFromAddrPort(addr))
 	}
 	if err != nil {
 		return false
@@ -257,78 +261,122 @@ func canListenOnIP(args *tsshdArgs, udpAddr *net.UDPAddr) bool {
 	return true
 }
 
-func getUdpAddrs(args *tsshdArgs) ([]*net.UDPAddr, error) {
-	if sshConnection := os.Getenv("SSH_CONNECTION"); sshConnection != "" {
-		if tokens := strings.Fields(sshConnection); len(tokens) >= 3 {
-			ip := tokens[2]
-			if strings.HasPrefix(strings.ToLower(ip), "::ffff:") {
-				ip = ip[7:]
-			}
-			var addr string
-			if !strings.HasPrefix(ip, "[") && strings.ContainsRune(ip, ':') {
-				addr = fmt.Sprintf("[%s]:0", ip)
-			} else {
-				addr = fmt.Sprintf("%s:0", ip)
-			}
-			udpAddr, err := net.ResolveUDPAddr("udp", addr)
-			if err == nil && canListenOnIP(args, udpAddr) {
-				return []*net.UDPAddr{udpAddr}, nil
-			}
-		}
-	}
+// getInterfaceAddrs returns all interface addresses. Only link-local ones get a
+// zone, because Windows can't bind ::1 with one. It is a variable for tests.
+var getInterfaceAddrs = func() []netip.Addr {
+	var ips []netip.Addr
 
-	var udpAddrs []*net.UDPAddr
-	ipv4Only := args.IPv4 && !args.IPv6
-	ipv6Only := !args.IPv4 && args.IPv6
-	addListenableAddr := func(ip net.IP, zone string) {
-		if ip.To4() != nil { // ipv4
-			if ipv6Only {
-				return
-			}
-			udpAddr := &net.UDPAddr{IP: ip}
-			if canListenOnIP(args, udpAddr) {
-				udpAddrs = append(udpAddrs, udpAddr)
-			}
-		} else if ip.To16() != nil { // ipv6
-			if ipv4Only {
-				return
-			}
-			udpAddr := &net.UDPAddr{IP: ip, Zone: zone}
-			if canListenOnIP(args, udpAddr) {
-				udpAddrs = append(udpAddrs, udpAddr)
-			}
+	addAddr := func(addr netip.Addr, zone string) {
+		if !addr.IsValid() {
+			return
 		}
+		addr = addr.Unmap()
+		if addr.Is6() && addr.IsLinkLocalUnicast() {
+			addr = addr.WithZone(zone)
+		}
+		ips = append(ips, addr)
 	}
 
 	ifaces, err := net.Interfaces()
-	if err == nil {
-		for _, iface := range ifaces {
-			addrs, err := iface.Addrs()
-			if err == nil {
-				for _, addr := range addrs {
-					switch v := addr.(type) {
-					case *net.IPNet:
-						addListenableAddr(v.IP, iface.Name)
-					case *net.IPAddr:
-						addListenableAddr(v.IP, iface.Name)
-					}
+	if err != nil {
+		return ips
+	}
+
+	for _, iface := range ifaces {
+		addrs, err := iface.Addrs()
+		if err != nil {
+			continue
+		}
+
+		for _, addr := range addrs {
+			switch v := addr.(type) {
+			case *net.IPNet:
+				if ip, ok := netip.AddrFromSlice(v.IP); ok {
+					addAddr(ip, iface.Name)
+				}
+			case *net.IPAddr:
+				if ip, ok := netip.AddrFromSlice(v.IP); ok {
+					addAddr(ip, iface.Name)
 				}
 			}
 		}
 	}
 
-	if len(udpAddrs) == 0 {
-		udpAddr, err := net.ResolveUDPAddr("udp", ":0")
-		if err != nil {
-			return nil, err
-		}
-		return []*net.UDPAddr{udpAddr}, nil
+	return ips
+}
+
+// ipNetwork returns "udp4", "udp6", "tcp4" or "tcp6".
+func ipNetwork(network string, ip netip.Addr) string {
+	if ip.Is4() {
+		return network + "4"
+	}
+	return network + "6"
+}
+
+type listenAddr struct {
+	ip netip.Addr
+	// Set for a wildcard UDP socket that replies from the contacted address.
+	replySource bool
+	// Interface addresses to test on the port before a wildcard TCP listen.
+	// On macOS and BSD the wildcard listen succeeds even when another process
+	// holds one of them on that port, and that process gets its connections.
+	probes []netip.Addr
+}
+
+func getListenAddrs(args *tsshdArgs) ([]listenAddr, error) {
+	var addrs []listenAddr
+	ipv4Only := args.IPv4 && !args.IPv6
+	ipv6Only := !args.IPv4 && args.IPv6
+	if !ipv6Only {
+		addrs = append(addrs, getFamilyListenAddrs(args, netip.IPv4Unspecified())...)
+	}
+	if !ipv4Only {
+		addrs = append(addrs, getFamilyListenAddrs(args, netip.IPv6Unspecified())...)
+	}
+	if len(addrs) == 0 {
+		return nil, errors.New("no address can be listened on")
+	}
+	return addrs, nil
+}
+
+func getFamilyListenAddrs(args *tsshdArgs, wildcard netip.Addr) []listenAddr {
+	if !args.TCP && canSelectReplySource(ipNetwork("udp", wildcard)) {
+		return []listenAddr{{ip: wildcard, replySource: true}}
 	}
 
-	return udpAddrs, nil
+	var ips []netip.Addr
+	for _, ip := range getInterfaceAddrs() {
+		if ip.Is4() == wildcard.Is4() && canListenOnIP(args, ip) {
+			ips = append(ips, ip)
+		}
+	}
+
+	// TCP replies always come from the address the client connected to. UDP
+	// replies don't, so without a way to choose the source address, UDP
+	// listens on each address.
+	if !args.TCP && len(ips) > 0 {
+		addrs := make([]listenAddr, 0, len(ips))
+		for _, ip := range ips {
+			addrs = append(addrs, listenAddr{ip: ip})
+		}
+		return addrs
+	}
+
+	if canListenOnIP(args, wildcard) {
+		addr := listenAddr{ip: wildcard}
+		if args.TCP {
+			addr.probes = ips
+		}
+		return []listenAddr{addr}
+	}
+	return nil
 }
 
 func listenOnFreePort(args *tsshdArgs) (frontendConnection, int, error) {
+	return listenOnFreePortWithRandom(args, math_rand.Intn)
+}
+
+func listenOnFreePortWithRandom(args *tsshdArgs, randomIntn func(int) int) (frontendConnection, int, error) {
 	tsshdPort := args.Port
 	if tsshdPort == "" {
 		tsshdPort = kDefaultPortRange
@@ -343,16 +391,16 @@ func listenOnFreePort(args *tsshdArgs) (frontendConnection, int, error) {
 		})
 	}
 
-	addrs, err := getUdpAddrs(args)
+	addrs, err := getListenAddrs(args)
 	if err != nil {
-		return nil, 0, fmt.Errorf("get available udp address failed: %v", err)
+		return nil, 0, fmt.Errorf("get available listen address failed: %v", err)
 	}
 
 	var lastErr error
 	for _, portRange := range portRanges {
 		portRangeLow, portRangeHigh := int(portRange[0]), int(portRange[1])
 		size := portRangeHigh - portRangeLow + 1
-		port := portRangeLow + math_rand.Intn(size)
+		port := portRangeLow + randomIntn(size)
 		for range size {
 			var conn frontendConnection
 			if args.TCP {
@@ -372,33 +420,32 @@ func listenOnFreePort(args *tsshdArgs) (frontendConnection, int, error) {
 	}
 
 	if lastErr != nil {
-		return nil, 0, fmt.Errorf("listen udp on [%s] failed: %v", tsshdPort, lastErr)
+		return nil, 0, fmt.Errorf("listen on [%s] failed: %v", tsshdPort, lastErr)
 	}
-	return nil, 0, fmt.Errorf("listen udp on [%s] failed", tsshdPort)
+	return nil, 0, fmt.Errorf("listen on [%s] failed", tsshdPort)
 }
 
-func udpListenOnPort(addrs []*net.UDPAddr, port int) (_ frontendConnection, err error) {
-	var connList []*net.UDPConn
+func udpListenOnPort(addrs []listenAddr, port int) (_ frontendConnection, err error) {
+	var sockets []udpSocket
 	defer func() {
 		if err != nil {
-			for _, conn := range connList {
-				_ = conn.Close()
+			for _, socket := range sockets {
+				_ = socket.Close()
 			}
 		}
 	}()
 	for _, addr := range addrs {
-		addr.Port = port
-		var conn *net.UDPConn
-		conn, err = net.ListenUDP("udp", addr)
+		var socket udpSocket
+		socket, err = listenUdpSocket(addr.ip, port, addr.replySource)
 		if err != nil {
 			return nil, err
 		}
-		connList = append(connList, conn)
+		sockets = append(sockets, socket)
 	}
-	return &udpFrontendConn{connList: connList}, nil
+	return &udpFrontendConn{sockets: sockets}, nil
 }
 
-func tcpListenOnPort(addrs []*net.UDPAddr, port int) (_ frontendConnection, err error) {
+func tcpListenOnPort(addrs []listenAddr, port int) (_ frontendConnection, err error) {
 	var listenerList []*net.TCPListener
 	defer func() {
 		if err != nil {
@@ -408,8 +455,16 @@ func tcpListenOnPort(addrs []*net.UDPAddr, port int) (_ frontendConnection, err 
 		}
 	}()
 	for _, addr := range addrs {
+		for _, ip := range addr.probes {
+			var probe *net.TCPListener
+			probe, err = net.ListenTCP(ipNetwork("tcp", ip), net.TCPAddrFromAddrPort(netip.AddrPortFrom(ip, uint16(port))))
+			if err != nil {
+				return nil, err
+			}
+			_ = probe.Close()
+		}
 		var listener *net.TCPListener
-		listener, err = net.ListenTCP("tcp", &net.TCPAddr{IP: addr.IP, Port: port, Zone: addr.Zone})
+		listener, err = net.ListenTCP(ipNetwork("tcp", addr.ip), net.TCPAddrFromAddrPort(netip.AddrPortFrom(addr.ip, uint16(port))))
 		if err != nil {
 			return nil, err
 		}
