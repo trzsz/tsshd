@@ -42,7 +42,7 @@ clean:
 
 test: EXAMPLE_OUT_DIR := ${NULL_DEVICE}
 test: ${EXAMPLE_DIRS}
-	${GO_TEST} -v -count=1 ./...
+	${GO_TEST} -p 1 -v -count=1 ./...
 
 examples: ${EXAMPLE_DIRS}
 $(EXAMPLE_DIRS):

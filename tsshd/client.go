@@ -182,29 +182,23 @@ func NewSshUdpClient(opts *UdpClientOptions) (udpClient *SshUdpClient, err error
 
 	udpClient.clientProxy, err = startClientProxy(udpClient, opts)
 	if err != nil {
+		err = fmt.Errorf("start client proxy failed: %w", err)
 		return
 	}
 
 	beginTime := time.Now()
 	err = udpClient.clientProxy.renewTransportPath(ctx, opts.ProxyClient)
 	if err != nil {
-		if opts.ConnectTimeout > 2*time.Second && time.Since(beginTime) > (opts.ConnectTimeout-time.Second) {
-			net := "UDP"
-			if opts.ServerInfo.ProxyMode == kProxyModeTCP {
-				net = "TCP"
-			}
-			port := opts.TsshdAddr
-			if pos := strings.LastIndex(opts.TsshdAddr, ":"); pos >= 0 {
-				port = opts.TsshdAddr[pos+1:]
-			}
-			err = fmt.Errorf("%w\r\n%s", err, fmt.Sprintf(
-				"\033[0;36mHint:\033[0m This may be caused by a firewall blocking the %s port (%s) that tsshd is listening on.", net, port))
+		if errors.Is(ctx.Err(), context.DeadlineExceeded) ||
+			opts.ConnectTimeout > 2*time.Second && time.Since(beginTime) > (opts.ConnectTimeout-time.Second) {
+			err = addTransportHint(err, opts)
 		}
 		return
 	}
 
 	udpClient.protoClient, err = newProtoClient(ctx, opts, udpClient)
 	if err != nil {
+		err = fmt.Errorf("initialize protocol client failed: %w", err)
 		return
 	}
 
@@ -226,10 +220,26 @@ func NewSshUdpClient(opts *UdpClientOptions) (udpClient *SshUdpClient, err error
 	udpClient.activeChecker.onTimeout(udpClient.tryToReconnect)
 
 	if err = udpClient.initBusStream(ctx, opts); err != nil {
+		err = fmt.Errorf("initialize bus stream failed: %w", err)
 		return
 	}
 
 	return
+}
+
+func addTransportHint(err error, opts *UdpClientOptions) error {
+	net := "UDP"
+	if opts.ServerInfo.ProxyMode == kProxyModeTCP {
+		net = "TCP"
+	}
+
+	port := opts.TsshdAddr
+	if pos := strings.LastIndex(opts.TsshdAddr, ":"); pos >= 0 {
+		port = opts.TsshdAddr[pos+1:]
+	}
+
+	return fmt.Errorf("%w\r\n%s", err, fmt.Sprintf(
+		"\033[0;36mHint:\033[0m This may be caused by a firewall blocking the %s port (%s) that tsshd is listening on.", net, port))
 }
 
 func (c *SshUdpClient) initBusStream(ctx context.Context, opts *UdpClientOptions) error {
@@ -308,8 +318,8 @@ func (c *SshUdpClient) Close() (err error) {
 
 	detached := c.detached.Load()
 	if detached && c.clientProxy != nil {
-		// On detach, close the proxy first to sever the transport before
-		// local protocol cleanup, preserving the remote session.
+		// On detach, close the proxy first to tear down the transport.
+		// This prevents the subsequent cleanup from terminating the remote session.
 		_ = c.clientProxy.Close()
 	}
 
@@ -455,7 +465,7 @@ func (c *SshUdpClient) dialContext(network, addr string, ctx context.Context) (S
 		if deadline, ok := ctx.Deadline(); ok {
 			timeout = time.Until(deadline)
 			if timeout <= 0 {
-				return errors.New("context deadline exceeded")
+				return context.DeadlineExceeded
 			}
 		}
 
@@ -511,7 +521,7 @@ func (c *SshUdpClient) dialUDP(network, addr string, ctx context.Context, datagr
 		if deadline, ok := ctx.Deadline(); ok {
 			timeout = time.Until(deadline)
 			if timeout <= 0 {
-				return errors.New("context deadline exceeded")
+				return context.DeadlineExceeded
 			}
 		}
 
