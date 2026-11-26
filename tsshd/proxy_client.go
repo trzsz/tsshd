@@ -863,12 +863,14 @@ func startClientProxy(client *SshUdpClient, opts *UdpClientOptions) (*clientProx
 	}
 
 	clientID := opts.ServerInfo.ClientID
-	for clientID == 0 {
-		buf := make([]byte, 8)
-		if _, err := crypto_rand.Read(buf); err != nil {
+	switch clientID {
+	case 0:
+		clientID, err = randomProxyID(opts.ServerInfo.ServerID)
+		if err != nil {
 			return nil, fmt.Errorf("rand client id failed: %w", err)
 		}
-		clientID = binary.BigEndian.Uint64(buf)
+	case opts.ServerInfo.ServerID:
+		return nil, errors.New("client ID must differ from server ID")
 	}
 
 	clientNonce := make([]byte, kClientNonceSize)

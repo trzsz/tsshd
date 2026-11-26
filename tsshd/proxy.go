@@ -51,6 +51,19 @@ func setDSCP(conn net.Conn, dscp int) {
 	_ = ipv6.NewConn(conn).SetTrafficClass(dscp)
 }
 
+func randomProxyID(excludedID uint64) (uint64, error) {
+	var buf [8]byte
+	for {
+		if _, err := crypto_rand.Read(buf[:]); err != nil {
+			return 0, err
+		}
+		id := binary.BigEndian.Uint64(buf[:])
+		if id != 0 && id != excludedID {
+			return id, nil
+		}
+	}
+}
+
 func aesEncrypt(cipherBlock *cipher.Block, buf []byte) []byte {
 	gcm, err := cipher.NewGCM(*cipherBlock)
 	if err != nil {

@@ -27,6 +27,7 @@ package tsshd
 import (
 	"bytes"
 	"context"
+	"encoding/binary"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -298,6 +299,159 @@ type idleFrontend struct {
 }
 
 func (c *idleFrontend) start(proxy *serverProxy) {}
+
+func TestProxy_RejectsReflectedAuthPacket(t *testing.T) {
+	modes := []struct {
+		name       string
+		attachable bool
+	}{
+		{"Attachable", true},
+		{"NonAttachable", false},
+	}
+
+	for _, mode := range modes {
+		t.Run(mode.name, func(t *testing.T) {
+			info := &ServerInfo{}
+			server, err := startServerProxy(
+				&tsshdArgs{
+					Attachable: mode.attachable,
+					Socket:     true,
+				},
+				info,
+				&idleFrontend{},
+			)
+			require.NoError(t, err)
+			require.NotZero(t, info.ClientID)
+			require.NotZero(t, info.ServerID)
+			require.NotEqual(t, info.ClientID, info.ServerID)
+
+			// Build an encrypted client authentication packet.
+			makeAuthPacket := func(clientID, serialNumber uint64, protoVersion int) []byte {
+				data := make([]byte, 16)
+				if protoVersion >= 3 {
+					data = make([]byte, 20+kClientNonceSize)
+					binary.BigEndian.PutUint32(data[16:20], uint32(protoVersion))
+				}
+
+				binary.BigEndian.PutUint64(data[0:8], clientID)
+				binary.BigEndian.PutUint64(data[8:16], serialNumber)
+
+				return aesEncrypt(server.cipherBlock, data)
+			}
+
+			// A server-generated acknowledgment must never be accepted
+			// as a client authentication packet.
+			acknowledgments := []struct {
+				name  string
+				hello *clientHello
+				size  int
+			}{
+				{
+					name:  "Legacy",
+					hello: &clientHello{},
+					size:  16,
+				},
+				{
+					name: "Current",
+					hello: &clientHello{
+						protoVersion: kTsshdProtocol,
+						clientNonce:  make([]byte, kClientNonceSize),
+					},
+					size: 16 + kClientNonceSize,
+				},
+			}
+
+			for _, ackCase := range acknowledgments {
+				t.Run("ReflectedACK/"+ackCase.name, func(t *testing.T) {
+					ack, err := server.sealAuthPacket(1, ackCase.hello)
+					require.NoError(t, err)
+
+					// Ensure the acknowledgment was successfully decrypted
+					// and has the expected plaintext length.
+					data := aesDecrypt(server.cipherBlock, ack)
+					require.Len(t, data, ackCase.size)
+					require.Equal(t, info.ServerID, binary.BigEndian.Uint64(data[:8]))
+
+					accepted, _, _, _ := server.openAuthPacket(ack)
+					require.False(t, accepted, "server-generated %s acknowledgment must not authenticate a client", ackCase.name)
+				})
+			}
+
+			// Test valid-length client authentication packets separately.
+			// The server ID must never be accepted, regardless of protocol
+			// version or attachment mode.
+			protocolVersions := []int{2, 3}
+			if kTsshdProtocol != 3 {
+				protocolVersions = append(protocolVersions, kTsshdProtocol)
+			}
+			protocolVersions = append(protocolVersions, kTsshdProtocol+1)
+			for _, protoVersion := range protocolVersions {
+				t.Run(fmt.Sprintf("ClientIDCheck/Proto%d", protoVersion), func(t *testing.T) {
+					accepted, _, _, _ := server.openAuthPacket(
+						makeAuthPacket(info.ServerID, 1, protoVersion),
+					)
+					require.False(t, accepted,
+						"server ID must not be accepted as a client ID for protocol %d",
+						protoVersion)
+
+					// A legitimate client ID must still be accepted.
+					accepted, _, _, _ = server.openAuthPacket(
+						makeAuthPacket(info.ClientID, 2, protoVersion),
+					)
+					require.True(t, accepted, "legitimate client ID must be accepted for protocol %d", protoVersion)
+				})
+			}
+		})
+	}
+}
+
+func TestProxy_AttachableClientChoosesID(t *testing.T) {
+	info := &ServerInfo{}
+	_, err := startServerProxy(&tsshdArgs{Attachable: true}, info, &idleFrontend{})
+	require.NoError(t, err)
+	require.Zero(t, info.ClientID)
+	require.NotZero(t, info.ServerID)
+
+	tests := []struct {
+		name     string
+		serverID uint64
+	}{
+		{
+			name:     "ServerID",
+			serverID: info.ServerID,
+		},
+		{
+			name:     "ZeroServerID",
+			serverID: 0,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			serverInfo := *info
+			serverInfo.ServerID = tt.serverID
+
+			client, err := startClientProxy(
+				&SshUdpClient{},
+				&UdpClientOptions{ServerInfo: &serverInfo},
+			)
+			require.NoError(t, err)
+			t.Cleanup(func() { _ = client.Close() })
+
+			require.NotZero(t, client.clientID)
+			require.NotEqual(t, serverInfo.ServerID, client.clientID)
+		})
+	}
+}
+
+func TestProxy_ClientRejectsServerID(t *testing.T) {
+	for _, version := range []int{2, 3} {
+		info := &ServerInfo{ProtoVer: version, ClientID: 23, ServerID: 23, ProxyKey: strings.Repeat("00", 32)}
+		client, err := NewSshUdpClient(&UdpClientOptions{ServerInfo: info, ConnectTimeout: 100 * time.Millisecond})
+		require.ErrorContains(t, err, "client ID must differ from server ID")
+		require.Nil(t, client)
+	}
+}
 
 func TestProxy_ClientHello(t *testing.T) {
 	info := &ServerInfo{}

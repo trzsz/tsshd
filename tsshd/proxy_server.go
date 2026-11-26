@@ -922,8 +922,9 @@ func (p *serverProxy) openAuthPacket(buf []byte) (bool, uint64, uint64, *clientH
 		return false, 0, 0, nil
 	}
 
+	// Reserve the server ID so a legacy acknowledgment cannot authenticate a client.
 	clientID := binary.BigEndian.Uint64(data[0:8])
-	if !p.args.Attachable && clientID != p.clientID {
+	if clientID == p.serverID || (!p.args.Attachable && clientID != p.clientID) {
 		return false, 0, 0, nil
 	}
 
@@ -1154,12 +1155,11 @@ func startServerProxy(args *tsshdArgs, info *ServerInfo, conn frontendConnection
 	}
 
 	if !args.Attachable || args.Socket {
-		for info.ClientID == 0 {
-			clientID := make([]byte, 8)
-			if _, err := crypto_rand.Read(clientID); err != nil {
+		if info.ClientID == 0 {
+			info.ClientID, err = randomProxyID(0)
+			if err != nil {
 				return nil, fmt.Errorf("rand client id failed: %v", err)
 			}
-			info.ClientID = binary.BigEndian.Uint64(clientID)
 		}
 		proxy.clientID = info.ClientID
 	}
@@ -1179,11 +1179,10 @@ func startServerProxy(args *tsshdArgs, info *ServerInfo, conn frontendConnection
 		}
 	}
 
-	serverID := make([]byte, 8)
-	if _, err := crypto_rand.Read(serverID); err != nil {
+	info.ServerID, err = randomProxyID(info.ClientID)
+	if err != nil {
 		return nil, fmt.Errorf("rand server id failed: %v", err)
 	}
-	info.ServerID = binary.BigEndian.Uint64(serverID)
 	proxy.serverID = info.ServerID
 
 	if args.TCP {
