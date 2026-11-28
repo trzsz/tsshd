@@ -105,16 +105,12 @@ type sshUdpServer struct {
 
 var newSshUdpServer = func(args *tsshdArgs, proxy *serverProxy, addr net.Addr, proto protocolServer) streamHandler {
 	clientAddr, ok := addr.(*proxyClientAddr)
-	if !ok {
-		warning("new server failed: invalid client address type: %T", addr)
+	if !ok || clientAddr == nil || clientAddr.client == nil {
+		warning("new server failed: invalid client address: %T", addr)
 		return nil
 	}
 
-	client := proxy.getClient(clientAddr.clientID)
-	if client == nil {
-		warning("new server failed: no client found for id: %x", clientAddr.clientID)
-		return nil
-	}
+	client := clientAddr.client
 	if client.closed.Load() {
 		warning("new server failed: client [%x] is closed", clientAddr.clientID)
 		return nil
