@@ -25,6 +25,7 @@ SOFTWARE.
 package tsshd
 
 import (
+	"context"
 	"fmt"
 	"net"
 	dbg "runtime/debug"
@@ -454,6 +455,7 @@ func TestServerLazyMap(t *testing.T) {
 		t.Fatalf("pending session expected nil, got %v", sess)
 	}
 
+	server.releaseUdpForwardSession(nil)
 	server.releaseUdpForwardSession(&udpForwardSession{}) // should not panic
 
 	dummyConn := &net.TCPConn{}
@@ -469,19 +471,97 @@ func TestServerLazyMap(t *testing.T) {
 	}
 
 	server.proto = &kcpServer{}
-	sess, exists := server.acquireUdpForwardSession("key", "udp", "", nil, nil)
+	sess, exists := server.acquireUdpForwardSession(context.Background(), 20, "key", "udp", "", nil, nil)
 	if exists {
 		t.Fatalf("expected new session, got exists=true")
 	}
 	if sess == nil {
 		t.Fatalf("acquired session is nil")
 	}
+	if sess.listenerID != 20 {
+		t.Fatalf("listener ID mismatch, expected 20, got %d", sess.listenerID)
+	}
 	if size := len(server.udpFwdSessionMap); size != 1 {
 		t.Fatalf("expected session map size 1, got %d", size)
 	}
 
-	server.releaseUdpForwardSession(sess)
+	sessionID := sess.forwardConn.channelID
+	server.addUdpFwdPendingSession(sessionID, sess)
+
+	// Releasing another listener must not affect this session.
+	server.releaseUdpForwardSessions(21)
+
+	if size := len(server.udpFwdSessionMap); size != 1 {
+		t.Fatalf("expected session map size 1, got %d", size)
+	}
+	if size := len(server.udpFwdPendingMap); size != 1 {
+		t.Fatalf("expected pending session map size 1, got %d", size)
+	}
+
+	sess.stateMu.Lock()
+	closed := sess.closed
+	sess.stateMu.Unlock()
+	if closed {
+		t.Fatalf("session should not be closed")
+	}
+
+	server.releaseUdpForwardSessions(20)
+
 	if size := len(server.udpFwdSessionMap); size != 0 {
 		t.Fatalf("expected session map size 0 after release, got %d", size)
+	}
+	if size := len(server.udpFwdPendingMap); size != 0 {
+		t.Fatalf("expected pending session map size 0 after release, got %d", size)
+	}
+
+	sess.stateMu.Lock()
+	closed = sess.closed
+	sess.stateMu.Unlock()
+	if !closed {
+		t.Fatalf("expected session to be closed")
+	}
+
+	if !sess.forwardConn.closed.Load() {
+		t.Fatalf("expected packet connection to be closed")
+	}
+}
+
+func TestServerCleanupFuncs(t *testing.T) {
+	server := &sshUdpServer{}
+	calls := 0
+
+	remove1 := server.addCleanupFunc(func() { calls++ })
+	remove2 := server.addCleanupFunc(func() { calls++ })
+
+	if calls != 0 {
+		t.Fatalf("cleanup ran before server shutdown: %d", calls)
+	}
+
+	// Explicitly clean up before server shutdown.
+	remove1()
+	if calls != 1 {
+		t.Fatalf("cleanup calls = %d, want 1", calls)
+	}
+
+	server.closed.Store(true)
+	server.runCleanupFuncs()
+
+	if calls != 2 {
+		t.Fatalf("cleanup calls = %d, want 2", calls)
+	}
+
+	// Calling the returned cleanup functions must not run them again.
+	remove1()
+	remove2()
+	server.runCleanupFuncs()
+
+	if calls != 2 {
+		t.Fatalf("cleanup ran more than once: %d", calls)
+	}
+
+	// Registering cleanup after shutdown must execute it immediately.
+	server.addCleanupFunc(func() { calls++ })
+	if calls != 3 {
+		t.Fatalf("cleanup registered after shutdown was not executed: %d", calls)
 	}
 }

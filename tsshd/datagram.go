@@ -34,6 +34,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"time"
 )
 
 const kMaxUdpForwardPendingPackets = 1024
@@ -136,7 +137,11 @@ func (f *udpForwarder) startWorker() {
 				continue
 			}
 
-			incomingBufferChan <- buf
+			select {
+			case <-f.ctx.Done():
+				return
+			case incomingBufferChan <- buf:
+			}
 		}
 	}()
 
@@ -154,7 +159,9 @@ func (f *udpForwarder) startWorker() {
 				}
 			}
 			f.channelMap.Range(func(key, val any) bool {
-				closeChannel(val)
+				if v, ok := f.channelMap.LoadAndDelete(key); ok {
+					closeChannel(v)
+				}
 				return true
 			})
 		}()
@@ -432,9 +439,14 @@ func (s *sshUdpServer) handleDialUdpEvent(stream Stream) {
 		sendError(stream, err)
 		return
 	}
+	cleanupConn := s.addCleanupFunc(func() { _ = conn.Close() })
 
 	id := s.nextUdpFwdChannelID.Add(1)
 	pconn := newPacketConn(stream, id, s.proto.getUdpForwarder(), s.clientChecker)
+	defer func() {
+		cleanupConn()
+		_ = pconn.Close()
+	}()
 
 	resp := dialUdpResponse{ID: id}
 	if err := sendResponse(stream, &resp); err != nil { // ack ok
@@ -502,11 +514,6 @@ func dialUDP(msg *dialUdpMessage) (io.ReadWriteCloser, error) {
 }
 
 func forwardUDP(pconn *packetConn, conn io.ReadWriteCloser, msg *dialUdpMessage) {
-	defer func() {
-		_ = conn.Close()
-		_ = pconn.Close()
-	}()
-
 	clientDone := make(chan struct{})
 	serverDone := make(chan struct{})
 
@@ -565,6 +572,7 @@ func forwardUDP(pconn *packetConn, conn io.ReadWriteCloser, msg *dialUdpMessage)
 }
 
 type udpForwardSession struct {
+	listenerID   uint64
 	sessionKey   string
 	listenerNet  string
 	listenerAddr string
@@ -572,31 +580,51 @@ type udpForwardSession struct {
 	forwardConn  *packetConn
 	peerAddr     net.Addr
 	warnOnce     sync.Once
-	writeMu      sync.Mutex
-	pendingBuf   [][]byte
-	pendingFlag  bool
+
+	writeMu sync.Mutex
+	stateMu sync.Mutex
+
+	pendingBuf  [][]byte
+	pendingFlag bool
+	closed      bool // protected by stateMu
+
+	writeCtx    context.Context
+	cancelWrite context.CancelFunc
 }
 
 func (s *udpForwardSession) writePacket(data []byte) {
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
 
+	s.stateMu.Lock()
+
+	if s.closed {
+		s.stateMu.Unlock()
+		return
+	}
+
 	if s.pendingFlag {
 		if len(s.pendingBuf) >= kMaxUdpForwardPendingPackets {
+			s.stateMu.Unlock()
 			return
 		}
+
 		buf := make([]byte, len(data), len(data)+kUdpForwardChannelIdSize)
 		copy(buf, data)
 		s.pendingBuf = append(s.pendingBuf, buf)
+
+		s.stateMu.Unlock()
 		return
 	}
+
+	s.stateMu.Unlock()
 
 	s.doWrite(data)
 }
 
 func (s *udpForwardSession) doWrite(data []byte) {
-	if err := s.forwardConn.Write(data); err != nil {
-		if IsClosedError(err) {
+	if err := s.forwardConn.WriteWithContext(s.writeCtx, data); err != nil {
+		if s.writeCtx.Err() != nil || IsClosedError(err) {
 			debug("udp forwarding [%s] [%s] write closed: %v", s.listenerNet, s.listenerAddr, err)
 			return
 		}
@@ -610,20 +638,56 @@ func (s *udpForwardSession) attachStream(stream Stream) {
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
 
+	s.stateMu.Lock()
+
+	if s.closed {
+		s.stateMu.Unlock()
+		_ = stream.Close()
+		return
+	}
+
 	s.forwardConn.stream = stream
 	s.pendingFlag = false
 
-	for _, data := range s.pendingBuf {
+	pendingBuf := s.pendingBuf
+	s.pendingBuf = nil
+
+	s.stateMu.Unlock()
+
+	// Keep writeMu locked while flushing so that new packets cannot
+	// overtake packets buffered before the stream was attached.
+	for _, data := range pendingBuf {
+		if s.writeCtx.Err() != nil {
+			break
+		}
 		s.doWrite(data)
 	}
-	s.pendingBuf = nil
 }
 
 func (s *udpForwardSession) Close() {
-	s.writeMu.Lock()
-	defer s.writeMu.Unlock()
-	if s.forwardConn != nil {
-		_ = s.forwardConn.Close()
+	s.stateMu.Lock()
+
+	if s.closed {
+		s.stateMu.Unlock()
+		return
+	}
+	s.closed = true
+
+	s.pendingFlag = false
+	s.pendingBuf = nil
+	forwardConn := s.forwardConn
+	cancelWrite := s.cancelWrite
+
+	s.stateMu.Unlock()
+
+	// Cancel writes waiting for peer reconnection.
+	if cancelWrite != nil {
+		cancelWrite()
+	}
+
+	// Close the underlying stream to interrupt any write already in progress.
+	if forwardConn != nil {
+		_ = forwardConn.Close()
 	}
 }
 
@@ -634,8 +698,34 @@ func (s *udpForwardSession) getPeerAddr() string {
 	return s.peerAddr.String()
 }
 
-func (s *sshUdpServer) acquireUdpForwardSession(sessionKey, listenerNet, listenerAddr string,
-	listenerConn net.PacketConn, peerAddr net.Addr) (*udpForwardSession, bool) {
+func (s *sshUdpServer) releaseUdpForwardSessions(listenerID uint64) {
+	sessions := make(map[*udpForwardSession]struct{})
+
+	s.udpFwdSessionMutex.Lock()
+	for key, session := range s.udpFwdSessionMap {
+		if session.listenerID == listenerID {
+			delete(s.udpFwdSessionMap, key)
+			sessions[session] = struct{}{}
+		}
+	}
+	s.udpFwdSessionMutex.Unlock()
+
+	s.udpFwdPendingMutex.Lock()
+	for id, session := range s.udpFwdPendingMap {
+		if session.listenerID == listenerID {
+			delete(s.udpFwdPendingMap, id)
+			sessions[session] = struct{}{}
+		}
+	}
+	s.udpFwdPendingMutex.Unlock()
+
+	for session := range sessions {
+		session.Close()
+	}
+}
+
+func (s *sshUdpServer) acquireUdpForwardSession(listenerCtx context.Context, listenerID uint64, sessionKey,
+	listenerNet, listenerAddr string, listenerConn net.PacketConn, peerAddr net.Addr) (*udpForwardSession, bool) {
 	s.udpFwdSessionMutex.Lock()
 	defer s.udpFwdSessionMutex.Unlock()
 
@@ -650,7 +740,9 @@ func (s *sshUdpServer) acquireUdpForwardSession(sessionKey, listenerNet, listene
 
 	id := s.nextUdpFwdChannelID.Add(1)
 	forwardConn := newPacketConn(nil, id, s.proto.getUdpForwarder(), s.clientChecker)
+	writeCtx, cancelWrite := context.WithCancel(listenerCtx)
 	session = &udpForwardSession{
+		listenerID:   listenerID,
 		sessionKey:   sessionKey,
 		listenerNet:  listenerNet,
 		listenerAddr: listenerAddr,
@@ -658,6 +750,8 @@ func (s *sshUdpServer) acquireUdpForwardSession(sessionKey, listenerNet, listene
 		forwardConn:  forwardConn,
 		peerAddr:     cloneNetAddr(peerAddr),
 		pendingFlag:  true,
+		writeCtx:     writeCtx,
+		cancelWrite:  cancelWrite,
 	}
 	s.udpFwdSessionMap[sessionKey] = session
 
@@ -665,9 +759,24 @@ func (s *sshUdpServer) acquireUdpForwardSession(sessionKey, listenerNet, listene
 }
 
 func (s *sshUdpServer) releaseUdpForwardSession(session *udpForwardSession) {
+	if session == nil {
+		return
+	}
+
 	s.udpFwdSessionMutex.Lock()
-	delete(s.udpFwdSessionMap, session.sessionKey)
+	if s.udpFwdSessionMap[session.sessionKey] == session {
+		delete(s.udpFwdSessionMap, session.sessionKey)
+	}
 	s.udpFwdSessionMutex.Unlock()
+
+	if session.forwardConn != nil {
+		id := session.forwardConn.channelID
+		s.udpFwdPendingMutex.Lock()
+		if s.udpFwdPendingMap[id] == session {
+			delete(s.udpFwdPendingMap, id)
+		}
+		s.udpFwdPendingMutex.Unlock()
+	}
 
 	session.Close()
 }
@@ -693,6 +802,20 @@ func (s *sshUdpServer) takeUdpFwdPendingSession(id uint64) *udpForwardSession {
 	}
 
 	return nil
+}
+
+func (s *sshUdpServer) reapUdpFwdPendingSessionAfterTimeout(id uint64) {
+	timeout := kDefaultConnectTimeout
+	if s.args != nil && s.args.ConnectTimeout > 0 {
+		timeout = s.args.ConnectTimeout
+	}
+
+	time.AfterFunc(timeout, func() {
+		if session := s.takeUdpFwdPendingSession(id); session != nil {
+			warning("UDP forwarding session [%d] was not claimed within %v, closing", id, timeout)
+			s.releaseUdpForwardSession(session)
+		}
+	})
 }
 
 func (s *sshUdpServer) handleListenUdpEvent(stream Stream) {
@@ -732,6 +855,7 @@ func (s *sshUdpServer) handleListenUdpEvent(stream Stream) {
 		return
 	}
 
+	var closeListener func()
 	if msg.Net == "unixgram" {
 		mode := os.FileMode(0666) &^ os.FileMode(streamLocalBindMask())
 		if err := os.Chmod(msg.Addr, mode); err != nil {
@@ -740,18 +864,28 @@ func (s *sshUdpServer) handleListenUdpEvent(stream Stream) {
 			sendError(stream, fmt.Errorf("chmod unix socket [%s] to %#o failed: %v", msg.Addr, mode, err))
 			return
 		}
-		defer newFileUnlinker(msg.Addr, listenerConn)()
+		closeListener = newFileUnlinker(msg.Addr, listenerConn)
 	} else {
-		defer func() { _ = listenerConn.Close() }()
-		addOnExitFunc(func() { _ = listenerConn.Close() })
+		closeListener = func() { _ = listenerConn.Close() }
 	}
+
+	listenerCtx, cancelListener := context.WithCancel(context.Background())
+	cleanupListener := s.addCleanupFunc(func() {
+		cancelListener()
+		closeListener()
+	})
+	defer cleanupListener()
 
 	if err := sendSuccess(stream); err != nil { // ack ok
 		warning("udp listener [%s] [%s] ack ok failed: %v", msg.Net, msg.Addr, err)
 		return
 	}
 
+	cleanupListenerOnEOF(stream, cleanupListener)
+
 	listenerID := s.nextUdpFwdListenerID.Add(1)
+	defer s.releaseUdpForwardSessions(listenerID)
+
 	buf := make([]byte, 0xffff)
 	for {
 		n, addr, err := listenerConn.ReadFrom(buf)
@@ -771,7 +905,7 @@ func (s *sshUdpServer) handleListenUdpEvent(stream Stream) {
 			sessionKey = fmt.Sprintf("%d_nil", listenerID)
 		}
 
-		session, exists := s.acquireUdpForwardSession(sessionKey, msg.Net, msg.Addr, listenerConn, addr)
+		session, exists := s.acquireUdpForwardSession(listenerCtx, listenerID, sessionKey, msg.Net, msg.Addr, listenerConn, addr)
 
 		session.writePacket(buf[:n])
 
@@ -781,6 +915,7 @@ func (s *sshUdpServer) handleListenUdpEvent(stream Stream) {
 
 		id := session.forwardConn.channelID
 		s.addUdpFwdPendingSession(id, session)
+		s.reapUdpFwdPendingSessionAfterTimeout(id)
 
 		if err := sendMessage(stream, acceptUdpMessage{id}); err != nil {
 			_ = s.takeUdpFwdPendingSession(id)
@@ -808,6 +943,7 @@ func (s *sshUdpServer) handleAcceptUdpEvent(stream Stream) {
 		sendError(stream, fmt.Errorf("invalid accept udp id: %d", msg.ID))
 		return
 	}
+	defer s.releaseUdpForwardSession(session)
 
 	if err := sendSuccess(stream); err != nil { // ack ok
 		warning("accept udp ack ok failed: %v", err)
@@ -815,7 +951,6 @@ func (s *sshUdpServer) handleAcceptUdpEvent(stream Stream) {
 	}
 
 	session.attachStream(stream)
-	defer s.releaseUdpForwardSession(session)
 
 	var warnOnce sync.Once
 	_ = session.forwardConn.Consume(func(buf []byte) error {

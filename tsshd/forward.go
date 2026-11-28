@@ -77,6 +77,20 @@ func sendProhibited(stream Stream, option string) {
 	sendErrorCode(stream, ErrProhibited, fmt.Sprintf("Check [%s] in [%s] on the server.", option, sshdConfigPath))
 }
 
+// cleanupListenerOnEOF runs the listener cleanup when the forwarding control
+// stream reaches EOF. The client sends only the initial request on this stream.
+func cleanupListenerOnEOF(stream Stream, cleanup func()) {
+	go func() {
+		var buf [128]byte
+		for {
+			if _, err := stream.Read(buf[:]); err != nil {
+				cleanup()
+				return
+			}
+		}
+	}()
+}
+
 func (s *sshUdpServer) handleDialEvent(stream Stream) {
 	var msg dialMessage
 	if err := recvMessage(stream, &msg); err != nil {
@@ -169,6 +183,7 @@ func (s *sshUdpServer) handleListenEvent(stream Stream) {
 		return
 	}
 
+	var cleanupListener func()
 	if msg.Net == "unix" {
 		mode := os.FileMode(0666) &^ os.FileMode(streamLocalBindMask())
 		if err := os.Chmod(msg.Addr, mode); err != nil {
@@ -177,16 +192,18 @@ func (s *sshUdpServer) handleListenEvent(stream Stream) {
 			sendError(stream, fmt.Errorf("chmod unix socket [%s] to %#o failed: %v", msg.Addr, mode, err))
 			return
 		}
-		defer newFileUnlinker(msg.Addr, listener)()
+		cleanupListener = s.addCleanupFunc(newFileUnlinker(msg.Addr, listener))
 	} else {
-		defer func() { _ = listener.Close() }()
-		addOnExitFunc(func() { _ = listener.Close() })
+		cleanupListener = s.addCleanupFunc(func() { _ = listener.Close() })
 	}
+	defer cleanupListener()
 
 	if err := sendSuccess(stream); err != nil { // ack ok
 		warning("listener [%s] [%s] ack ok failed: %v", msg.Net, msg.Addr, err)
 		return
 	}
+
+	cleanupListenerOnEOF(stream, cleanupListener)
 
 	for {
 		conn, err := listener.Accept()

@@ -141,3 +141,41 @@ func TestSessionWaitWithDescendantPTY(t *testing.T) {
 		t.Fatal("Wait did not return after the output forward timeout")
 	}
 }
+
+func TestSessionCleanupFuncs(t *testing.T) {
+	session := &sessionContext{}
+	calls := 0
+
+	if !session.addCleanupFunc(func() { calls++ }) {
+		t.Fatal("failed to register first cleanup")
+	}
+	if !session.addCleanupFunc(func() { calls++ }) {
+		t.Fatal("failed to register second cleanup")
+	}
+
+	if calls != 0 {
+		t.Fatalf("cleanup ran before session shutdown: %d", calls)
+	}
+
+	// Simulate the session entering shutdown before running its cleanups.
+	session.closed.Store(true)
+	session.runCleanupFuncs()
+
+	if calls != 2 {
+		t.Fatalf("cleanup calls = %d, want 2", calls)
+	}
+
+	// Running the cleanup registry again must not repeat cleanups.
+	session.runCleanupFuncs()
+	if calls != 2 {
+		t.Fatalf("cleanup ran more than once: %d", calls)
+	}
+
+	// Registering cleanup after shutdown must execute it immediately.
+	if session.addCleanupFunc(func() { calls++ }) {
+		t.Fatal("cleanup should not be registered after session shutdown")
+	}
+	if calls != 3 {
+		t.Fatalf("cleanup registered after shutdown was not executed: %d", calls)
+	}
+}

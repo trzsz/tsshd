@@ -145,7 +145,12 @@ func listenForAgent(id uint64) (net.Listener, string, error) {
 
 func listenForSocketServer() (net.Listener, error) {
 	listener, _, err := listenOnPipe(fmt.Sprintf("socket-%d", os.Getpid()))
-	return listener, err
+	if err != nil {
+		return nil, err
+	}
+
+	addOnExitFunc(func() { _ = listener.Close() })
+	return listener, nil
 }
 
 func listenOnPipe(name string) (net.Listener, string, error) {
@@ -164,8 +169,6 @@ func listenOnPipe(name string) (net.Listener, string, error) {
 	if err != nil {
 		return nil, "", fmt.Errorf("listen on [%s] failed: %v", pipePath, err)
 	}
-
-	addOnExitFunc(func() { _ = listener.Close() })
 
 	return listener, pipePath, nil
 }

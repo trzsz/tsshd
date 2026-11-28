@@ -144,7 +144,15 @@ func listenForSocketServer() (net.Listener, error) {
 	}
 
 	sockPath := filepath.Join(sockDir, fmt.Sprintf("socket-%d", os.Getpid()))
-	return listenOnSocket(sockPath)
+
+	listener, err := listenOnSocket(sockPath)
+	if err != nil {
+		return nil, err
+	}
+
+	addOnExitFunc(newFileUnlinker(sockPath, listener))
+
+	return listener, nil
 }
 
 func listenOnSocket(sockPath string) (net.Listener, error) {
@@ -169,8 +177,6 @@ func listenOnSocket(sockPath string) (net.Listener, error) {
 		_ = os.Remove(sockPath)
 		return nil, fmt.Errorf("chmod socket [%s] failed: %v", sockPath, err)
 	}
-
-	_ = newFileUnlinker(sockPath, listener)
 
 	debug("listen on socket [%s] success", sockPath)
 

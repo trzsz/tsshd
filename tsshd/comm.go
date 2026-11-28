@@ -373,17 +373,19 @@ func (tc *timeoutChecker) waitReconnect(ctx context.Context) error {
 			return nil
 		}
 
-		ch := tc.reconnectedCh.Load()
-		for ch == nil {
-			time.Sleep(10 * time.Millisecond)
-			ch = tc.reconnectedCh.Load()
-			if !tc.isTimeout() {
-				return nil
-			}
+		var reconnectCh <-chan struct{}
+		var timerCh <-chan time.Time
+
+		if ch := tc.reconnectedCh.Load(); ch != nil {
+			reconnectCh = *ch
+		} else {
+			timerCh = time.After(10 * time.Millisecond)
 		}
 
 		select {
-		case <-*ch:
+		case <-reconnectCh:
+			continue
+		case <-timerCh:
 			continue
 		case <-tc.closeChan:
 			return errors.New("timeout closed")
@@ -522,10 +524,10 @@ func (tc *timeoutChecker) Close() {
 	close(tc.closeChan)
 }
 
-// newFileUnlinker returns a cleanup function that closes the provided closer
-// and unlinks (removes) the specified file path. It ensures that the cleanup
-// logic is executed only once, even if called multiple times (e.g., via both
-// defer and a global exit hook).
+// newFileUnlinker returns an idempotent cleanup function that closes the
+// provided closer and removes the specified file path if it still refers
+// to the file created by this call. The caller is responsible for invoking
+// or registering the returned cleanup function.
 func newFileUnlinker(path string, closer io.Closer) func() {
 	var once sync.Once
 
@@ -568,9 +570,6 @@ func newFileUnlinker(path string, closer io.Closer) func() {
 			debug("unlink file [%s] successful", path)
 		})
 	}
-
-	// Register the cleanup function to the global exit registry.
-	addOnExitFunc(cleanup)
 
 	// Return the cleanup function to be used with defer.
 	return cleanup

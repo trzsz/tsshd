@@ -96,6 +96,11 @@ type sshUdpServer struct {
 	udpFwdSessionMap     map[string]*udpForwardSession
 	udpFwdPendingMutex   sync.Mutex
 	udpFwdPendingMap     map[uint64]*udpForwardSession
+
+	// Cleanup functions for resources owned by this server.
+	cleanupMutex  sync.Mutex
+	cleanupFuncs  map[uint64]func()
+	nextCleanupID uint64
 }
 
 var newSshUdpServer = func(args *tsshdArgs, proxy *serverProxy, addr net.Addr, proto protocolServer) streamHandler {
@@ -311,6 +316,11 @@ func (s *sshUdpServer) closeServer(onlyIfNotServing bool) {
 		debug("client [%x] shutting down server", s.client.proxyAddr.clientID)
 	}
 
+	s.runCleanupFuncs()
+
+	// Stop accepting new streams and collect all currently active streams.
+	streams := s.collectActiveStreams()
+
 	// Stop the client checker and its background goroutines.
 	//
 	// The client checker is created during bus initialization, so it is nil
@@ -331,16 +341,28 @@ func (s *sshUdpServer) closeServer(onlyIfNotServing bool) {
 		debug("client [%x] bus stream closed: %v", s.client.proxyAddr.clientID, err)
 	}
 
-	// Close all stderr streams
+	// Unblock stderr handler goroutines waiting in stderrStream.Wait
+	// so they can return and be cleaned up during server shutdown.
 	s.closeAllStderrStreams()
 
-	// Ensure all active streams are closed.
-	// closeActiveStreams is idempotent and safe to call multiple times.
-	s.closeActiveStreams()
-	debug("client [%x] all streams closed", s.client.proxyAddr.clientID)
+	// Give all streams a short chance to close gracefully before shutting
+	// down the transport. If this times out, the cleanup goroutine continues
+	// in the background and the transport shutdown below must unblock it.
+	_, err := doWithTimeout(func() (int, error) {
+		for _, entry := range streams {
+			err := entry.stream.Close()
+			debug("active stream [%x][%d] closed: %v", s.client.proxyAddr.clientID, entry.id, err)
+		}
 
-	// close server connection
-	err := s.proto.Close()
+		debug("client [%x] all stream close calls completed", s.client.proxyAddr.clientID)
+		return 0, nil
+	}, time.Second)
+	if err != nil {
+		debug("client [%x] stream shutdown timed out: %v", s.client.proxyAddr.clientID, err)
+	}
+
+	// Close the transport to interrupt any remaining stream operations.
+	err = s.proto.Close()
 	debug("client [%x] transport closed: %v", s.client.proxyAddr.clientID, err)
 
 	// The clientState is kept in memory to prevent replay attacks.
@@ -463,31 +485,33 @@ func (s *sshUdpServer) handleStream(stream Stream) {
 	handler(s, stream)
 }
 
-func (s *sshUdpServer) closeActiveStreams() {
+type streamEntry struct {
+	id     uint64
+	stream Stream
+}
+
+// collectActiveStreams returns all currently registered streams and prevents
+// subsequent streams from being registered.
+func (s *sshUdpServer) collectActiveStreams() []streamEntry {
 	s.streamMutex.Lock()
+	defer s.streamMutex.Unlock()
 
 	if s.streamMap == nil {
-		s.streamMutex.Unlock()
-		return
+		return nil
 	}
 
-	entries := make([]struct {
-		id     uint64
-		stream Stream
-	}, 0, len(s.streamMap))
-
+	streams := make([]streamEntry, 0, len(s.streamMap))
 	for id, stream := range s.streamMap {
-		entries = append(entries, struct {
-			id     uint64
-			stream Stream
-		}{id: id, stream: stream})
+		streams = append(streams, streamEntry{id, stream})
 	}
 
 	s.streamMap = nil // mark the server as shutting down so no new streams are accepted.
 
-	s.streamMutex.Unlock()
+	return streams
+}
 
-	for _, entry := range entries {
+func (s *sshUdpServer) closeActiveStreams() {
+	for _, entry := range s.collectActiveStreams() {
 		_, err := doWithTimeout(func() (int, error) { return 0, entry.stream.Close() }, time.Second)
 		debug("active stream [%x][%d] closed: %v", s.client.proxyAddr.clientID, entry.id, err)
 	}
@@ -582,4 +606,55 @@ func (s *sshUdpServer) expireInactiveClientPath() {
 	}
 
 	s.pendingPathExpiry = nil
+}
+
+func (s *sshUdpServer) addCleanupFunc(fn func()) func() {
+	s.cleanupMutex.Lock()
+
+	if s.closed.Load() {
+		s.cleanupMutex.Unlock()
+		fn()
+		return func() {}
+	}
+
+	if s.cleanupFuncs == nil {
+		s.cleanupFuncs = make(map[uint64]func())
+	}
+
+	s.nextCleanupID++
+	id := s.nextCleanupID
+	s.cleanupFuncs[id] = fn
+
+	s.cleanupMutex.Unlock()
+
+	return func() {
+		s.cleanupMutex.Lock()
+		if s.cleanupFuncs == nil {
+			s.cleanupMutex.Unlock()
+			return
+		}
+
+		_, exists := s.cleanupFuncs[id]
+		if exists {
+			delete(s.cleanupFuncs, id)
+		}
+		s.cleanupMutex.Unlock()
+
+		if exists {
+			fn()
+		}
+	}
+}
+
+func (s *sshUdpServer) runCleanupFuncs() {
+	s.cleanupMutex.Lock()
+
+	funcs := s.cleanupFuncs
+	s.cleanupFuncs = nil
+
+	s.cleanupMutex.Unlock()
+
+	for _, fn := range funcs {
+		fn()
+	}
 }

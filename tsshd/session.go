@@ -138,6 +138,8 @@ type sessionContext struct {
 	screenBuf      chan []byte
 	screenObj      *te.Screen
 	screenMu       sync.Mutex
+	cleanupMutex   sync.Mutex
+	cleanupFuncs   []func()
 }
 
 var sessionMutex sync.Mutex
@@ -429,6 +431,8 @@ func (c *sessionContext) Close() {
 	delete(sessionMap, c.id)
 	sessionMutex.Unlock()
 
+	c.runCleanupFuncs()
+
 	code := -1
 	if c.mwSess != nil {
 		if exitCode := c.mwSess.exitCode.Load(); exitCode != nil {
@@ -436,7 +440,7 @@ func (c *sessionContext) Close() {
 		}
 	} else if c.pty != nil {
 		code = c.pty.GetExitCode()
-	} else {
+	} else if c.cmd != nil && c.cmd.ProcessState != nil {
 		code = c.cmd.ProcessState.ExitCode()
 	}
 	debug("session [%d] exiting with code: %d", c.id, code)
@@ -780,16 +784,19 @@ func (c *stderrStream) Close() error {
 		return nil
 	}
 
+	// Unblock handleStderrEvent's Wait so it can send EOF with CloseWrite.
+	// The enclosing handleStream cleanup will perform the final Close.
 	c.wg.Done()
-
-	// Send an EOF signal to the client as early as possible to indicate that stderr has finished.
-	// The actual underlying stream will be fully closed by sshUdpServer.handleStream after Wait returns.
-	return c.CloseWrite()
+	return nil
 }
 
 func (s *sshUdpServer) newStderrStream(id uint64, stream Stream) (*stderrStream, error) {
 	s.stderrMutex.Lock()
 	defer s.stderrMutex.Unlock()
+
+	if s.closed.Load() {
+		return nil, errors.New("server closed")
+	}
 
 	if _, ok := s.stderrMap[id]; ok {
 		return nil, fmt.Errorf("session %d stderr already set", id)
@@ -820,10 +827,16 @@ func (s *sshUdpServer) takeStderrStream(id uint64) *stderrStream {
 
 func (s *sshUdpServer) closeAllStderrStreams() {
 	s.stderrMutex.Lock()
-	defer s.stderrMutex.Unlock()
 
+	streams := make([]*stderrStream, 0, len(s.stderrMap))
 	for id, stream := range s.stderrMap {
 		delete(s.stderrMap, id)
+		streams = append(streams, stream)
+	}
+
+	s.stderrMutex.Unlock()
+
+	for _, stream := range streams {
 		_ = stream.Close()
 	}
 }
@@ -978,6 +991,15 @@ func (s *sshUdpServer) handleStderrEvent(stream Stream) {
 	}
 
 	errStream.Wait()
+
+	// Send EOF so the client can finish reading stderr and release its resources.
+	// Every session start and attach creates a stderr stream that the client
+	// waits to read until EOF. For PTY sessions, stderr is merged into stdout,
+	// so no stderr forwarder writes to this stream or closes its write side.
+	// CloseWrite sends the FIN that signals EOF, whereas Close only releases
+	// stream resources and does not guarantee that EOF is sent. The enclosing
+	// handleStream cleanup performs the final Close after this handler returns.
+	_ = stream.CloseWrite()
 }
 
 func (s *sshUdpServer) handleResizeEvent(stream Stream) error {
@@ -1045,11 +1067,6 @@ func (c *sessionContext) handleX11Request(msg *startMessage) {
 		warning("X11 forwarding listen failed: %v", err)
 		return
 	}
-	addOnExitFunc(func() {
-		for _, listener := range listeners {
-			_ = listener.Close()
-		}
-	})
 
 	hostname := getHostnameForX11(useLocalhost)
 	displayNumber := port - 6000
@@ -1064,11 +1081,17 @@ func (c *sessionContext) handleX11Request(msg *startMessage) {
 	if err := writeXauthData(xauthPath, xauthInput); err != nil {
 		warning("write xauth data failed: %v", err)
 	}
-	addOnExitFunc(func() {
+
+	if !c.addCleanupFunc(func() {
+		for _, listener := range listeners {
+			_ = listener.Close()
+		}
 		if err := writeXauthData(xauthPath, fmt.Sprintf("remove %s\n", authDisplay)); err != nil {
 			warning("remove xauth data failed: %v", err)
 		}
-	})
+	}) {
+		return
+	}
 
 	for _, listener := range listeners {
 		go c.handleChannelAccept(listener, msg.X11.ChannelType)
@@ -1217,6 +1240,10 @@ func (c *sessionContext) handleAgentRequest(msg *startMessage) {
 		return
 	}
 
+	if !c.addCleanupFunc(newFileUnlinker(agentPath, listener)) {
+		return
+	}
+
 	go c.handleChannelAccept(listener, msg.Agent.ChannelType)
 
 	env := fmt.Sprintf("SSH_AUTH_SOCK=%s", agentPath)
@@ -1264,5 +1291,37 @@ func closeAllSessions() {
 	debug("closing all the sessions")
 	for _, sess := range getAllSessions() {
 		sess.Close()
+	}
+}
+
+// addCleanupFunc registers a cleanup function to be called when the session closes.
+// If the session is already closed, the cleanup function is executed immediately.
+func (c *sessionContext) addCleanupFunc(fn func()) bool {
+	c.cleanupMutex.Lock()
+
+	if c.closed.Load() {
+		c.cleanupMutex.Unlock()
+		fn()
+		return false
+	}
+
+	c.cleanupFuncs = append(c.cleanupFuncs, fn)
+
+	c.cleanupMutex.Unlock()
+	return true
+}
+
+// runCleanupFuncs executes all registered cleanup functions.
+func (c *sessionContext) runCleanupFuncs() {
+	c.cleanupMutex.Lock()
+
+	funcs := c.cleanupFuncs
+	c.cleanupFuncs = nil
+
+	c.cleanupMutex.Unlock()
+
+	// Release resources in reverse registration order, like deferred calls.
+	for i := len(funcs) - 1; i >= 0; i-- {
+		funcs[i]()
 	}
 }
